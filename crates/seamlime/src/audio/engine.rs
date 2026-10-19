@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{FromSample, SampleFormat, SizedSample, StreamConfig};
+use cpal::{FromSample, I24, SampleFormat, SizedSample, StreamConfig, U24};
 use seamlime_core::edit::LoopMode;
 
 use super::voice::{MAX_VOICES, PlayBuffer, Voice};
@@ -186,8 +186,18 @@ impl AudioEngine {
         };
         let stream = match format {
             SampleFormat::F32 => build_f32(&device, config, cb),
+            SampleFormat::F64 => build_converted::<f64>(&device, config, cb),
+            SampleFormat::I8 => build_converted::<i8>(&device, config, cb),
             SampleFormat::I16 => build_converted::<i16>(&device, config, cb),
+            SampleFormat::I24 => build_converted::<I24>(&device, config, cb),
+            SampleFormat::I32 => build_converted::<i32>(&device, config, cb),
+            SampleFormat::I64 => build_converted::<i64>(&device, config, cb),
+            SampleFormat::U8 => build_converted::<u8>(&device, config, cb),
             SampleFormat::U16 => build_converted::<u16>(&device, config, cb),
+            SampleFormat::U24 => build_converted::<U24>(&device, config, cb),
+            SampleFormat::U32 => build_converted::<u32>(&device, config, cb),
+            SampleFormat::U64 => build_converted::<u64>(&device, config, cb),
+            // DSD and any format added later.
             other => return Err(format!("Unsupported output sample format {other}")),
         }
         .map_err(|e| format!("Could not open audio output {device_name}: {e}"))?;
