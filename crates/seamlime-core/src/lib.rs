@@ -8,12 +8,13 @@ pub mod meta;
 pub mod notes;
 pub mod render;
 pub mod riff;
+pub mod save;
 pub mod smpl;
 #[cfg(any(test, feature = "testwav"))]
 pub mod testwav;
 pub mod wav;
 
-pub use error::{LoadError, WavError};
+pub use error::{LoadError, SaveError, WavError};
 
 /// The software tag written into exported WAV files, e.g. `Seamlime 0.1.0`.
 pub fn software_tag() -> String {

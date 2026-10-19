@@ -108,7 +108,7 @@ fn bytes_per_sample(format: SampleFormat) -> usize {
 }
 
 /// Bytes per frame: the declared block align, but never less than the samples need.
-fn frame_stride(fmt: &WavFormat) -> usize {
+pub fn frame_stride(fmt: &WavFormat) -> usize {
     usize::from(fmt.block_align).max(usize::from(fmt.channels) * bytes_per_sample(fmt.format))
 }
 

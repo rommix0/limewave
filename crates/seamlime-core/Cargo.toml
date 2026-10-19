@@ -7,6 +7,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+tempfile = "3"
 thiserror = "2"
 
 [features]
