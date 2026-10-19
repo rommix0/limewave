@@ -44,23 +44,12 @@ pub fn parse_riff(bytes: &[u8]) -> Result<RiffFile, WavError> {
 
     let mut warnings = Vec::new();
     let riff_size = read_u32(&bytes[4..8]) as usize;
-    let declared_end = riff_size.saturating_add(CHUNK_HEADER_LEN);
-    let end = if declared_end < HEADER_LEN || declared_end > bytes.len() {
+    let end = bytes.len();
+    if riff_size.saturating_add(CHUNK_HEADER_LEN) != end {
         warnings.push(format!(
-            "RIFF size {} does not match the file length {}; using the file length",
-            riff_size,
-            bytes.len()
+            "RIFF size {riff_size} does not match the file length {end}; reading to the end of the file"
         ));
-        bytes.len()
-    } else {
-        if declared_end < bytes.len() {
-            warnings.push(format!(
-                "ignored {} trailing bytes after the RIFF data",
-                bytes.len() - declared_end
-            ));
-        }
-        declared_end
-    };
+    }
 
     let mut chunks = Vec::new();
     let mut pos = HEADER_LEN;
@@ -187,6 +176,22 @@ mod tests {
         assert_eq!(&file.chunks[1].id, b"abcd");
         assert_eq!(file.chunks[1].data, vec![1, 2, 3]);
         assert_eq!(write_riff(&file), bytes);
+    }
+
+    #[test]
+    fn understated_riff_size_keeps_trailing_chunks() {
+        let mut body = chunk_bytes(b"fmt ", &[1; 16], true);
+        body.extend(chunk_bytes(b"data", &[9, 8, 7, 6], true));
+        let mut bytes = wave(&body);
+        bytes.extend(chunk_bytes(b"smpl", &[3; 36], true));
+        let file = parse_riff(&bytes).unwrap();
+        assert_eq!(file.chunks.len(), 3);
+        assert_eq!(&file.chunks[2].id, b"smpl");
+        assert_eq!(file.chunks[2].data, vec![3; 36]);
+        assert!(!file.warnings.is_empty());
+        let rewritten = parse_riff(&write_riff(&file)).unwrap();
+        assert_eq!(rewritten.chunks, file.chunks);
+        assert!(rewritten.warnings.is_empty());
     }
 
     #[test]
