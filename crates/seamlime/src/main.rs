@@ -1,3 +1,3 @@
-fn main() {
-    println!("{}", seamlime_core::software_tag());
+fn main() -> eframe::Result<()> {
+    seamlime::run()
 }
