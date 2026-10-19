@@ -27,8 +27,20 @@ pub struct WavDocument {
     pub warnings: Vec<String>,
 }
 
-/// Reads and decodes the WAV file at `path`.
+/// The largest file a RIFF header can describe: a 32-bit size plus the 8-byte header.
+const MAX_FILE_LEN: u64 = u32::MAX as u64 + 8;
+
+/// Refuses a file longer than a RIFF size can describe.
+fn check_file_len(len: u64) -> Result<(), LoadError> {
+    if len > MAX_FILE_LEN {
+        return Err(LoadError::TooLarge(len));
+    }
+    Ok(())
+}
+
+/// Reads and decodes the WAV file at `path`. Files over 4 GiB are refused before reading.
 pub fn load_wav(path: &Path) -> Result<WavDocument, LoadError> {
+    check_file_len(std::fs::metadata(path)?.len())?;
     let bytes = std::fs::read(path)?;
     load_wav_bytes(path.to_path_buf(), &bytes)
 }
@@ -107,7 +119,12 @@ fn derive_edit(frames: usize, smpl: Option<&Smpl>) -> (EditState, Vec<String>) {
             LoopMode::Forward
         }
     };
-    let (start, end) = (l.start as usize, l.end as usize);
+    let (start, mut end) = (l.start as usize, l.end as usize);
+    // Writers that store an exclusive end give one past the last frame: pull it back.
+    if frames > 0 && end == frames {
+        end = frames - 1;
+        warnings.push("loop end was one past the last sample; clamped".into());
+    }
     e.loop_start = start;
     e.loop_end = end;
 
@@ -285,6 +302,18 @@ mod tests {
     }
 
     #[test]
+    fn loop_end_one_past_the_last_frame_is_clamped() {
+        let doc = load(1000, vec![smpl_chunk(60, &[(0, 100, 1000)])]).unwrap();
+        let e = doc.initial_edit();
+        assert_eq!(e.loop_mode, LoopMode::Forward);
+        assert_eq!((e.loop_start, e.loop_end), (100, 999));
+        assert_eq!(
+            doc.warnings,
+            vec!["loop end was one past the last sample; clamped"]
+        );
+    }
+
+    #[test]
     fn inverted_loop_is_disabled() {
         let doc = load(1000, vec![smpl_chunk(60, &[(0, 500, 100)])]).unwrap();
         assert_eq!(doc.initial_edit().loop_mode, LoopMode::Off);
@@ -321,6 +350,18 @@ mod tests {
         let bytes = crate::riff::write_riff(&riff);
         let err = load_wav_bytes(PathBuf::from("t.wav"), &bytes).unwrap_err();
         assert!(matches!(err, LoadError::Wav(WavError::Malformed(_))));
+    }
+
+    #[test]
+    fn files_over_4_gib_are_refused_before_reading() {
+        let limit = u64::from(u32::MAX) + 8;
+        assert!(check_file_len(limit).is_ok());
+        let err = check_file_len(limit + 1).unwrap_err();
+        assert!(
+            matches!(err, LoadError::TooLarge(n) if n == limit + 1),
+            "{err}"
+        );
+        assert!(err.to_string().contains("4 GiB"), "{err}");
     }
 
     #[test]

@@ -28,6 +28,8 @@ pub enum LoadError {
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Wav(#[from] WavError),
+    #[error("file is {0} bytes; WAV files over 4 GiB (RF64 or longer) are not supported")]
+    TooLarge(u64),
 }
 
 /// Everything that can go wrong while saving a WAV file. A failed save leaves the target
