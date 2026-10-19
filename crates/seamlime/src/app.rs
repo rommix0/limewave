@@ -65,6 +65,8 @@ pub struct Session {
     pub preview: Option<EditState>,
     /// When the engine buffer last followed a drag preview.
     last_preview_push: Option<Instant>,
+    /// The drag preview was throttled and is not yet in `rendered` or the engine.
+    preview_held: bool,
 }
 
 impl Session {
@@ -84,6 +86,7 @@ impl Session {
             view: None,
             preview: None,
             last_preview_push: None,
+            preview_held: false,
         }
     }
 
@@ -137,7 +140,31 @@ impl Session {
             self.publish(&e, engine);
             self.last_preview_push = Some(Instant::now());
         }
+        self.preview_held = !due;
         self.preview = Some(e);
+    }
+
+    /// Publishes a drag preview that `set_preview` held back once its wait is over, so the
+    /// sound follows a drag that stops moving. Returns how long to wait when the preview is
+    /// still held back (the caller asks for a repaint then), else `None`.
+    pub fn flush_preview(&mut self, engine: Option<&AudioEngine>) -> Option<Duration> {
+        if !self.preview_held {
+            return None;
+        }
+        let Some(e) = self.preview.clone() else {
+            self.preview_held = false;
+            return None;
+        };
+        let elapsed = self
+            .last_preview_push
+            .map_or(PREVIEW_PUSH_INTERVAL, |t| t.elapsed());
+        if elapsed < PREVIEW_PUSH_INTERVAL {
+            return Some(PREVIEW_PUSH_INTERVAL - elapsed);
+        }
+        self.publish(&e, engine);
+        self.last_preview_push = Some(Instant::now());
+        self.preview_held = false;
+        None
     }
 
     /// Ends a drag: the preview becomes one history entry (if it changed anything) and the
@@ -145,6 +172,7 @@ impl Session {
     pub fn commit_preview(&mut self, engine: Option<&AudioEngine>) {
         self.just_saved = false;
         self.last_preview_push = None;
+        self.preview_held = false;
         match self.preview.take() {
             Some(e) if e != *self.edit() => self.apply(e, engine),
             _ => self.refresh(engine),
@@ -709,6 +737,18 @@ impl SeamlimeApp {
         {
             self.save_results = None;
         }
+        self.flush_preview(&ctx);
+    }
+
+    /// Publishes the selected file's held-back drag preview, or asks for a repaint when
+    /// its wait is over.
+    fn flush_preview(&mut self, ctx: &egui::Context) {
+        let engine = self.engine.as_ref();
+        if let Some(FileEntry::Loaded(s)) = self.selected.and_then(|i| self.files.get_mut(i))
+            && let Some(wait) = s.flush_preview(engine)
+        {
+            ctx.request_repaint_after(wait);
+        }
     }
 
     fn inspector_panel(&mut self, ui: &mut egui::Ui) {
@@ -1087,6 +1127,33 @@ mod tests {
         tx.send((0, Ok(session().doc))).unwrap();
         app.drain_loader();
         assert_eq!(app.selected, Some(1));
+    }
+
+    #[test]
+    fn a_throttled_preview_is_published_when_the_drag_holds_still() {
+        let mut s = session();
+        let looped = |crossfade| EditState {
+            loop_mode: LoopMode::Forward,
+            loop_start: 2000,
+            loop_end: 6000,
+            crossfade,
+            ..s.edit().clone()
+        };
+        let (faded, plain) = (looped(10), looped(0));
+        s.set_preview(faded, None);
+        assert_eq!(s.flush_preview(None), None, "published at once");
+        s.set_preview(plain, None);
+        assert_ne!(s.rendered, s.doc.audio, "throttled");
+
+        // No further drag events: the app asks to be woken when the wait is over.
+        let wait = s.flush_preview(None).expect("a repaint is needed");
+        assert!(wait > Duration::ZERO && wait <= PREVIEW_PUSH_INTERVAL);
+        assert_ne!(s.rendered, s.doc.audio, "still waiting");
+
+        s.last_preview_push = Instant::now().checked_sub(PREVIEW_PUSH_INTERVAL);
+        assert_eq!(s.flush_preview(None), None);
+        assert_eq!(s.rendered, s.doc.audio, "the held preview is published");
+        assert_eq!(s.flush_preview(None), None, "nothing left to publish");
     }
 
     #[test]
