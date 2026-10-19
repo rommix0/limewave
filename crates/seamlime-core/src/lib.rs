@@ -1,6 +1,7 @@
 //! Seamlime core library: WAV/RIFF handling and loop analysis.
 
 pub mod document;
+pub mod dsp;
 pub mod edit;
 pub mod error;
 pub mod meta;
