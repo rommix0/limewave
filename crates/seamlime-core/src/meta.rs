@@ -6,10 +6,30 @@ use crate::riff::{Chunk, list_type};
 const INFO: &[u8; 4] = b"INFO";
 const SUB_HEADER_LEN: usize = 8;
 
-/// Splits the body of a `LIST` chunk (after the list type) into sub-chunks.
-/// A sub-chunk that does not fit ends the scan.
-fn parse_sub_chunks(body: &[u8]) -> Vec<Chunk> {
-    let mut out = Vec::new();
+/// The sub-chunks of a `LIST` body (after the list type), and how cleanly it parsed.
+struct SubChunks {
+    subs: Vec<Chunk>,
+    /// Every byte of the body was accounted for (trailing zero bytes allowed).
+    complete: bool,
+    /// Some odd-length entry was not followed by its pad byte.
+    missing_pad: bool,
+}
+
+/// Whether a whole sub-chunk header fits at `at` and its id looks like one: four printable
+/// ASCII characters, the first a letter or digit.
+fn plausible_id(body: &[u8], at: usize) -> bool {
+    at + SUB_HEADER_LEN <= body.len()
+        && body[at].is_ascii_alphanumeric()
+        && body[at..at + 4].iter().all(|b| (0x20..=0x7e).contains(b))
+}
+
+/// Splits the body of a `LIST` chunk (after the list type) into sub-chunks. After an
+/// odd-length entry the pad byte is skipped, unless only the unpadded position holds a
+/// plausible next header (a writer left the pad byte out). A sub-chunk that does not fit
+/// ends the scan.
+fn parse_sub_chunks(body: &[u8]) -> SubChunks {
+    let mut subs = Vec::new();
+    let mut missing_pad = false;
     let mut pos = 0;
     while pos + SUB_HEADER_LEN <= body.len() {
         let id = [body[pos], body[pos + 1], body[pos + 2], body[pos + 3]];
@@ -19,13 +39,27 @@ fn parse_sub_chunks(body: &[u8]) -> Vec<Chunk> {
         let Some(end) = start.checked_add(size).filter(|e| *e <= body.len()) else {
             break;
         };
-        out.push(Chunk {
+        subs.push(Chunk {
             id,
             data: body[start..end].to_vec(),
         });
-        pos = end + (size & 1);
+        pos = end;
+        if size % 2 == 1 {
+            if end == body.len() || (!plausible_id(body, end + 1) && plausible_id(body, end)) {
+                missing_pad = true;
+            } else {
+                pos += 1;
+            }
+        }
     }
-    out
+    let complete = body
+        .get(pos..)
+        .is_some_and(|rest| rest.iter().all(|b| *b == 0));
+    SubChunks {
+        subs,
+        complete,
+        missing_pad,
+    }
 }
 
 fn write_sub_chunks(subs: &[Chunk]) -> Vec<u8> {
@@ -51,6 +85,7 @@ fn info_index(chunks: &[Chunk]) -> Option<usize> {
 pub fn info_get(chunks: &[Chunk], key: &[u8; 4]) -> Option<String> {
     let list = &chunks[info_index(chunks)?];
     let sub = parse_sub_chunks(&list.data[4..])
+        .subs
         .into_iter()
         .find(|s| &s.id == key)?;
     let text = sub.data.split(|b| *b == 0).next().unwrap_or(&[]);
@@ -58,7 +93,9 @@ pub fn info_get(chunks: &[Chunk], key: &[u8; 4]) -> Option<String> {
 }
 
 /// Sets a text tag in the first `LIST/INFO` chunk, replacing an existing value
-/// in place or appending it. Creates a `LIST/INFO` chunk when there is none.
+/// in place or appending it. Creates a `LIST/INFO` chunk when there is none. An INFO
+/// list that cannot be read to its end is left byte for byte as it is (the tag is not
+/// set), so no entry is ever lost; [`info_warnings`] reports it on load.
 pub fn info_set(chunks: &mut Vec<Chunk>, key: &[u8; 4], value: &str) {
     let mut data = value.as_bytes().to_vec();
     data.push(0);
@@ -71,12 +108,36 @@ pub fn info_set(chunks: &mut Vec<Chunk>, key: &[u8; 4], value: &str) {
         });
         return;
     };
-    let mut subs = parse_sub_chunks(&chunks[i].data[4..]);
+    let parsed = parse_sub_chunks(&chunks[i].data[4..]);
+    if !parsed.complete {
+        return;
+    }
+    let mut subs = parsed.subs;
     match subs.iter_mut().find(|s| &s.id == key) {
         Some(existing) => *existing = new,
         None => subs.push(new),
     }
     chunks[i].data = write_sub_chunks(&subs);
+}
+
+/// Warnings about the first `LIST/INFO` chunk: entries missing their pad byte (fixed on
+/// save), or a list that cannot be read to its end (kept as is; its software tag is not
+/// updated).
+pub fn info_warnings(chunks: &[Chunk]) -> Vec<String> {
+    let Some(i) = info_index(chunks) else {
+        return Vec::new();
+    };
+    let parsed = parse_sub_chunks(&chunks[i].data[4..]);
+    let mut warnings = Vec::new();
+    if !parsed.complete {
+        warnings.push(
+            "the LIST/INFO chunk could not be read to its end; it will be saved unchanged,              without the software tag"
+                .to_owned(),
+        );
+    } else if parsed.missing_pad {
+        warnings.push("LIST/INFO entries without their pad byte were read; fixed on save".into());
+    }
+    warnings
 }
 
 /// Writes the root note and fine tune into an `inst` chunk body. The `inst`
@@ -189,7 +250,7 @@ mod tests {
             Some("Seamlime 0.1.0")
         );
         assert_eq!(info_get(&chunks, b"INAM").as_deref(), Some("0051"));
-        let subs = parse_sub_chunks(&chunks[1].data[4..]);
+        let subs = parse_sub_chunks(&chunks[1].data[4..]).subs;
         let ids: Vec<_> = subs.iter().map(|s| s.id).collect();
         assert_eq!(ids, vec![*b"INAM", *b"ISFT"]);
         // The declared sub-chunk data includes the NUL terminator.
@@ -203,7 +264,7 @@ mod tests {
         assert_eq!(info_get(&chunks, b"ICMT").as_deref(), Some("ab"));
         let data = &chunks[0].data;
         assert_eq!(&data[data.len() - 12..], b"ICMT\x03\0\0\0ab\0\0");
-        let subs = parse_sub_chunks(&data[4..]);
+        let subs = parse_sub_chunks(&data[4..]).subs;
         let ids: Vec<_> = subs.iter().map(|s| s.id).collect();
         assert_eq!(ids, vec![*b"INAM", *b"ISFT", *b"ICMT"]);
         assert_eq!(data.len() % 2, 0);
@@ -220,7 +281,7 @@ mod tests {
             info_get(&chunks, b"ISFT").as_deref(),
             Some("Seamlime 0.1.0")
         );
-        let subs = parse_sub_chunks(&chunks[1].data[4..]);
+        let subs = parse_sub_chunks(&chunks[1].data[4..]).subs;
         assert_eq!(subs.len(), 1);
     }
 
@@ -238,6 +299,63 @@ mod tests {
         );
         assert_eq!(info_get(&chunks, b"INAM").as_deref(), Some("0051"));
         assert_eq!(chunks[2], data_chunk());
+    }
+
+    /// A sub-chunk written without the pad byte after an odd-length value.
+    fn unpadded(id: &[u8; 4], value: &[u8]) -> Vec<u8> {
+        let mut v = id.to_vec();
+        v.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        v.extend_from_slice(value);
+        v
+    }
+
+    #[test]
+    fn info_entry_missing_its_pad_byte_keeps_every_tag() {
+        let lax = list(
+            b"INFO",
+            &[
+                unpadded(b"INAM", b"Lead\0"),
+                unpadded(b"ICMT", b"odd\0x"),
+                sub(b"ISFT", b"Other Tool 1.0\0"),
+                unpadded(b"IART", b"Me\0"),
+            ],
+        );
+        let mut chunks = vec![lax];
+        assert_eq!(info_get(&chunks, b"ICMT").as_deref(), Some("odd"));
+        assert_eq!(info_get(&chunks, b"IART").as_deref(), Some("Me"));
+        info_set(&mut chunks, b"ISFT", "Seamlime 0.1.0");
+        assert_eq!(info_get(&chunks, b"INAM").as_deref(), Some("Lead"));
+        assert_eq!(info_get(&chunks, b"ICMT").as_deref(), Some("odd"));
+        assert_eq!(info_get(&chunks, b"IART").as_deref(), Some("Me"));
+        assert_eq!(
+            info_get(&chunks, b"ISFT").as_deref(),
+            Some("Seamlime 0.1.0")
+        );
+        // Rewritten with the pad bytes in place.
+        let want = list(
+            b"INFO",
+            &[
+                sub(b"INAM", b"Lead\0"),
+                sub(b"ICMT", b"odd\0x"),
+                sub(b"ISFT", b"Seamlime 0.1.0\0"),
+                sub(b"IART", b"Me\0"),
+            ],
+        );
+        assert_eq!(chunks, vec![want]);
+        assert!(info_warnings(&chunks).is_empty());
+    }
+
+    #[test]
+    fn info_list_that_cannot_be_read_fully_is_kept_verbatim() {
+        let mut body = sub(b"INAM", b"Lead\0");
+        body.extend_from_slice(&[0x01, 0x02, 0x03, 0x04, 0xff, 0xff, 0, 0, 7, 7]);
+        let bad = list(b"INFO", &[body]);
+        let mut chunks = vec![bad.clone()];
+        assert_eq!(info_get(&chunks, b"INAM").as_deref(), Some("Lead"));
+        info_set(&mut chunks, b"ISFT", "Seamlime 0.1.0");
+        assert_eq!(chunks, vec![bad], "kept byte for byte");
+        assert_eq!(info_get(&chunks, b"ISFT"), None);
+        assert_eq!(info_warnings(&chunks).len(), 1);
     }
 
     #[test]

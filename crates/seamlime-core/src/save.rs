@@ -499,6 +499,25 @@ mod tests {
     }
 
     #[test]
+    fn lax_info_lists_lose_no_tags_on_save() {
+        // INAM "Lead\0" is odd-sized and its pad byte is missing.
+        let mut lax = b"INFOINAM\x05\0\0\0Lead\0".to_vec();
+        lax.extend_from_slice(b"ICMT\x04\0\0\0abc\0");
+        let d = doc(&file(vec![chunk(b"LIST", lax)], vec![]));
+        let c = chunks(&build_wav_bytes(&d, &d.initial_edit()));
+        assert_eq!(info_get(&c, b"INAM").as_deref(), Some("Lead"));
+        assert_eq!(info_get(&c, b"ICMT").as_deref(), Some("abc"));
+        assert_eq!(info_get(&c, b"ISFT"), Some(software_tag()));
+
+        // A list that cannot be read to its end is written back byte for byte.
+        let mut broken = b"INFOINAM\x04\0\0\0abc\0".to_vec();
+        broken.extend_from_slice(&[1, 2, 3, 4, 0xff, 0xff, 0, 0, 9, 9]);
+        let d = doc(&file(vec![chunk(b"LIST", broken.clone())], vec![]));
+        let c = chunks(&build_wav_bytes(&d, &d.initial_edit()));
+        assert_eq!(c[find(&c, b"LIST").unwrap()].data, broken);
+    }
+
+    #[test]
     fn head_trim_shifts_loop_offsets() {
         let bytes = file(
             vec![smpl_chunk(vec![

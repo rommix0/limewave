@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use crate::edit::{EditState, LoopMode};
 use crate::error::{LoadError, WavError};
-use crate::meta::info_get;
+use crate::meta::{info_get, info_warnings};
 use crate::riff::{RiffFile, find, list_type, parse_riff};
 use crate::smpl::{Smpl, smpl_to_tuning};
 use crate::wav::{WavFormat, decode, parse_fmt};
@@ -59,6 +59,7 @@ pub fn load_wav_bytes(path: PathBuf, bytes: &[u8]) -> Result<WavDocument, LoadEr
     });
     warnings.extend(derive_edit(frames, smpl.as_ref()).1);
 
+    warnings.extend(info_warnings(&riff.chunks));
     let name = info_get(&riff.chunks, b"INAM");
     let software = info_get(&riff.chunks, b"ISFT");
     let has_markers = find(&riff.chunks, b"cue ").is_some()
@@ -237,6 +238,21 @@ mod tests {
         assert_eq!(doc.software.as_deref(), Some("Tool 1.0"));
         assert!(doc.has_markers);
         assert!(!load(100, vec![]).unwrap().has_markers);
+    }
+
+    #[test]
+    fn unreadable_info_list_is_reported() {
+        let mut list = b"INFO".to_vec();
+        list.extend(sub(b"INAM", "Pad"));
+        list.extend_from_slice(&[1, 2, 3, 4, 0xff, 0xff, 0, 0, 9, 9]);
+        let extra = vec![Chunk {
+            id: *b"LIST",
+            data: list,
+        }];
+        let doc = load(100, extra).unwrap();
+        assert_eq!(doc.name.as_deref(), Some("Pad"));
+        assert_eq!(doc.warnings.len(), 1);
+        assert!(doc.warnings[0].contains("LIST/INFO"), "{:?}", doc.warnings);
     }
 
     #[test]
