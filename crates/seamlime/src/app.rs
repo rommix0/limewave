@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, TryRecvError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Key, KeyboardShortcut, Modifiers};
 use seamlime_core::document::{WavDocument, load_wav};
@@ -16,7 +16,13 @@ use crate::audio::engine::AudioEngine;
 use crate::audio::voice::{PlayBuffer, play_buffer};
 use crate::folder;
 use crate::theme::{self, colors};
+use crate::ui::coords::ViewTransform;
 use crate::ui::filelist;
+use crate::ui::overview::overview;
+use crate::ui::waveform::waveform_view;
+
+/// Longest a drag preview waits before the audio engine buffer is refreshed.
+const PREVIEW_PUSH_INTERVAL: Duration = Duration::from_millis(50);
 
 type LoadResult = (usize, Result<WavDocument, String>);
 
@@ -33,6 +39,12 @@ pub struct Session {
     pub destination: Option<Destination>,
     /// Set when the file was just saved; cleared by the UI that reports it.
     pub just_saved: bool,
+    /// What the waveform shows; `None` until the first draw fits the whole file.
+    pub view: Option<ViewTransform>,
+    /// The edit being dragged, not yet in the history.
+    pub preview: Option<EditState>,
+    /// When the engine buffer last followed a drag preview.
+    last_preview_push: Option<Instant>,
 }
 
 impl Session {
@@ -49,11 +61,19 @@ impl Session {
             rendered,
             destination: None,
             just_saved: false,
+            view: None,
+            preview: None,
+            last_preview_push: None,
         }
     }
 
     pub fn edit(&self) -> &EditState {
         self.history.current()
+    }
+
+    /// The edit the views draw: the drag preview if there is one, else the current edit.
+    pub fn shown_edit(&self) -> &EditState {
+        self.preview.as_ref().unwrap_or_else(|| self.edit())
     }
 
     /// The buffer the audio engine plays for the current edit.
@@ -63,31 +83,65 @@ impl Session {
 
     /// Records `e` (clamped to the file) as the new current edit.
     pub fn apply(&mut self, e: EditState, engine: Option<&AudioEngine>) {
+        self.preview = None;
         self.history.push(e.clamped(self.doc.frames));
         self.refresh(engine);
     }
 
     pub fn undo(&mut self, engine: Option<&AudioEngine>) {
+        self.preview = None;
         if self.history.undo() {
             self.refresh(engine);
         }
     }
 
     pub fn redo(&mut self, engine: Option<&AudioEngine>) {
+        self.preview = None;
         if self.history.redo() {
             self.refresh(engine);
         }
     }
 
-    /// Recomputes `rendered` and, with an engine, publishes the matching play buffer.
+    /// Shows `e` (clamped to the file) while a marker is dragged. The rendered audio and the
+    /// engine buffer follow at most every 50 ms; the history is untouched until
+    /// [`Session::commit_preview`].
+    pub fn set_preview(&mut self, e: EditState, engine: Option<&AudioEngine>) {
+        let e = e.clamped(self.doc.frames);
+        let due = self
+            .last_preview_push
+            .is_none_or(|t| t.elapsed() >= PREVIEW_PUSH_INTERVAL);
+        if due {
+            self.publish(&e, engine);
+            self.last_preview_push = Some(Instant::now());
+        }
+        self.preview = Some(e);
+    }
+
+    /// Ends a drag: the preview becomes one history entry (if it changed anything) and the
+    /// rendered audio and engine buffer are brought up to date.
+    pub fn commit_preview(&mut self, engine: Option<&AudioEngine>) {
+        self.last_preview_push = None;
+        match self.preview.take() {
+            Some(e) if e != *self.edit() => self.apply(e, engine),
+            _ => self.refresh(engine),
+        }
+    }
+
+    /// Recomputes `rendered` for the current edit and publishes it to the engine.
     fn refresh(&mut self, engine: Option<&AudioEngine>) {
+        let e = self.history.current().clone();
+        self.publish(&e, engine);
+    }
+
+    /// Renders `e` into `rendered` and, with an engine, publishes the matching play buffer.
+    fn publish(&mut self, e: &EditState, engine: Option<&AudioEngine>) {
         match engine {
             Some(engine) => {
-                let buffer = self.play_buffer();
+                let buffer = play_buffer(&self.doc.audio, self.doc.format.sample_rate, e);
                 self.rendered.clone_from(&buffer.audio);
                 engine.set_buffer(buffer);
             }
-            None => self.rendered = render(&self.doc.audio, self.history.current()),
+            None => self.rendered = render(&self.doc.audio, e),
         }
     }
 }
@@ -385,6 +439,12 @@ impl SeamlimeApp {
                 undo = ui.button("Undo").clicked();
                 redo = ui.button("Redo").clicked();
                 ui.separator();
+                ui.toggle_value(&mut self.ui.snap, "Snap").on_hover_text(
+                    "Snap loop markers to upward zero crossings (Shift disables while dragging)",
+                );
+                ui.toggle_value(&mut self.ui.lock_length, "Lock length")
+                    .on_hover_text("Moving either loop marker moves both");
+                ui.separator();
                 self.status(ui);
             });
         });
@@ -414,7 +474,9 @@ impl SeamlimeApp {
     }
 
     fn central(&mut self, ui: &mut egui::Ui) {
-        let Some(entry) = self.selected.and_then(|i| self.files.get(i)) else {
+        let engine = self.engine.as_ref();
+        let ui_state = &mut self.ui;
+        let Some(entry) = self.selected.and_then(|i| self.files.get_mut(i)) else {
             ui.weak("Open a WAV file or a folder to begin.");
             return;
         };
@@ -422,12 +484,17 @@ impl SeamlimeApp {
         match entry {
             FileEntry::Loaded(s) => {
                 ui.label(format!("{} frames", s.doc.frames));
+                overview(ui, s);
+                ui.add_space(4.0);
+                // The waveform gets its own region; the seam view goes below it.
+                let size = ui.available_size();
+                ui.allocate_ui(size, |ui| waveform_view(ui, s, ui_state, engine));
             }
             FileEntry::Loading(_) => {
                 ui.weak("Loading…");
             }
             FileEntry::Failed(_, e) => {
-                ui.colored_label(colors::END, e);
+                ui.colored_label(colors::END, e.as_str());
             }
         }
     }
@@ -514,6 +581,45 @@ mod tests {
                 .into_iter()
                 .any(|i| s.rendered[0][i] != s.doc.audio[0][i])
         );
+    }
+
+    #[test]
+    fn preview_is_throttled_and_commits_as_one_history_entry() {
+        let mut s = session();
+        let looped = |crossfade| EditState {
+            loop_mode: LoopMode::Forward,
+            loop_start: 2000,
+            loop_end: 6000,
+            crossfade,
+            ..s.edit().clone()
+        };
+        let (faded, plain) = (looped(10), looped(0));
+
+        s.set_preview(faded.clone(), None);
+        assert_eq!(s.shown_edit(), &faded);
+        assert!(!s.history.is_dirty(), "a preview is not in the history");
+        assert_ne!(
+            s.rendered[0][5995], s.doc.audio[0][5995],
+            "first preview renders"
+        );
+
+        // Within 50 ms the rendered audio is left alone, but the view follows at once.
+        s.set_preview(plain.clone(), None);
+        assert_eq!(s.shown_edit(), &plain);
+        assert_ne!(s.rendered[0][5995], s.doc.audio[0][5995], "throttled");
+
+        s.commit_preview(None);
+        assert!(s.preview.is_none());
+        assert_eq!(s.edit(), &plain);
+        assert_eq!(s.rendered, s.doc.audio, "release renders the final edit");
+        s.undo(None);
+        assert!(!s.history.is_dirty(), "one drag, one undo step");
+
+        // A drag that ends where it began adds nothing.
+        s.set_preview(s.edit().clone(), None);
+        s.commit_preview(None);
+        assert!(!s.history.is_dirty());
+        assert!(!s.history.undo());
     }
 
     #[test]
