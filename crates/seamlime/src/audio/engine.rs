@@ -221,6 +221,13 @@ impl AudioEngine {
         let _ = self.ui_tx.push(c);
     }
 
+    /// Releases every note and swaps in an empty buffer, so nothing from the previous file can
+    /// keep sounding.
+    pub fn silence(&mut self) {
+        self.send(Command::AllOff);
+        self.set_buffer(empty_buffer(self.device_rate));
+    }
+
     /// The producer end of the MIDI command queue. `Some` on the first call only.
     pub fn midi_sender(&mut self) -> Option<rtrb::Producer<Command>> {
         self.midi_tx.take()

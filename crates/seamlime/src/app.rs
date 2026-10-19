@@ -2,23 +2,29 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
-use eframe::egui::{self, Key, KeyboardShortcut, Modifiers};
+use eframe::egui::{self, Event, Key, KeyboardShortcut, Modifiers};
 use seamlime_core::document::{WavDocument, load_wav};
 use seamlime_core::dsp::{PeakPyramid, mono_sum};
 use seamlime_core::edit::{EditState, History};
+use seamlime_core::notes::note_name;
 use seamlime_core::render::render;
 use seamlime_core::save::Destination;
 
-use crate::audio::engine::AudioEngine;
+use crate::audio::engine::{AudioEngine, Command};
+use crate::audio::keys::{octave_shift, qwerty_note};
+use crate::audio::midi::{MidiConnection, connect_midi, list_midi_ports};
 use crate::audio::voice::{PlayBuffer, play_buffer};
 use crate::folder;
 use crate::theme::{self, colors};
 use crate::ui::coords::ViewTransform;
 use crate::ui::filelist;
 use crate::ui::inspector::inspector;
+use crate::ui::keyboard::keyboard_strip;
 use crate::ui::overview::overview;
 use crate::ui::seam::{DEFAULT_HALF, SeamChannel, seam_view};
 use crate::ui::waveform::waveform_view;
@@ -219,6 +225,16 @@ pub struct SeamlimeApp {
     pub ui: UiState,
     /// The action waiting on the unsaved-changes prompt.
     pub pending: Option<PendingAction>,
+    /// The selected file's Start frame, read by the MIDI thread for each note-on.
+    start_frame: Arc<AtomicUsize>,
+    midi: Option<MidiConnection>,
+    /// The MIDI command producer while no connection holds it.
+    midi_spare: Option<rtrb::Producer<Command>>,
+    midi_ports: Vec<String>,
+    midi_selected: Option<usize>,
+    midi_error: Option<String>,
+    /// True while the engine has been silenced because no loaded file is selected.
+    silenced: bool,
     ctx: egui::Context,
     loader: Option<Receiver<LoadResult>>,
     single_file: bool,
@@ -240,7 +256,12 @@ impl SeamlimeApp {
         Self::build(egui::Context::default(), None, None)
     }
 
-    fn build(ctx: egui::Context, engine: Option<AudioEngine>, audio_error: Option<String>) -> Self {
+    fn build(
+        ctx: egui::Context,
+        mut engine: Option<AudioEngine>,
+        audio_error: Option<String>,
+    ) -> Self {
+        let midi_spare = engine.as_mut().and_then(AudioEngine::midi_sender);
         SeamlimeApp {
             files: Vec::new(),
             selected: None,
@@ -248,6 +269,13 @@ impl SeamlimeApp {
             audio_error,
             ui: UiState::default(),
             pending: None,
+            start_frame: Arc::new(AtomicUsize::new(0)),
+            midi: None,
+            midi_spare,
+            midi_ports: Vec::new(),
+            midi_selected: None,
+            midi_error: None,
+            silenced: false,
             ctx,
             loader: None,
             single_file: false,
@@ -309,11 +337,142 @@ impl SeamlimeApp {
         self.files.iter().filter(|f| f.is_dirty()).count()
     }
 
-    /// Makes `i` the edited file and hands its sound to the audio engine.
+    /// Makes `i` the edited file and hands its sound to the audio engine. Notes still sounding
+    /// from the previous file are released.
     pub fn select(&mut self, i: usize) {
         self.selected = Some(i);
-        if let (Some(FileEntry::Loaded(s)), Some(engine)) = (self.files.get(i), &self.engine) {
-            engine.set_buffer(s.play_buffer());
+        self.release_all();
+        match (self.files.get(i), &mut self.engine) {
+            (Some(FileEntry::Loaded(s)), Some(engine)) => {
+                engine.set_buffer(s.play_buffer());
+                self.silenced = false;
+            }
+            (_, Some(engine)) => {
+                engine.silence();
+                self.silenced = true;
+            }
+            _ => {}
+        }
+    }
+
+    /// The selected file, if it is loaded.
+    fn selected_session(&self) -> Option<&Session> {
+        match self.selected.and_then(|i| self.files.get(i)) {
+            Some(FileEntry::Loaded(s)) => Some(s),
+            _ => None,
+        }
+    }
+
+    fn send(&mut self, c: Command) {
+        if let Some(engine) = &mut self.engine {
+            engine.send(c);
+        }
+    }
+
+    /// Releases every note and forgets the held keys.
+    fn release_all(&mut self) {
+        self.send(Command::AllOff);
+        self.ui.held.clear();
+    }
+
+    /// Starts `note` from the selected file's Start (the MIDI start frame).
+    fn note_on(&mut self, note: u8) {
+        self.ui.held.insert(note);
+        let from = self.start_frame.load(Ordering::Relaxed);
+        self.send(Command::NoteOn { note, from });
+    }
+
+    fn note_off(&mut self, note: u8) {
+        if self.ui.held.remove(&note) {
+            self.send(Command::NoteOff { note });
+        }
+    }
+
+    /// Plays the root note from the start (`from_loop == false`) or from the loop start.
+    fn play(&mut self, from_loop: bool) {
+        let Some(e) = self.selected_session().map(|s| s.shown_edit().clone()) else {
+            return;
+        };
+        let from = if from_loop { e.loop_start } else { e.start };
+        self.send(Command::NoteOn { note: e.root, from });
+    }
+
+    /// Keeps the engine and the MIDI start frame in step with the selection each frame.
+    fn sync_audio(&mut self) {
+        let start = self.selected_session().map(|s| s.shown_edit().start);
+        self.start_frame
+            .store(start.unwrap_or(0), Ordering::Relaxed);
+        if start.is_none() && !self.silenced {
+            self.release_all();
+            if let Some(engine) = &mut self.engine {
+                engine.silence();
+            }
+            self.silenced = true;
+        }
+    }
+
+    /// QWERTY notes and octave keys. Presses need audition on and no widget wanting the
+    /// keyboard; releases always count, so a note never sticks.
+    fn handle_keyboard(&mut self, ctx: &egui::Context) {
+        let events = ctx.input(|i| i.events.clone());
+        let accepting =
+            self.ui.audition && self.pending.is_none() && !ctx.egui_wants_keyboard_input();
+        for event in events {
+            match event {
+                Event::WindowFocused(false) => self.release_all(),
+                Event::Key {
+                    key,
+                    pressed: false,
+                    ..
+                } => {
+                    if let Some(note) = qwerty_note(key, self.ui.octave_base) {
+                        self.note_off(note);
+                    }
+                }
+                Event::Key {
+                    key,
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                    ..
+                } if accepting && !modifiers.command && !modifiers.alt => {
+                    if let Some(shift) = octave_shift(key) {
+                        let base = i16::from(self.ui.octave_base) + i16::from(shift);
+                        self.ui.octave_base = base.clamp(12, 96) as u8;
+                        // Held keys would release as different notes under the new base.
+                        self.release_all();
+                    } else if let Some(note) = qwerty_note(key, self.ui.octave_base) {
+                        self.note_on(note);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Switches the MIDI input to port `index`, or off for `None`.
+    fn choose_midi_port(&mut self, index: Option<usize>) {
+        self.send(Command::AllOff);
+        let producer = match self.midi.take() {
+            Some(conn) => Some(conn.close()),
+            None => self.midi_spare.take(),
+        };
+        self.midi_selected = None;
+        self.midi_error = None;
+        let Some(index) = index else {
+            self.midi_spare = producer;
+            return;
+        };
+        let Some(tx) = producer else { return };
+        match connect_midi(index, tx, Arc::clone(&self.start_frame)) {
+            Ok(conn) => {
+                self.midi = Some(conn);
+                self.midi_selected = Some(index);
+            }
+            Err((message, tx)) => {
+                self.midi_spare = Some(tx);
+                self.midi_error = Some(message);
+            }
         }
     }
 
@@ -399,6 +558,8 @@ impl SeamlimeApp {
         }
         self.handle_close_request(&ctx);
         self.handle_shortcuts(&ctx);
+        self.sync_audio();
+        self.handle_keyboard(&ctx);
 
         self.toolbar(ui);
         if !self.single_file {
@@ -415,10 +576,7 @@ impl SeamlimeApp {
             }
         }
         self.inspector_panel(ui);
-        // Panel scaffolding: the keyboard strip is filled in by a later task.
-        egui::Panel::bottom("keyboard")
-            .exact_size(84.0)
-            .show(ui, |_| {});
+        self.keyboard_panel(ui);
         egui::CentralPanel::default().show(ui, |ui| self.central(ui));
         self.unsaved_prompt(&ctx);
     }
@@ -438,12 +596,38 @@ impl SeamlimeApp {
             });
     }
 
+    fn keyboard_panel(&mut self, ui: &mut egui::Ui) {
+        let root = self.selected_session().map_or(60, |s| s.shown_edit().root);
+        let live = self.engine.is_some() && self.ui.audition;
+        let mut key = None;
+        egui::Panel::bottom("keyboard")
+            .exact_size(84.0)
+            .show(ui, |ui| {
+                ui.weak(format!(
+                    "Z row starts at {}; - and = shift the octave; root key {}",
+                    note_name(self.ui.octave_base),
+                    note_name(root)
+                ));
+                ui.add_enabled_ui(live, |ui| {
+                    key = keyboard_strip(ui, root, &self.ui.held);
+                });
+            });
+        match key {
+            Some((note, true)) => self.note_on(note),
+            Some((note, false)) => self.note_off(note),
+            None => {}
+        }
+    }
+
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         let mut action = None;
         let mut undo = false;
         let mut redo = false;
+        let mut play = None;
+        let mut stop = false;
+        let mut midi_choice = None;
         egui::Panel::top("toolbar").show(ui, |ui| {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 if ui.button("Open file…").clicked()
                     && let Some(p) = rfd::FileDialog::new()
                         .add_filter("WAV audio", &["wav", "WAV"])
@@ -466,9 +650,46 @@ impl SeamlimeApp {
                 ui.toggle_value(&mut self.ui.lock_length, "Lock length")
                     .on_hover_text("Moving either loop marker moves both");
                 ui.separator();
+                let can_play = self.engine.is_some() && self.selected_session().is_some();
+                ui.add_enabled_ui(can_play, |ui| {
+                    if ui
+                        .button("Play")
+                        .on_hover_text("Play from Start through the loop at the root key")
+                        .clicked()
+                    {
+                        play = Some(false);
+                    }
+                    if ui
+                        .button("Play loop")
+                        .on_hover_text("Play from the loop start at the root key")
+                        .clicked()
+                    {
+                        play = Some(true);
+                    }
+                    stop = ui.button("Stop").clicked();
+                });
+                ui.add_enabled_ui(self.engine.is_some(), |ui| {
+                    let on = ui
+                        .toggle_value(&mut self.ui.audition, "Audition")
+                        .on_hover_text("Play notes from the computer keyboard (Z and Q rows)");
+                    if on.changed() && !self.ui.audition {
+                        stop = true;
+                    }
+                    self.midi_menu(ui, &mut midi_choice);
+                });
+                ui.separator();
                 self.status(ui);
             });
         });
+        if let Some(from_loop) = play {
+            self.play(from_loop);
+        }
+        if stop {
+            self.release_all();
+        }
+        if let Some(choice) = midi_choice {
+            self.choose_midi_port(choice);
+        }
         if undo {
             self.undo();
         }
@@ -480,6 +701,38 @@ impl SeamlimeApp {
         }
     }
 
+    /// The MIDI input menu. Ports are listed afresh each time it is opened.
+    fn midi_menu(&mut self, ui: &mut egui::Ui, choice: &mut Option<Option<usize>>) {
+        let can_connect = self.midi.is_some() || self.midi_spare.is_some();
+        ui.add_enabled_ui(can_connect, |ui| {
+            let menu = ui.menu_button("MIDI", |ui| {
+                if ui
+                    .selectable_label(self.midi_selected.is_none(), "None")
+                    .clicked()
+                {
+                    *choice = Some(None);
+                }
+                for (i, name) in self.midi_ports.iter().enumerate() {
+                    if ui
+                        .selectable_label(self.midi_selected == Some(i), name)
+                        .clicked()
+                    {
+                        *choice = Some(Some(i));
+                    }
+                }
+                if self.midi_ports.is_empty() {
+                    ui.weak("No MIDI input ports found");
+                }
+                if let Some(err) = &self.midi_error {
+                    ui.colored_label(colors::END, err);
+                }
+            });
+            if menu.response.clicked() {
+                self.midi_ports = list_midi_ports();
+            }
+        });
+    }
+
     fn status(&self, ui: &mut egui::Ui) {
         if let Some(err) = &self.audio_error {
             ui.colored_label(colors::END, format!("Audio unavailable: {err}"));
@@ -488,6 +741,9 @@ impl SeamlimeApp {
                 "Audio: {} ({} Hz)",
                 engine.device_name, engine.device_rate
             ));
+        }
+        if let Some(err) = &self.midi_error {
+            ui.colored_label(colors::END, err);
         }
         if !self.single_file && !self.files.is_empty() {
             ui.weak(format!("{} files", self.files.len()));
