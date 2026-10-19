@@ -6,7 +6,7 @@ use eframe::egui::{
     self, Button, DragValue, Grid, RadioButton, RichText, ScrollArea, TextEdit, Ui,
 };
 use seamlime_core::document::load_wav;
-use seamlime_core::edit::{LoopMode, Marker, move_marker};
+use seamlime_core::edit::{EditState, LoopMode, Marker, move_marker};
 use seamlime_core::save::{Destination, SaveOutcome, default_folder, save_wav};
 use seamlime_core::software_tag;
 
@@ -301,7 +301,7 @@ fn dialog_body(ui: &mut Ui, st: &mut SaveDialogState, files: &[FileEntry]) {
     }
 
     group(ui, "Audio changes");
-    if chosen.iter().any(|s| s.edit().crossfade > 0) {
+    if chosen.iter().any(|s| mixes_crossfade(s.edit())) {
         ui.colored_label(colors::XFADE, "Loop crossfade will be mixed into the audio");
     }
     ui.horizontal(|ui| {
@@ -345,6 +345,12 @@ fn dialog_body(ui: &mut Ui, st: &mut SaveDialogState, files: &[FileEntry]) {
     ui.checkbox(&mut st.only_changed, "Only save files that changed");
 }
 
+/// Whether saving `e` mixes a crossfade into the audio. A crossfade kept while the loop is
+/// off does not count.
+fn mixes_crossfade(e: &EditState) -> bool {
+    e.crossfade.min(e.max_crossfade()) > 0
+}
+
 /// A session rebased onto its own file in `dir` saves over that file next time. `save_wav`
 /// refuses that in folder mode (it guards originals), so it replaces the saved file
 /// instead, with no backup. The original source is never in `dir` in this case: the
@@ -380,7 +386,7 @@ fn save_session(
             .min(frames.saturating_sub(1));
         e = move_marker(&e, Marker::End, end, false, frames);
     }
-    let crossfaded = e.clone().clamped(frames).crossfade > 0;
+    let crossfaded = mixes_crossfade(&e.clone().clamped(frames));
     let outcome =
         save_wav(&s.doc, &e, &effective_destination(s, dest)).map_err(|err| err.to_string())?;
     match load_wav(&outcome.written) {
@@ -468,7 +474,6 @@ mod tests {
     use std::path::Path;
 
     use seamlime_core::document::load_wav;
-    use seamlime_core::edit::{EditState, LoopMode};
     use seamlime_core::riff::Chunk;
     use seamlime_core::smpl::{Smpl, SmplLoop};
     use seamlime_core::testwav::{sine, wav_bytes};
@@ -767,6 +772,26 @@ mod tests {
         let e = edit_with(s, |e| e.root = 61);
         s.apply(e, None);
         assert!(!s.just_saved);
+    }
+
+    #[test]
+    fn a_crossfade_with_the_loop_off_is_not_mixed_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = write_looped(dir.path(), "tone.wav");
+        let mut app = app_with(std::slice::from_ref(&source));
+        let s = session(&mut app, 0);
+        let e = edit_with(s, |e| e.crossfade = 50);
+        s.apply(e, None);
+        assert!(mixes_crossfade(s.edit()));
+        let e = edit_with(s, |e| e.loop_mode = LoopMode::Off);
+        s.apply(e, None);
+        assert_eq!(s.edit().crossfade, 50, "kept for when the loop comes back");
+        assert!(!mixes_crossfade(s.edit()));
+
+        perform_save(&mut app, folder_request(vec![0], &dir.path().join("out")));
+        let s = session(&mut app, 0);
+        assert!(!s.history.is_dirty());
+        assert!(!s.just_saved, "nothing was mixed into the saved file");
     }
 
     #[test]
