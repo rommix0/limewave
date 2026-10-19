@@ -1,2 +1,10 @@
-# documents for project planning
-docs/
+# documents for project planning (reference material stays local)
+docs/*
+# ...except the design specs and plans, which are part of the project
+!docs/superpowers/
+
+# brainstorming mockups
+.superpowers/
+
+# third-party audio used for local testing only; not ours to publish
+samples/
