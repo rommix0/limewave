@@ -128,12 +128,46 @@ fn save_as_dialog_saves_and_rebases() {
     assert!(h.state().save_results.is_none());
     assert!(!session(h.state_mut()).history.is_dirty());
     assert_eq!(load_wav(&written).unwrap().initial_edit().root, 62);
-    let mut backups: Vec<_> = std::fs::read_dir(dir.path().join("seamlime"))
+    let names: Vec<_> = std::fs::read_dir(dir.path().join("seamlime"))
         .unwrap()
         .map(|e| e.unwrap().file_name().into_string().unwrap())
         .collect();
-    backups.sort();
-    assert_eq!(backups, vec!["tone.wav", "tone.wav.bak"]);
+    assert_eq!(
+        names,
+        vec!["tone.wav"],
+        "its own saved file is replaced, no .bak"
+    );
+}
+
+#[test]
+fn save_as_asks_before_replacing_another_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = write_wav(dir.path(), "tone.wav");
+    let out = dir.path().join("seamlime");
+    std::fs::create_dir(&out).unwrap();
+    std::fs::write(out.join("tone.wav"), b"someone else's file").unwrap();
+    let mut h = harness(edited_app(source));
+
+    h.key_press_modifiers(Modifiers::COMMAND | Modifiers::SHIFT, Key::S);
+    h.run();
+    h.get_by_label("1 file(s) already exist in this folder and will be replaced");
+    h.get_by_label("Save 1 file(s)").click();
+    h.run();
+    assert!(h.state().ui.save_dialog.open, "Save stays disabled");
+    assert_eq!(
+        std::fs::read(out.join("tone.wav")).unwrap(),
+        b"someone else's file"
+    );
+
+    h.get_by_label("Replace existing files").click();
+    h.run();
+    h.get_by_label("Save 1 file(s)").click();
+    h.run();
+    assert!(!h.state().ui.save_dialog.open);
+    assert!(
+        load_wav(&out.join("tone.wav")).is_ok(),
+        "replaced after the tick"
+    );
 }
 
 #[test]

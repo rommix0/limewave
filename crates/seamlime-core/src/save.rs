@@ -21,6 +21,9 @@ pub enum Destination {
     Folder(PathBuf),
     /// Over the original file, after copying it to [`backup_path`].
     OverwriteWithBackup,
+    /// Over `doc.path` itself, without a backup. Only for a document that was reopened
+    /// from a file this program saved, when it is saved again to the same place.
+    ReplaceSaved,
 }
 
 /// What a successful save wrote.
@@ -213,8 +216,8 @@ fn write_atomic(target: &Path, bytes: &[u8]) -> Result<(), SaveError> {
 ///
 /// `Folder` creates the folder if needed and refuses a folder that would put the file
 /// over the original. `OverwriteWithBackup` first copies the original to
-/// [`backup_path`] and aborts with [`SaveError::Backup`] if that fails. The write itself
-/// is atomic.
+/// [`backup_path`] and aborts with [`SaveError::Backup`] if that fails. `ReplaceSaved`
+/// writes over `doc.path` with no backup. The write itself is atomic.
 pub fn save_wav(
     doc: &WavDocument,
     e: &EditState,
@@ -242,6 +245,7 @@ pub fn save_wav(
             })?;
             (doc.path.clone(), Some(backup))
         }
+        Destination::ReplaceSaved => (doc.path.clone(), None),
     };
     write_atomic(&target, &bytes)?;
     Ok(SaveOutcome {
@@ -647,6 +651,28 @@ mod tests {
         assert_ne!(written, original);
         assert_eq!(written, build_wav_bytes(&d, &e));
         assert_eq!(backup_path(&path), dir.path().join("x.wav.2.bak"));
+    }
+
+    #[test]
+    fn replace_saved_writes_doc_path_without_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.wav");
+        std::fs::write(&path, file(vec![], vec![])).unwrap();
+
+        let d = load_wav(&path).unwrap();
+        let e = EditState {
+            root: 50,
+            ..d.initial_edit()
+        };
+        let out = save_wav(&d, &e, &Destination::ReplaceSaved).unwrap();
+        assert_eq!(out.written, path);
+        assert_eq!(out.backup, None);
+        assert_eq!(std::fs::read(&path).unwrap(), build_wav_bytes(&d, &e));
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(names, vec!["x.wav"], "no backup, no temporary file left");
     }
 
     #[test]

@@ -27,8 +27,8 @@ use crate::ui::inspector::inspector;
 use crate::ui::keyboard::keyboard_strip;
 use crate::ui::overview::overview;
 use crate::ui::save_dialog::{
-    SaveCommand, SaveDialogState, SaveRequest, SaveResult, perform_save, save_dialog,
-    save_results_window,
+    SaveCommand, SaveDialogState, SaveRequest, SaveResult, other_file_in_the_way, perform_save,
+    save_dialog, save_results_window,
 };
 use crate::ui::seam::{DEFAULT_HALF, SeamChannel, seam_view};
 use crate::ui::waveform::waveform_view;
@@ -360,12 +360,7 @@ impl SeamlimeApp {
         };
         match s.destination.clone() {
             Some(destination) => {
-                let req = SaveRequest {
-                    indices: vec![i],
-                    destination,
-                    trim_after_loop: None,
-                };
-                let results = perform_save(self, req);
+                let results = self.save_without_dialog(i, destination);
                 if results.iter().any(|(_, r)| r.is_err()) {
                     self.save_results = Some(results);
                 }
@@ -399,18 +394,34 @@ impl SeamlimeApp {
                 .destination
                 .clone()
                 .unwrap_or_else(|| Destination::Folder(default_folder(&s.doc.path)));
-            let req = SaveRequest {
-                indices: vec![i],
-                destination,
-                trim_after_loop: None,
-            };
-            results.extend(perform_save(self, req));
+            results.extend(self.save_without_dialog(i, destination));
         }
         let ok = results.iter().all(|(_, r)| r.is_ok());
         if !ok {
             self.save_results = Some(results);
         }
         ok
+    }
+
+    /// Saves file `i` to `destination` with nobody to ask: a folder save that would replace
+    /// a different file of the same name is refused instead (Save as… can confirm it).
+    fn save_without_dialog(&mut self, i: usize, destination: Destination) -> Vec<SaveResult> {
+        if let (Some(FileEntry::Loaded(s)), Destination::Folder(dir)) =
+            (self.files.get(i), &destination)
+            && other_file_in_the_way(dir, s).is_some()
+        {
+            let message = format!(
+                "a different file with this name already exists in {}; use Save as…",
+                dir.display()
+            );
+            return vec![(s.doc.path.clone(), Err(message))];
+        }
+        let req = SaveRequest {
+            indices: vec![i],
+            destination,
+            trim_after_loop: None,
+        };
+        perform_save(self, req)
     }
 
     fn run_save_command(&mut self, c: SaveCommand) {

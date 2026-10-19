@@ -1,6 +1,6 @@
 //! The save dialog, saving through `save_wav`, and rebasing a session on the saved file.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use eframe::egui::{
     self, Button, DragValue, Grid, RadioButton, RichText, ScrollArea, TextEdit, Ui,
@@ -41,6 +41,9 @@ pub struct SaveDialogState {
     pub folder_mode: bool,
     /// The per-file "save" ticks, indexed like the app's file list.
     pub selected_files: Vec<bool>,
+    /// The user agreed to replace other files of the same name in `folder`. Reset when the
+    /// dialog opens or the folder changes.
+    pub replace_existing: bool,
 }
 
 impl Default for SaveDialogState {
@@ -56,8 +59,20 @@ impl Default for SaveDialogState {
             current: 0,
             folder_mode: false,
             selected_files: Vec::new(),
+            replace_existing: false,
         }
     }
+}
+
+/// The file a folder save of `s` into `dir` would replace, when that file exists and is
+/// not `s`'s own file (a session reopened from its saved file replaces itself freely).
+pub fn other_file_in_the_way(dir: &Path, s: &Session) -> Option<PathBuf> {
+    let target = dir.join(s.doc.path.file_name()?);
+    let own = match (target.canonicalize(), s.doc.path.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => target == s.doc.path,
+    };
+    (target.exists() && !own).then_some(target)
 }
 
 impl SaveDialogState {
@@ -75,10 +90,34 @@ impl SaveDialogState {
         self.only_changed = folder_mode;
         self.selected_files = vec![true; files.len()];
         self.overwrite = s.destination == Some(Destination::OverwriteWithBackup);
+        self.replace_existing = false;
         self.folder = match &s.destination {
             Some(Destination::Folder(dir)) => dir.clone(),
             _ => default_folder(&s.doc.path),
         };
+    }
+
+    /// Changes the folder; any agreement to replace files there no longer holds.
+    pub fn set_folder(&mut self, folder: PathBuf) {
+        if folder != self.folder {
+            self.folder = folder;
+            self.replace_existing = false;
+        }
+    }
+
+    /// The chosen files that would replace a different file of the same name in the new
+    /// folder (none when overwriting originals).
+    pub fn conflicts(&self, files: &[FileEntry]) -> Vec<PathBuf> {
+        if self.overwrite {
+            return Vec::new();
+        }
+        self.chosen(files)
+            .into_iter()
+            .filter_map(|i| match &files[i] {
+                FileEntry::Loaded(s) => other_file_in_the_way(&self.folder, s),
+                _ => None,
+            })
+            .collect()
     }
 
     /// The loaded files the table lists: the current one, or all with `scope_all`.
@@ -118,10 +157,11 @@ impl SaveDialogState {
         }
     }
 
-    /// The request the Save button sends.
+    /// The request the Save button sends; `None` while it is disabled (nothing chosen, an
+    /// unusable folder, or other files would be replaced without "Replace existing files").
     pub fn request(&self, files: &[FileEntry]) -> Option<SaveRequest> {
         let indices = self.chosen(files);
-        if indices.is_empty() {
+        if indices.is_empty() || (!self.replace_existing && !self.conflicts(files).is_empty()) {
             return None;
         }
         Some(SaveRequest {
@@ -163,7 +203,7 @@ pub fn save_dialog(
             .show(ui, |ui| dialog_body(ui, st, app_files));
         ui.separator();
         let req = st.request(app_files);
-        let count = req.as_ref().map_or(0, |r| r.indices.len());
+        let count = st.chosen(app_files).len();
         ui.horizontal(|ui| {
             cancel = ui.button("Cancel").clicked();
             let save = ui.add_enabled(req.is_some(), Button::new(format!("Save {count} file(s)")));
@@ -204,19 +244,36 @@ fn dialog_body(ui: &mut Ui, st: &mut SaveDialogState, files: &[FileEntry]) {
             let field = ui.add(TextEdit::singleline(&mut text).desired_width(300.0));
             let field = field.labelled_by(new_folder.id);
             if field.changed() {
-                st.folder = PathBuf::from(text);
+                st.set_folder(PathBuf::from(text));
             }
             if ui.button("Browse…").clicked()
                 && let Some(dir) = rfd::FileDialog::new()
                     .set_directory(&st.folder)
                     .pick_folder()
             {
-                st.folder = dir;
+                st.set_folder(dir);
             }
         });
     });
     if !st.overwrite && !st.folder.is_absolute() {
         ui.colored_label(colors::END, "Enter the full path of a folder");
+    }
+    let conflicts = st.conflicts(files);
+    if !conflicts.is_empty() {
+        ui.colored_label(
+            colors::END,
+            format!(
+                "{} file(s) already exist in this folder and will be replaced",
+                conflicts.len()
+            ),
+        );
+        let names: Vec<String> = conflicts
+            .iter()
+            .filter_map(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .collect();
+        ui.add(egui::Label::new(RichText::new(names.join(", ")).weak()).wrap());
+        ui.checkbox(&mut st.replace_existing, "Replace existing files");
     }
     if ui.radio(st.overwrite, "Overwrite originals").clicked() {
         st.overwrite = true;
@@ -289,16 +346,16 @@ fn dialog_body(ui: &mut Ui, st: &mut SaveDialogState, files: &[FileEntry]) {
 }
 
 /// A session rebased onto its own file in `dir` saves over that file next time. `save_wav`
-/// refuses that in folder mode (it guards originals), so it goes through the backed-up
-/// overwrite instead. The original source is never in `dir` in this case: the session
-/// only remembers `dir` after reopening the file it wrote there.
+/// refuses that in folder mode (it guards originals), so it replaces the saved file
+/// instead, with no backup. The original source is never in `dir` in this case: the
+/// session only remembers `dir` after reopening the file it wrote there.
 fn effective_destination(s: &Session, dest: &Destination) -> Destination {
     match dest {
         Destination::Folder(dir)
             if s.destination.as_ref() == Some(dest)
                 && s.doc.path.file_name().map(|n| dir.join(n)).as_ref() == Some(&s.doc.path) =>
         {
-            Destination::OverwriteWithBackup
+            Destination::ReplaceSaved
         }
         _ => dest.clone(),
     }
@@ -663,10 +720,16 @@ mod tests {
         let results = perform_save(&mut app, folder_request(vec![0], &out));
         let outcome = results[0].1.as_ref().unwrap();
         assert_eq!(outcome.written, out.join("tone.wav"));
-        assert_eq!(outcome.backup, Some(out.join("tone.wav.bak")));
-        let root_in = |p: &Path| load_wav(p).unwrap().initial_edit().root;
-        assert_eq!(root_in(&out.join("tone.wav")), 64);
-        assert_eq!(root_in(&out.join("tone.wav.bak")), 62);
+        assert_eq!(outcome.backup, None, "its own saved file needs no backup");
+        assert_eq!(
+            load_wav(&out.join("tone.wav")).unwrap().initial_edit().root,
+            64
+        );
+        let names: Vec<_> = std::fs::read_dir(&out)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(names, vec!["tone.wav"]);
         let s = session(&mut app, 0);
         assert!(!s.history.is_dirty());
         assert_eq!(s.destination, Some(Destination::Folder(out.clone())));
@@ -856,5 +919,112 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, source);
         assert!(results[0].1.is_err());
+    }
+
+    #[test]
+    fn dialog_blocks_replacing_other_files_until_ticked() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = [
+            write_looped(dir.path(), "a.wav"),
+            write_looped(dir.path(), "b.wav"),
+        ];
+        let mut app = app_with(&paths);
+        let out = dir.path().join("seamlime");
+        std::fs::create_dir(&out).unwrap();
+        std::fs::write(out.join("a.wav"), b"unrelated").unwrap();
+
+        let mut st = SaveDialogState::default();
+        st.open_for(0, &app.files, true);
+        st.scope_all = true;
+        st.only_changed = false;
+        assert_eq!(st.conflicts(&app.files), vec![out.join("a.wav")]);
+        assert_eq!(st.request(&app.files), None, "blocked until ticked");
+        st.replace_existing = true;
+        assert_eq!(st.request(&app.files).unwrap().indices, vec![0, 1]);
+
+        // A new folder takes the agreement back; so does reopening the dialog.
+        st.set_folder(dir.path().join("other"));
+        assert!(!st.replace_existing);
+        assert!(st.conflicts(&app.files).is_empty());
+        st.set_folder(out.clone());
+        assert_eq!(st.request(&app.files), None);
+        st.replace_existing = true;
+        st.open_for(0, &app.files, true);
+        assert!(!st.replace_existing);
+
+        // Overwriting originals replaces nothing in the folder.
+        st.scope_all = true;
+        st.only_changed = false;
+        st.overwrite = true;
+        assert!(st.conflicts(&app.files).is_empty());
+        assert!(st.request(&app.files).is_some());
+
+        // A session reopened from its own saved file is not in its own way.
+        st.overwrite = false;
+        std::fs::remove_file(out.join("a.wav")).unwrap();
+        let s = session(&mut app, 0);
+        let e = edit_with(s, |e| e.root = 62);
+        s.apply(e, None);
+        assert!(
+            perform_save(&mut app, folder_request(vec![0], &out))[0]
+                .1
+                .is_ok()
+        );
+        assert_eq!(session(&mut app, 0).doc.path, out.join("a.wav"));
+        assert!(st.conflicts(&app.files).is_empty());
+    }
+
+    #[test]
+    fn save_all_refuses_to_replace_a_different_file() {
+        use crate::app::PendingAction;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = [
+            write_looped(dir.path(), "a.wav"),
+            write_looped(dir.path(), "b.wav"),
+        ];
+        let out = dir.path().join("seamlime");
+        std::fs::create_dir(&out).unwrap();
+        std::fs::write(out.join("a.wav"), b"unrelated").unwrap();
+        let mut app = app_with(&paths);
+        for i in [0, 1] {
+            let s = session(&mut app, i);
+            let e = edit_with(s, |e| e.root = 62);
+            s.apply(e, None);
+        }
+        let empty = dir.path().join("empty");
+        std::fs::create_dir(&empty).unwrap();
+
+        app.request(PendingAction::OpenFolder(empty));
+        app.resolve_pending_save_all();
+        assert_eq!(app.files.len(), 2, "the folder was not opened");
+        assert_eq!(std::fs::read(out.join("a.wav")).unwrap(), b"unrelated");
+        assert_eq!(
+            load_wav(&out.join("b.wav")).unwrap().initial_edit().root,
+            62
+        );
+        assert!(session(&mut app, 0).history.is_dirty());
+        assert!(!session(&mut app, 1).history.is_dirty());
+
+        let results = app.save_results.as_ref().unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].0, paths[0]);
+        let want = format!(
+            "a different file with this name already exists in {}; use Save as…",
+            out.display()
+        );
+        assert_eq!(results[0].1, Err(want));
+        assert!(results[1].1.is_ok());
+
+        // After a save into a folder, Save all replaces that same file again.
+        let s = session(&mut app, 1);
+        let e = edit_with(s, |e| e.root = 64);
+        s.apply(e, None);
+        app.save_results = None;
+        std::fs::remove_file(out.join("a.wav")).unwrap();
+        assert!(app.save_all());
+        assert_eq!(
+            load_wav(&out.join("b.wav")).unwrap().initial_edit().root,
+            64
+        );
     }
 }

@@ -113,6 +113,8 @@ fn save_section(ui: &mut Ui, s: &Session) -> Option<SaveCommand> {
         Some(Destination::OverwriteWithBackup) => {
             "Save overwrites the file, keeping a .bak copy".to_owned()
         }
+        // Only ever an effective destination; sessions remember the folder.
+        Some(Destination::ReplaceSaved) => "Save replaces this file".to_owned(),
         None => "Save asks where to write the file".to_owned(),
     };
     ui.add(egui::Label::new(RichText::new(place).weak()).wrap());
