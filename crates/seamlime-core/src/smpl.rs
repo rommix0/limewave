@@ -137,11 +137,18 @@ pub fn tuning_to_smpl(root: u8, cents: f32) -> (u32, u32) {
     }
 }
 
+/// The pitch fraction of exactly half a semitone.
+const HALF_SEMITONE: u32 = 1 << 31;
+
 /// Converts `smpl` `(unity_note, pitch_fraction)` into the nearest root note
-/// and a tuning offset in cents within `[-50, 50)`. A unity note above 127 is
-/// clamped to 127.
+/// and a tuning offset in cents within `[-50, 50)`, except that exactly half a
+/// semitone reads as `+50` on the unity note, so a saved `(n, +50)` comes back
+/// unchanged. A unity note above 127 is clamped to 127.
 pub fn smpl_to_tuning(unity: u32, fraction: u32) -> (u8, f32) {
     let unity = unity.min(127) as u8;
+    if fraction == HALF_SEMITONE {
+        return (unity, 50.0);
+    }
     let cents = fraction as f64 / FRACTION_SCALE * 100.0;
     if cents >= 50.0 && unity < 127 {
         (unity + 1, (cents - 100.0) as f32)
@@ -261,10 +268,10 @@ mod tests {
     #[test]
     fn tuning_roundtrip() {
         for root in 21u8..=108 {
-            for cents in [-50.0f32, -12.5, 0.0, 12.5, 49.9] {
+            for cents in [-50.0f32, -12.5, 0.0, 12.5, 49.9, 50.0] {
                 let (unity, fraction) = tuning_to_smpl(root, cents);
                 let (r, c) = smpl_to_tuning(unity, fraction);
-                assert!((-50.0..50.0).contains(&c), "cents {c} out of range");
+                assert!((-50.0..=50.0).contains(&c), "cents {c} out of range");
                 let want = root as f64 + cents as f64 / 100.0;
                 let got = r as f64 + c as f64 / 100.0;
                 assert!((want - got).abs() < 1e-5, "{root} {cents}: {got} != {want}");
@@ -274,6 +281,19 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn exact_half_semitone_reads_as_plus_50() {
+        assert_eq!(tuning_to_smpl(60, 50.0), (60, 1 << 31));
+        assert_eq!(smpl_to_tuning(60, 1 << 31), (60, 50.0));
+        // Only the exact half reads as +50; just above it is the next note.
+        let (r, c) = smpl_to_tuning(60, (1 << 31) + 1);
+        assert_eq!(r, 61);
+        assert!((c + 50.0).abs() < 1e-6, "{c}");
+        let (r, c) = smpl_to_tuning(60, (1 << 31) - 1);
+        assert_eq!(r, 60);
+        assert!(c < 50.0, "{c}");
     }
 
     #[test]
