@@ -1,0 +1,10 @@
+[package]
+name = "seamlime-core"
+description = "Core library for Seamlime: WAV/RIFF handling and loop analysis"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror = "2"

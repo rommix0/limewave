@@ -8,3 +8,6 @@ docs/*
 
 # third-party audio used for local testing only; not ours to publish
 samples/
+
+# build output
+/target/

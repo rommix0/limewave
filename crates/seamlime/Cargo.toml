@@ -1,0 +1,10 @@
+[package]
+name = "seamlime"
+description = "Seamlime: a loop and one-shot WAV sample editor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+seamlime-core = { path = "../seamlime-core" }
