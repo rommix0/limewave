@@ -150,7 +150,9 @@ fn save_as_asks_before_replacing_another_file() {
 
     h.key_press_modifiers(Modifiers::COMMAND | Modifiers::SHIFT, Key::S);
     h.run();
-    h.get_by_label("1 file(s) already exist in this folder and will be replaced");
+    h.get_by_label(
+        "1 file(s) already exist in this folder and will be replaced; each replaced file is kept as a .bak copy",
+    );
     h.get_by_label("Save 1 file(s)").click();
     h.run();
     assert!(h.state().ui.save_dialog.open, "Save stays disabled");
@@ -167,6 +169,11 @@ fn save_as_asks_before_replacing_another_file() {
     assert!(
         load_wav(&out.join("tone.wav")).is_ok(),
         "replaced after the tick"
+    );
+    assert_eq!(
+        std::fs::read(out.join("tone.wav.bak")).unwrap(),
+        b"someone else's file",
+        "the replaced file is kept as a backup"
     );
 }
 

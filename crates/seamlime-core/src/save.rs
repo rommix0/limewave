@@ -17,9 +17,10 @@ use crate::wav::{encode_frames, frame_stride};
 /// Where a save goes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Destination {
-    /// Into this folder (created if missing), keeping the file name.
+    /// Into this folder (created if missing), keeping the file name. A different file of
+    /// that name already there is first copied to a numbered `.bak` next to it.
     Folder(PathBuf),
-    /// Over the original file, after copying it to [`backup_path`].
+    /// Over the original file, after copying it to a numbered `.bak` (see [`backup_path`]).
     OverwriteWithBackup,
     /// Over `doc.path` itself, without a backup. Only for a document that was reopened
     /// from a file this program saved, when it is saved again to the same place.
@@ -215,9 +216,10 @@ fn write_atomic(target: &Path, bytes: &[u8]) -> Result<(), SaveError> {
 /// Writes `doc` edited by `e` to `dest`.
 ///
 /// `Folder` creates the folder if needed and refuses a folder that would put the file
-/// over the original. `OverwriteWithBackup` first copies the original to
-/// [`backup_path`] and aborts with [`SaveError::Backup`] if that fails. `ReplaceSaved`
-/// writes over `doc.path` with no backup. The write itself is atomic.
+/// over the original; a different file it replaces is backed up first.
+/// `OverwriteWithBackup` first backs up the original. A failed backup aborts the save
+/// with [`SaveError::Backup`] before anything is written. `ReplaceSaved` writes over
+/// `doc.path` with no backup. The write itself is atomic.
 pub fn save_wav(
     doc: &WavDocument,
     e: &EditState,
@@ -235,14 +237,14 @@ pub fn save_wav(
                 return Err(SaveError::WouldOverwriteOriginal(target));
             }
             std::fs::create_dir_all(dir)?;
-            (target, None)
+            let backup = match std::fs::symlink_metadata(&target) {
+                Ok(_) => Some(make_backup(&target)?),
+                Err(_) => None,
+            };
+            (target, backup)
         }
         Destination::OverwriteWithBackup => {
-            let backup = backup_path(&doc.path);
-            std::fs::copy(&doc.path, &backup).map_err(|source| SaveError::Backup {
-                path: backup.clone(),
-                source,
-            })?;
+            let backup = make_backup(&doc.path)?;
             (doc.path.clone(), Some(backup))
         }
         Destination::ReplaceSaved => (doc.path.clone(), None),
@@ -254,21 +256,66 @@ pub fn save_wav(
     })
 }
 
-/// The first of `<name>.bak`, `<name>.1.bak`, `<name>.2.bak`, … that does not exist.
-pub fn backup_path(original: &Path) -> PathBuf {
-    let name = original.file_name().unwrap_or_default();
-    let with_suffix = |suffix: &str| {
-        let mut n = name.to_os_string();
-        n.push(suffix);
-        original.with_file_name(n)
-    };
-    let mut candidate = with_suffix(".bak");
-    let mut i: u64 = 1;
-    while candidate.exists() {
-        candidate = with_suffix(&format!(".{i}.bak"));
-        i += 1;
+/// Backup name number `n` for `original`: `<name>.bak` for 0, else `<name>.<n>.bak`.
+fn backup_candidate(original: &Path, n: u64) -> PathBuf {
+    let mut name = original.file_name().unwrap_or_default().to_os_string();
+    if n == 0 {
+        name.push(".bak");
+    } else {
+        name.push(format!(".{n}.bak"));
     }
-    candidate
+    original.with_file_name(name)
+}
+
+/// The first of `<name>.bak`, `<name>.1.bak`, `<name>.2.bak`, … that does not exist (a
+/// dangling link counts as existing).
+pub fn backup_path(original: &Path) -> PathBuf {
+    (0..)
+        .map(|n| backup_candidate(original, n))
+        .find(|p| std::fs::symlink_metadata(p).is_err())
+        .unwrap_or_else(|| backup_candidate(original, 0))
+}
+
+/// Copies `original` to the first free numbered backup name and returns it. Each name is
+/// created exclusively, so an existing file or link is never written through or replaced
+/// (a name taken in the meantime moves on to the next number), and a partial copy is
+/// removed.
+fn make_backup(original: &Path) -> Result<PathBuf, SaveError> {
+    let mut source = std::fs::File::open(original).map_err(|source| SaveError::Backup {
+        path: backup_candidate(original, 0),
+        source,
+    })?;
+    let mut n = 0;
+    loop {
+        let path = backup_candidate(original, n);
+        let mut file = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                n += 1;
+                continue;
+            }
+            Err(source) => return Err(SaveError::Backup { path, source }),
+        };
+        let copied = std::io::copy(&mut source, &mut file).and_then(|_| file.sync_all());
+        drop(file);
+        return match copied {
+            Ok(()) => {
+                // Like `fs::copy`, keep the original's permissions (best effort).
+                if let Ok(meta) = source.metadata() {
+                    let _ = std::fs::set_permissions(&path, meta.permissions());
+                }
+                Ok(path)
+            }
+            Err(source) => {
+                let _ = std::fs::remove_file(&path);
+                Err(SaveError::Backup { path, source })
+            }
+        };
+    }
 }
 
 /// The default save folder: `<source dir>/seamlime`.
@@ -670,6 +717,89 @@ mod tests {
         assert_ne!(written, original);
         assert_eq!(written, build_wav_bytes(&d, &e));
         assert_eq!(backup_path(&path), dir.path().join("x.wav.2.bak"));
+    }
+
+    fn names_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn failed_backup_aborts_the_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = file(vec![], vec![]);
+        let e = |d: &WavDocument| EditState {
+            root: 50,
+            ..d.initial_edit()
+        };
+
+        // The original is gone: nothing to back up, so nothing is written.
+        let gone = load_wav_bytes(dir.path().join("gone.wav"), &bytes).unwrap();
+        let err = save_wav(&gone, &e(&gone), &Destination::OverwriteWithBackup).unwrap_err();
+        assert!(matches!(err, SaveError::Backup { .. }), "{err}");
+        assert!(
+            names_in(dir.path()).is_empty(),
+            "no file, no partial backup"
+        );
+
+        // The "original" is a folder: it cannot be copied, and no partial backup is left.
+        let folder = dir.path().join("folder.wav");
+        std::fs::create_dir(&folder).unwrap();
+        let d = load_wav_bytes(folder.clone(), &bytes).unwrap();
+        let err = save_wav(&d, &e(&d), &Destination::OverwriteWithBackup).unwrap_err();
+        assert!(matches!(err, SaveError::Backup { .. }), "{err}");
+        assert_eq!(names_in(dir.path()), vec!["folder.wav"]);
+        assert_eq!(std::fs::read_dir(&folder).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn folder_save_backs_up_a_different_file_it_replaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.wav");
+        let original = file(vec![], vec![]);
+        std::fs::write(&path, &original).unwrap();
+        let out = dir.path().join("out");
+        std::fs::create_dir(&out).unwrap();
+        std::fs::write(out.join("x.wav"), b"unrelated").unwrap();
+
+        let d = load_wav(&path).unwrap();
+        let e = EditState {
+            root: 50,
+            ..d.initial_edit()
+        };
+        let saved = save_wav(&d, &e, &Destination::Folder(out.clone())).unwrap();
+        assert_eq!(saved.written, out.join("x.wav"));
+        assert_eq!(saved.backup, Some(out.join("x.wav.bak")));
+        assert_eq!(std::fs::read(out.join("x.wav.bak")).unwrap(), b"unrelated");
+        assert_eq!(
+            std::fs::read(out.join("x.wav")).unwrap(),
+            build_wav_bytes(&d, &e)
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backup_never_follows_a_dangling_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.wav");
+        let original = file(vec![], vec![]);
+        std::fs::write(&path, &original).unwrap();
+        let elsewhere = dir.path().join("elsewhere");
+        std::os::unix::fs::symlink(&elsewhere, dir.path().join("x.wav.bak")).unwrap();
+
+        let d = load_wav(&path).unwrap();
+        let out = save_wav(&d, &d.initial_edit(), &Destination::OverwriteWithBackup).unwrap();
+        assert_eq!(out.backup, Some(dir.path().join("x.wav.1.bak")));
+        assert!(!elsewhere.exists(), "the link target was not written");
+        assert_eq!(
+            std::fs::read(dir.path().join("x.wav.1.bak")).unwrap(),
+            original
+        );
     }
 
     #[test]

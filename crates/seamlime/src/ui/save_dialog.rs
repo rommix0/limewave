@@ -263,7 +263,7 @@ fn dialog_body(ui: &mut Ui, st: &mut SaveDialogState, files: &[FileEntry]) {
         ui.colored_label(
             colors::END,
             format!(
-                "{} file(s) already exist in this folder and will be replaced",
+                "{} file(s) already exist in this folder and will be replaced; each replaced file is kept as a .bak copy",
                 conflicts.len()
             ),
         );
@@ -972,6 +972,27 @@ mod tests {
         );
         assert_eq!(session(&mut app, 0).doc.path, out.join("a.wav"));
         assert!(st.conflicts(&app.files).is_empty());
+    }
+
+    #[test]
+    fn replacing_a_different_file_keeps_it_as_a_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = write_looped(dir.path(), "a.wav");
+        let out = dir.path().join("seamlime");
+        std::fs::create_dir(&out).unwrap();
+        std::fs::write(out.join("a.wav"), b"unrelated").unwrap();
+        let mut app = app_with(std::slice::from_ref(&source));
+        let mut st = SaveDialogState::default();
+        st.open_for(0, &app.files, false);
+        st.replace_existing = true;
+        let req = st.request(&app.files).unwrap();
+
+        let results = perform_save(&mut app, req);
+        let outcome = results[0].1.as_ref().unwrap();
+        assert_eq!(outcome.written, out.join("a.wav"));
+        assert_eq!(outcome.backup, Some(out.join("a.wav.bak")));
+        assert_eq!(std::fs::read(out.join("a.wav.bak")).unwrap(), b"unrelated");
+        assert_eq!(session(&mut app, 0).doc.path, out.join("a.wav"));
     }
 
     #[test]
