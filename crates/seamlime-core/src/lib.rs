@@ -1,5 +1,6 @@
 //! Seamlime core library: WAV/RIFF handling and loop analysis.
 
+pub mod document;
 pub mod edit;
 pub mod error;
 pub mod meta;
@@ -10,7 +11,7 @@ pub mod smpl;
 pub mod testwav;
 pub mod wav;
 
-pub use error::WavError;
+pub use error::{LoadError, WavError};
 
 /// The software tag written into exported WAV files, e.g. `Seamlime 0.1.0`.
 pub fn software_tag() -> String {

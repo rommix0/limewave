@@ -18,3 +18,12 @@ pub enum WavError {
     #[error("too many channels: {0}")]
     TooManyChannels(u16),
 }
+
+/// Everything that can go wrong while loading a WAV file from disk.
+#[derive(Debug, Error)]
+pub enum LoadError {
+    #[error("could not read file: {0}")]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Wav(#[from] WavError),
+}
