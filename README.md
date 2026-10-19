@@ -27,7 +27,7 @@ To run the tests: `cargo test --workspace`.
 On Linux, install the development packages for audio, MIDI and the window system first. On Debian and Ubuntu:
 
 ```
-sudo apt-get install -y libasound2-dev libudev-dev libgtk-3-dev libxkbcommon-dev
+sudo apt-get install -y libasound2-dev libudev-dev libxkbcommon-dev
 ```
 
 The application icon sources and PNGs live in `assets/icon`.
