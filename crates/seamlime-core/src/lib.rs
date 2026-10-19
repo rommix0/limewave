@@ -1,6 +1,8 @@
 //! Seamlime core library: WAV/RIFF handling and loop analysis.
 
 pub mod error;
+pub mod meta;
+pub mod notes;
 pub mod riff;
 pub mod smpl;
 #[cfg(any(test, feature = "testwav"))]
