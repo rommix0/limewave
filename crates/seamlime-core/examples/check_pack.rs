@@ -12,10 +12,11 @@
 //!
 //! Loaded into a sampler, each should sound in tune at A4, and the third should loop cleanly.
 
+use std::error::Error;
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
 
 use seamlime_core::document::load_wav;
+use seamlime_core::edit::LoopMode;
 use seamlime_core::riff::Chunk;
 use seamlime_core::smpl::{Smpl, SmplLoop, sample_period, tuning_to_smpl};
 use seamlime_core::testwav::{sine, wav_bytes};
@@ -70,21 +71,20 @@ fn write_sine(dir: &Path, name: &str, freq: f64, smpl: Chunk) -> std::io::Result
     Ok(path)
 }
 
-fn main() -> ExitCode {
-    let Some(dir) = std::env::args_os().nth(1).map(PathBuf::from) else {
-        eprintln!("usage: check_pack <out dir>");
-        return ExitCode::FAILURE;
-    };
-    match run(&dir) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("check_pack: {e}");
-            ExitCode::FAILURE
-        }
-    }
+fn main() -> Result<(), Box<dyn Error>> {
+    let dir = std::env::args_os()
+        .nth(1)
+        .map(PathBuf::from)
+        .ok_or("usage: check_pack <out dir>")?;
+    run(&dir)
 }
 
-fn run(dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+/// Fails with `message` unless `ok` holds.
+fn check(ok: bool, message: impl FnOnce() -> String) -> Result<(), Box<dyn Error>> {
+    if ok { Ok(()) } else { Err(message().into()) }
+}
+
+fn run(dir: &Path) -> Result<(), Box<dyn Error>> {
     std::fs::create_dir_all(dir)?;
     let loop_len = LOOP_STEP * LOOP_PERIODS_OF_STEP;
     let loop_range = (LOOP_START, LOOP_START + loop_len - 1);
@@ -108,8 +108,38 @@ fn run(dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
         // Read the file back through the library to make sure it says what we meant.
         let doc = load_wav(&path)?;
         let edit = doc.initial_edit();
-        assert_eq!(edit.root, ROOT, "{name}: root note");
-        assert!((edit.cents - cents).abs() < 0.001, "{name}: fine tune");
+        check(edit.root == ROOT, || {
+            format!("{name}: root note is {}, expected {ROOT}", edit.root)
+        })?;
+        check((edit.cents - cents).abs() < 0.001, || {
+            format!("{name}: fine tune is {}, expected {cents}", edit.cents)
+        })?;
+        match looped {
+            Some((start, end)) => {
+                check(edit.loop_mode == LoopMode::Forward, || {
+                    format!(
+                        "{name}: loop mode is {:?}, expected Forward",
+                        edit.loop_mode
+                    )
+                })?;
+                check((edit.loop_start, edit.loop_end) == (start, end), || {
+                    format!(
+                        "{name}: loop is {}..={}, expected {start}..={end}",
+                        edit.loop_start, edit.loop_end
+                    )
+                })?;
+                // The sample after the loop end must continue the loop start exactly, to
+                // within one 16-bit step, or the loop would click.
+                let x = &doc.audio[0];
+                let gap = (x[start] - x[end + 1]).abs();
+                check(gap <= 1.0 / 32768.0, || {
+                    format!("{name}: loop is not periodic, seam gap is {gap}")
+                })?;
+            }
+            None => check(edit.loop_mode == LoopMode::Off, || {
+                format!("{name}: loop mode is {:?}, expected Off", edit.loop_mode)
+            })?,
+        }
         println!("wrote {} ({freq:.4} Hz)", path.display());
     }
     Ok(())

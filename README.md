@@ -42,7 +42,7 @@ Notes play when the **Audition** toggle is on and no text field has focus.
 | Q 2 W 3 E R 5 T 6 Y 7 U I | Upper row of notes, one octave higher than the lower row. |
 | - and = | Move both rows down or up one octave. |
 | Ctrl/Cmd+Z | Undo |
-| Ctrl/Cmd+Shift+Z, Ctrl+Y | Redo |
+| Ctrl/Cmd+Shift+Z or Ctrl/Cmd+Y | Redo |
 | Ctrl/Cmd+S | Save |
 | Ctrl/Cmd+Shift+S | Save as… |
 | Hold Shift while dragging a marker | Turn zero-crossing snap off for that drag |
