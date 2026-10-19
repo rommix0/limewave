@@ -3158,6 +3158,7 @@ dependencies = [
  "rfd",
  "rtrb",
  "seamlime-core",
+ "tempfile",
 ]
 
 [[package]]

@@ -18,3 +18,4 @@ rtrb = "0.4"
 [dev-dependencies]
 seamlime-core = { path = "../seamlime-core", features = ["testwav"] }
 egui_kittest = "0.37"
+tempfile = "3"
