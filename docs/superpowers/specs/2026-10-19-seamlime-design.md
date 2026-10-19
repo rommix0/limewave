@@ -49,8 +49,8 @@ A hand-editing loop tool that someone would actually use on real samples:
 
 ### Not planned at all (for now)
 
-- SF2 / SoundFont, Kontakt or other proprietary instrument formats.
-- A VST3/CLAP plugin version (keep the core library free of UI and audio-device code so a CLAP plugin stays possible later).
+- Other proprietary or third-party instrument formats.
+- An audio plugin version (keep the core library free of UI and audio-device code so a CLAP plugin stays possible later).
 - Recording, general audio effects, resampling, time-stretch.
 - A browser version.
 
