@@ -189,8 +189,9 @@ fn same_file(a: &Path, b: &Path) -> bool {
 }
 
 /// Writes `bytes` to a temporary file next to `target`, then renames it over `target`.
-/// On any error the temporary file is removed and `target` is untouched.
-fn write_atomic(target: &Path, bytes: &[u8]) -> Result<(), SaveError> {
+/// The result takes the permissions of the file it replaces, or of `source` when `target`
+/// is new. On any error the temporary file is removed and `target` is untouched.
+fn write_atomic(target: &Path, source: &Path, bytes: &[u8]) -> Result<(), SaveError> {
     let dir = match target.parent() {
         Some(p) if !p.as_os_str().is_empty() => p,
         _ => Path::new("."),
@@ -199,8 +200,8 @@ fn write_atomic(target: &Path, bytes: &[u8]) -> Result<(), SaveError> {
     tmp.write_all(bytes)?;
     tmp.flush()?;
     tmp.as_file().sync_all()?;
-    // Keep the replaced file's permissions (the temporary file is created private).
-    if let Ok(meta) = std::fs::metadata(target) {
+    // The temporary file is created private (owner-only on Unix).
+    if let Ok(meta) = std::fs::metadata(target).or_else(|_| std::fs::metadata(source)) {
         let perms = meta.permissions();
         if !perms.readonly() {
             std::fs::set_permissions(tmp.path(), perms)?;
@@ -249,7 +250,7 @@ pub fn save_wav(
         }
         Destination::ReplaceSaved => (doc.path.clone(), None),
     };
-    write_atomic(&target, &bytes)?;
+    write_atomic(&target, &doc.path, &bytes)?;
     Ok(SaveOutcome {
         written: target,
         backup,
@@ -800,6 +801,29 @@ mod tests {
             std::fs::read(dir.path().join("x.wav.1.bak")).unwrap(),
             original
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn new_files_take_the_source_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.wav");
+        std::fs::write(&path, file(vec![], vec![])).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let d = load_wav(&path).unwrap();
+        let out = save_wav(
+            &d,
+            &d.initial_edit(),
+            &Destination::Folder(dir.path().join("o")),
+        )
+        .unwrap();
+        let mode = std::fs::metadata(&out.written)
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o644);
     }
 
     #[test]
