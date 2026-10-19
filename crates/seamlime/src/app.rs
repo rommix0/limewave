@@ -456,17 +456,13 @@ impl SeamlimeApp {
     pub fn select(&mut self, i: usize) {
         self.selected = Some(i);
         self.release_all();
+        let loaded = matches!(self.files.get(i), Some(FileEntry::Loaded(_)));
         match (self.files.get(i), &mut self.engine) {
-            (Some(FileEntry::Loaded(s)), Some(engine)) => {
-                engine.set_buffer(s.play_buffer());
-                self.silenced = false;
-            }
-            (_, Some(engine)) => {
-                engine.silence();
-                self.silenced = true;
-            }
+            (Some(FileEntry::Loaded(s)), Some(engine)) => engine.set_buffer(s.play_buffer()),
+            (_, Some(engine)) => engine.silence(),
             _ => {}
         }
+        self.silenced = !loaded;
     }
 
     /// The selected file, if it is loaded.
@@ -629,7 +625,10 @@ impl SeamlimeApp {
                 Ok(doc) => FileEntry::Loaded(Box::new(Session::new(doc))),
                 Err(e) => FileEntry::Failed(slot.path().to_path_buf(), e),
             };
-            if self.selected.is_none() && matches!(self.files[i], FileEntry::Loaded(_)) {
+            // The first loaded file is selected; a file selected while it was still loading
+            // gets its sound now.
+            let loaded = matches!(self.files[i], FileEntry::Loaded(_));
+            if loaded && self.selected.is_none_or(|s| s == i) {
                 self.select(i);
             }
         }
@@ -1065,6 +1064,29 @@ mod tests {
         s.commit_preview(None);
         assert!(!s.history.is_dirty());
         assert!(!s.history.undo());
+    }
+
+    #[test]
+    fn a_file_selected_while_loading_gets_its_sound_once_loaded() {
+        let mut app = SeamlimeApp::for_test();
+        app.files = vec![
+            FileEntry::Loading(PathBuf::from("a.wav")),
+            FileEntry::Loading(PathBuf::from("t.wav")),
+        ];
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.loader = Some(rx);
+        app.select(1);
+        assert!(app.silenced, "nothing to play yet");
+
+        tx.send((1, Ok(session().doc))).unwrap();
+        app.drain_loader();
+        assert_eq!(app.selected, Some(1));
+        assert!(!app.silenced, "the loaded file's sound was handed over");
+
+        // A file that finishes loading while another is selected changes nothing.
+        tx.send((0, Ok(session().doc))).unwrap();
+        app.drain_loader();
+        assert_eq!(app.selected, Some(1));
     }
 
     #[test]
