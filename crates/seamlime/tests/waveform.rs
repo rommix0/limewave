@@ -60,6 +60,8 @@ fn looped_harness() -> Harness<'static, SeamlimeApp> {
     app.open_file(path);
     let mut harness = Harness::builder()
         .with_size(eframe::egui::vec2(1100.0, 700.0))
+        // The seam readout uses an arrow that the test font set lacks.
+        .allow_missing_glyphs()
         .build_ui_state(|ui, app: &mut SeamlimeApp| app.show(ui), app);
     harness.run();
     harness
@@ -251,6 +253,8 @@ fn opening_a_long_stereo_file_renders_quickly() {
     app.select(0);
     let mut h = Harness::builder()
         .with_size(eframe::egui::vec2(1100.0, 700.0))
+        // The seam readout uses an arrow that the test font set lacks.
+        .allow_missing_glyphs()
         .build_ui_state(|ui, app: &mut SeamlimeApp| app.show(ui), app);
     let t = Instant::now();
     h.step();

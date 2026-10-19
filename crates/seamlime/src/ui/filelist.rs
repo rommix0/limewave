@@ -53,12 +53,12 @@ fn row(ui: &mut Ui, entry: &FileEntry, selected: bool) -> bool {
         FileEntry::Loaded(s) => {
             thumbnail(&mut inner, s);
             inner.vertical(|ui| {
-                let shown = if s.history.is_dirty() {
-                    format!("● {name}")
-                } else {
-                    name
-                };
-                ui.add(egui::Label::new(shown).truncate());
+                ui.horizontal(|ui| {
+                    if s.history.is_dirty() {
+                        dirty_dot(ui);
+                    }
+                    ui.add(egui::Label::new(name).truncate());
+                });
                 chips(ui, s);
             });
         }
@@ -79,6 +79,12 @@ fn row(ui: &mut Ui, entry: &FileEntry, selected: bool) -> bool {
         }
     }
     response.clicked()
+}
+
+/// The unsaved-changes marker: a small filled circle (drawn, as not every font has the glyph).
+fn dirty_dot(ui: &mut Ui) {
+    let (rect, _) = ui.allocate_exact_size(vec2(8.0, 8.0), Sense::hover());
+    ui.painter().circle_filled(rect.center(), 3.0, colors::LOOP);
 }
 
 fn chips(ui: &mut Ui, s: &Session) {

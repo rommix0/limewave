@@ -23,6 +23,8 @@ fn write_wav(dir: &Path, name: &str) -> PathBuf {
 fn harness(app: SeamlimeApp) -> Harness<'static, SeamlimeApp> {
     Harness::builder()
         .with_size(eframe::egui::vec2(1100.0, 700.0))
+        // The seam readout uses an arrow that the test font set lacks.
+        .allow_missing_glyphs()
         .build_ui_state(|ui, app: &mut SeamlimeApp| app.show(ui), app)
 }
 

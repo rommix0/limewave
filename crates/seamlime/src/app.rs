@@ -18,11 +18,16 @@ use crate::folder;
 use crate::theme::{self, colors};
 use crate::ui::coords::ViewTransform;
 use crate::ui::filelist;
+use crate::ui::inspector::inspector;
 use crate::ui::overview::overview;
+use crate::ui::seam::{DEFAULT_HALF, SeamChannel, seam_view};
 use crate::ui::waveform::waveform_view;
 
 /// Longest a drag preview waits before the audio engine buffer is refreshed.
 const PREVIEW_PUSH_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Default height of the seam panel: its controls plus a plot of about 200 px.
+const SEAM_PANEL_HEIGHT: f32 = 300.0;
 
 type LoadResult = (usize, Result<WavDocument, String>);
 
@@ -179,6 +184,9 @@ pub struct UiState {
     pub audition: bool,
     pub octave_base: u8,
     pub held: BTreeSet<u8>,
+    /// Samples shown on each side of the seam.
+    pub seam_half: usize,
+    pub seam_channel: SeamChannel,
 }
 
 impl Default for UiState {
@@ -189,6 +197,8 @@ impl Default for UiState {
             audition: true,
             octave_base: 48,
             held: BTreeSet::new(),
+            seam_half: DEFAULT_HALF,
+            seam_channel: SeamChannel::default(),
         }
     }
 }
@@ -404,17 +414,28 @@ impl SeamlimeApp {
                 self.select(i);
             }
         }
-        // Panel scaffolding: the inspector and keyboard strip are filled in by later tasks.
-        egui::Panel::right("inspector")
-            .resizable(true)
-            .default_size(300.0)
-            .size_range(220.0..=480.0)
-            .show(ui, |_| {});
+        self.inspector_panel(ui);
+        // Panel scaffolding: the keyboard strip is filled in by a later task.
         egui::Panel::bottom("keyboard")
             .exact_size(84.0)
             .show(ui, |_| {});
         egui::CentralPanel::default().show(ui, |ui| self.central(ui));
         self.unsaved_prompt(&ctx);
+    }
+
+    fn inspector_panel(&mut self, ui: &mut egui::Ui) {
+        let engine = self.engine.as_ref();
+        let ui_state = &self.ui;
+        let selected = self.selected.and_then(|i| self.files.get_mut(i));
+        egui::Panel::right("inspector")
+            .resizable(true)
+            .default_size(300.0)
+            .size_range(220.0..=480.0)
+            .show(ui, |ui| {
+                if let Some(FileEntry::Loaded(s)) = selected {
+                    inspector(ui, s, ui_state, engine);
+                }
+            });
     }
 
     fn toolbar(&mut self, ui: &mut egui::Ui) {
@@ -486,7 +507,11 @@ impl SeamlimeApp {
                 ui.label(format!("{} frames", s.doc.frames));
                 overview(ui, s);
                 ui.add_space(4.0);
-                // The waveform gets its own region; the seam view goes below it.
+                egui::Panel::bottom("seam")
+                    .resizable(true)
+                    .default_size(SEAM_PANEL_HEIGHT)
+                    .size_range(120.0..=600.0)
+                    .show(ui, |ui| seam_view(ui, s, ui_state, engine));
                 let size = ui.available_size();
                 ui.allocate_ui(size, |ui| waveform_view(ui, s, ui_state, engine));
             }
