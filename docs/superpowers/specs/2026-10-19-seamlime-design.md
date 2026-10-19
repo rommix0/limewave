@@ -198,7 +198,7 @@ v0.1 saves individual WAV files only. The save dialog follows `layout-v4-wav.htm
   - All other chunks: copied through unchanged.
 - **Crossfade is destructive:** when a crossfade length `N > 0` is set, the saved audio has the crossfade mixed in. For `i` in `0..N`, the sample at `loop_end - N + 1 + i` becomes `fade_out(i) * x[loop_end - N + 1 + i] + fade_in(i) * x[loop_start - N + i]`, where the fade curves are linear or equal-power and `fade_in` rises from 0 to 1 across the window. `N` is clamped so it never reaches before the start of the file (`loop_start - N >= 0`) or beyond the loop length. The loop points themselves don't move. *The builder may choose a different standard loop-crossfade formula if it is documented and tested, as long as playback through the seam is continuous.*
 - **Trim after loop end (optional checkbox, off by default):** a shortcut that sets End to `loop_end + P` (default `P` = 16, clamped to the file length) so sampler interpolation still has data to read past the loop end. It's the same trim as dragging End there.
-- **After saving**, the open document is rebased onto what was just written: the editor now works from the saved audio (crossfade already mixed in), the crossfade setting resets to 0 with a note "crossfade applied in saved file", and the next Save compares against and writes to that same destination. The original source file is untouched (unless overwriting). Undo history from before the save is kept but cannot un-bake an already-saved crossfade. *My call.*
+- **After saving**, the open document is rebased onto what was just written: the editor now works from the saved audio (crossfade already mixed in), the crossfade setting resets to 0 with a note "crossfade applied in saved file", and the next Save compares against and writes to that same destination. The original source file is untouched (unless overwriting). Undo history starts fresh after a save, because a trim shifts every frame position and the old history would point at the wrong audio. *My call.*
 - **Re-crossfading:** a WAV doesn't record that a crossfade was applied (the user asked for `smpl`-only metadata), so reopening a saved file shows crossfade 0. That is accepted; adding another crossfade simply fades again. No private chunk or sidecar file. *My call.*
 - **Only save files that changed** (since the last save, or since opening) is on by default in folder mode.
 - **Save** (toolbar) re-saves using the last choices for that file without showing the dialog; **Save as…** always shows it.
@@ -289,7 +289,7 @@ Possible later: batch processing over a folder, a command-line tool, a CLAP plug
 - MIDI keyboard input is "include if cheap" in v0.1.
 - `inst` / `acid` chunks are kept in step with the root key and tune when present.
 - The fine-tune sign follows the published RIFF definition; a real-sampler check is optional.
-- After a save, the document continues from the saved file; crossfade settings are not stored in the WAV.
+- After a save, the document continues from the saved file and undo history starts fresh; crossfade settings are not stored in the WAV.
 
 ## 12. Left to the builder
 
