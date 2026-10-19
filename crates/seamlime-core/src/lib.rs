@@ -6,6 +6,7 @@ pub mod edit;
 pub mod error;
 pub mod meta;
 pub mod notes;
+pub mod render;
 pub mod riff;
 pub mod smpl;
 #[cfg(any(test, feature = "testwav"))]
