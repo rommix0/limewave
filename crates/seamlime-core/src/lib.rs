@@ -2,6 +2,9 @@
 
 pub mod error;
 pub mod riff;
+#[cfg(any(test, feature = "testwav"))]
+pub mod testwav;
+pub mod wav;
 
 pub use error::WavError;
 
