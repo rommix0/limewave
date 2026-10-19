@@ -12,6 +12,6 @@ allow = [
     "BSL-1.0",
     "OFL-1.1",
     # Ubuntu Font Licence (bundled by the default egui fonts)
-    "LicenseRef-UFL-1.0",
+    "Ubuntu-font-1.0",
 ]
 confidence-threshold = 0.8

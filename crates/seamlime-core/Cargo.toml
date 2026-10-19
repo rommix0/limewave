@@ -13,3 +13,7 @@ thiserror = "2"
 [features]
 # Exposes the synthetic test WAV builders to other crates' tests.
 testwav = []
+
+[[example]]
+name = "check_pack"
+required-features = ["testwav"]
