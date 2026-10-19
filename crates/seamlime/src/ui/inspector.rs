@@ -1,4 +1,4 @@
-//! The inspector: file metadata as read, tuning and loop settings.
+//! The inspector: file metadata as read, tuning and loop settings, and the Save buttons.
 
 use eframe::egui::{
     self, DragValue, Grid, Response, RichText, ScrollArea, Slider, TextEdit, Ui, text::CCursor,
@@ -6,11 +6,13 @@ use eframe::egui::{
 };
 use seamlime_core::edit::{EditState, FadeShape, LoopMode, Marker, move_marker};
 use seamlime_core::notes::{note_name, parse_note};
+use seamlime_core::save::Destination;
 use seamlime_core::wav::SampleFormat;
 
 use crate::app::{Session, UiState};
 use crate::audio::engine::AudioEngine;
 use crate::theme::colors;
+use crate::ui::save_dialog::SaveCommand;
 
 /// Crossfade length in milliseconds for `frames` frames.
 pub fn frames_to_ms(frames: usize, rate: u32) -> f64 {
@@ -74,8 +76,13 @@ fn track(
     }
 }
 
-/// Draws the inspector of `s`.
-pub fn inspector(ui: &mut Ui, s: &mut Session, ui_state: &UiState, engine: Option<&AudioEngine>) {
+/// Draws the inspector of `s`. Returns the Save button clicked, if any.
+pub fn inspector(
+    ui: &mut Ui,
+    s: &mut Session,
+    ui_state: &UiState,
+    engine: Option<&AudioEngine>,
+) -> Option<SaveCommand> {
     ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
@@ -84,7 +91,32 @@ pub fn inspector(ui: &mut Ui, s: &mut Session, ui_state: &UiState, engine: Optio
             tuning_section(ui, s, engine);
             ui.separator();
             loop_section(ui, s, ui_state, engine);
-        });
+            ui.separator();
+            save_section(ui, s)
+        })
+        .inner
+}
+
+fn save_section(ui: &mut Ui, s: &Session) -> Option<SaveCommand> {
+    ui.heading("Save");
+    let mut command = None;
+    ui.horizontal(|ui| {
+        if ui.button("Save").clicked() {
+            command = Some(SaveCommand::Save);
+        }
+        if ui.button("Save as…").clicked() {
+            command = Some(SaveCommand::SaveAs);
+        }
+    });
+    let place = match &s.destination {
+        Some(Destination::Folder(dir)) => format!("Save writes to {}", dir.display()),
+        Some(Destination::OverwriteWithBackup) => {
+            "Save overwrites the file, keeping a .bak copy".to_owned()
+        }
+        None => "Save asks where to write the file".to_owned(),
+    };
+    ui.add(egui::Label::new(RichText::new(place).weak()).wrap());
+    command
 }
 
 fn file_section(ui: &mut Ui, s: &Session) {
@@ -325,7 +357,7 @@ fn loop_section(ui: &mut Ui, s: &mut Session, ui_state: &UiState, engine: Option
             RichText::new("Crossfade is mixed into the audio when you save (destructive).")
                 .color(colors::XFADE),
         );
-        if s.just_saved && shown.crossfade > 0 {
+        if s.just_saved {
             ui.label(RichText::new("crossfade applied in saved file").color(colors::LIME));
         }
     });

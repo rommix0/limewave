@@ -13,7 +13,7 @@ use seamlime_core::dsp::{PeakPyramid, mono_sum};
 use seamlime_core::edit::{EditState, History};
 use seamlime_core::notes::note_name;
 use seamlime_core::render::render;
-use seamlime_core::save::Destination;
+use seamlime_core::save::{Destination, default_folder};
 
 use crate::audio::engine::{AudioEngine, Command};
 use crate::audio::keys::{octave_shift, qwerty_note};
@@ -26,11 +26,19 @@ use crate::ui::filelist;
 use crate::ui::inspector::inspector;
 use crate::ui::keyboard::keyboard_strip;
 use crate::ui::overview::overview;
+use crate::ui::save_dialog::{
+    SaveCommand, SaveDialogState, SaveRequest, SaveResult, perform_save, save_dialog,
+    save_results_window,
+};
 use crate::ui::seam::{DEFAULT_HALF, SeamChannel, seam_view};
 use crate::ui::waveform::waveform_view;
 
 /// Longest a drag preview waits before the audio engine buffer is refreshed.
 const PREVIEW_PUSH_INTERVAL: Duration = Duration::from_millis(50);
+
+const SAVE_SHORTCUT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::S);
+const SAVE_AS_SHORTCUT: KeyboardShortcut =
+    KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::S);
 
 /// Default height of the seam panel: its controls plus a plot of about 200 px.
 const SEAM_PANEL_HEIGHT: f32 = 300.0;
@@ -48,7 +56,8 @@ pub struct Session {
     /// `doc.audio` with the current crossfade applied.
     pub rendered: Vec<Vec<f32>>,
     pub destination: Option<Destination>,
-    /// Set when the file was just saved; cleared by the UI that reports it.
+    /// Set by a save that mixed a crossfade into the file (the inspector says so); cleared
+    /// by the next edit, undo or redo.
     pub just_saved: bool,
     /// What the waveform shows; `None` until the first draw fits the whole file.
     pub view: Option<ViewTransform>,
@@ -94,12 +103,14 @@ impl Session {
 
     /// Records `e` (clamped to the file) as the new current edit.
     pub fn apply(&mut self, e: EditState, engine: Option<&AudioEngine>) {
+        self.just_saved = false;
         self.preview = None;
         self.history.push(e.clamped(self.doc.frames));
         self.refresh(engine);
     }
 
     pub fn undo(&mut self, engine: Option<&AudioEngine>) {
+        self.just_saved = false;
         self.preview = None;
         if self.history.undo() {
             self.refresh(engine);
@@ -107,6 +118,7 @@ impl Session {
     }
 
     pub fn redo(&mut self, engine: Option<&AudioEngine>) {
+        self.just_saved = false;
         self.preview = None;
         if self.history.redo() {
             self.refresh(engine);
@@ -131,6 +143,7 @@ impl Session {
     /// Ends a drag: the preview becomes one history entry (if it changed anything) and the
     /// rendered audio and engine buffer are brought up to date.
     pub fn commit_preview(&mut self, engine: Option<&AudioEngine>) {
+        self.just_saved = false;
         self.last_preview_push = None;
         match self.preview.take() {
             Some(e) if e != *self.edit() => self.apply(e, engine),
@@ -193,6 +206,7 @@ pub struct UiState {
     /// Samples shown on each side of the seam.
     pub seam_half: usize,
     pub seam_channel: SeamChannel,
+    pub save_dialog: SaveDialogState,
 }
 
 impl Default for UiState {
@@ -205,6 +219,7 @@ impl Default for UiState {
             held: BTreeSet::new(),
             seam_half: DEFAULT_HALF,
             seam_channel: SeamChannel::default(),
+            save_dialog: SaveDialogState::default(),
         }
     }
 }
@@ -225,6 +240,8 @@ pub struct SeamlimeApp {
     pub ui: UiState,
     /// The action waiting on the unsaved-changes prompt.
     pub pending: Option<PendingAction>,
+    /// The results of the last save, shown until the user closes them.
+    pub save_results: Option<Vec<SaveResult>>,
     /// The selected file's Start frame, read by the MIDI thread for each note-on.
     start_frame: Arc<AtomicUsize>,
     midi: Option<MidiConnection>,
@@ -269,6 +286,7 @@ impl SeamlimeApp {
             audio_error,
             ui: UiState::default(),
             pending: None,
+            save_results: None,
             start_frame: Arc::new(AtomicUsize::new(0)),
             midi: None,
             midi_spare,
@@ -320,6 +338,91 @@ impl SeamlimeApp {
         {
             self.perform(action);
         }
+    }
+
+    /// The prompt's Save all: saves every file with unsaved edits, then runs the held
+    /// action only if all of them saved. Otherwise the action is dropped and the results
+    /// are shown.
+    pub fn resolve_pending_save_all(&mut self) {
+        if let Some(action) = self.pending.take()
+            && self.save_all()
+        {
+            self.perform(action);
+        }
+    }
+
+    /// Save: the selected file goes straight to its remembered destination, or the dialog
+    /// opens when it has none. The results are shown only if the save failed.
+    pub fn save(&mut self) {
+        let Some(i) = self.selected else { return };
+        let Some(FileEntry::Loaded(s)) = self.files.get(i) else {
+            return;
+        };
+        match s.destination.clone() {
+            Some(destination) => {
+                let req = SaveRequest {
+                    indices: vec![i],
+                    destination,
+                    trim_after_loop: None,
+                };
+                let results = perform_save(self, req);
+                if results.iter().any(|(_, r)| r.is_err()) {
+                    self.save_results = Some(results);
+                }
+            }
+            None => self.save_as(),
+        }
+    }
+
+    /// Save as…: opens the dialog for the selected file.
+    pub fn save_as(&mut self) {
+        if let Some(i) = self.selected {
+            self.ui
+                .save_dialog
+                .open_for(i, &self.files, !self.single_file);
+        }
+    }
+
+    /// Saves every file with unsaved edits to its remembered destination, or to the default
+    /// folder next to it. Returns true when all of them saved; otherwise the results are
+    /// shown.
+    pub fn save_all(&mut self) -> bool {
+        let mut results = Vec::new();
+        for i in 0..self.files.len() {
+            let FileEntry::Loaded(s) = &self.files[i] else {
+                continue;
+            };
+            if !s.history.is_dirty() {
+                continue;
+            }
+            let destination = s
+                .destination
+                .clone()
+                .unwrap_or_else(|| Destination::Folder(default_folder(&s.doc.path)));
+            let req = SaveRequest {
+                indices: vec![i],
+                destination,
+                trim_after_loop: None,
+            };
+            results.extend(perform_save(self, req));
+        }
+        let ok = results.iter().all(|(_, r)| r.is_ok());
+        if !ok {
+            self.save_results = Some(results);
+        }
+        ok
+    }
+
+    fn run_save_command(&mut self, c: SaveCommand) {
+        match c {
+            SaveCommand::Save => self.save(),
+            SaveCommand::SaveAs => self.save_as(),
+        }
+    }
+
+    /// True while a modal (unsaved prompt, save dialog, save results) is up.
+    fn modal_open(&self) -> bool {
+        self.pending.is_some() || self.ui.save_dialog.open || self.save_results.is_some()
     }
 
     fn perform(&mut self, action: PendingAction) {
@@ -415,8 +518,7 @@ impl SeamlimeApp {
     /// keyboard; releases always count, so a note never sticks.
     fn handle_keyboard(&mut self, ctx: &egui::Context) {
         let events = ctx.input(|i| i.events.clone());
-        let accepting =
-            self.ui.audition && self.pending.is_none() && !ctx.egui_wants_keyboard_input();
+        let accepting = self.ui.audition && !self.modal_open() && !ctx.egui_wants_keyboard_input();
         for event in events {
             match event {
                 Event::WindowFocused(false) => self.release_all(),
@@ -531,8 +633,18 @@ impl SeamlimeApp {
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
-        if self.pending.is_some() {
+        if self.modal_open() {
             return;
+        }
+        // The shift variants first: Ctrl+Shift+S would otherwise also match plain Ctrl+S.
+        let (save_as, save) = ctx.input_mut(|i| {
+            let save_as = i.consume_shortcut(&SAVE_AS_SHORTCUT);
+            (save_as, i.consume_shortcut(&SAVE_SHORTCUT))
+        });
+        if save_as {
+            self.save_as();
+        } else if save {
+            self.save();
         }
         let redo_shift = KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z);
         let redo_y = KeyboardShortcut::new(Modifiers::COMMAND, Key::Y);
@@ -579,21 +691,33 @@ impl SeamlimeApp {
         self.keyboard_panel(ui);
         egui::CentralPanel::default().show(ui, |ui| self.central(ui));
         self.unsaved_prompt(&ctx);
+        if let Some(req) = save_dialog(&ctx, &mut self.ui.save_dialog, &self.files) {
+            self.save_results = Some(perform_save(self, req));
+        }
+        if let Some(results) = &self.save_results
+            && save_results_window(&ctx, results)
+        {
+            self.save_results = None;
+        }
     }
 
     fn inspector_panel(&mut self, ui: &mut egui::Ui) {
         let engine = self.engine.as_ref();
         let ui_state = &self.ui;
         let selected = self.selected.and_then(|i| self.files.get_mut(i));
+        let mut command = None;
         egui::Panel::right("inspector")
             .resizable(true)
             .default_size(300.0)
             .size_range(220.0..=480.0)
             .show(ui, |ui| {
                 if let Some(FileEntry::Loaded(s)) = selected {
-                    inspector(ui, s, ui_state, engine);
+                    command = inspector(ui, s, ui_state, engine);
                 }
             });
+        if let Some(c) = command {
+            self.run_save_command(c);
+        }
     }
 
     fn keyboard_panel(&mut self, ui: &mut egui::Ui) {
@@ -626,6 +750,7 @@ impl SeamlimeApp {
         let mut play = None;
         let mut stop = false;
         let mut midi_choice = None;
+        let mut save = None;
         egui::Panel::top("toolbar").show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 if ui.button("Open file…").clicked()
@@ -640,6 +765,24 @@ impl SeamlimeApp {
                 {
                     action = Some(PendingAction::OpenFolder(d));
                 }
+                ui.separator();
+                ui.add_enabled_ui(self.selected_session().is_some(), |ui| {
+                    let ctx = ui.ctx().clone();
+                    let hint = format!(
+                        "Save to the last destination, or choose one ({})",
+                        ctx.format_shortcut(&SAVE_SHORTCUT)
+                    );
+                    if ui.button("Save").on_hover_text(hint).clicked() {
+                        save = Some(SaveCommand::Save);
+                    }
+                    let hint = format!(
+                        "Choose where and how to save ({})",
+                        ctx.format_shortcut(&SAVE_AS_SHORTCUT)
+                    );
+                    if ui.button("Save as…").on_hover_text(hint).clicked() {
+                        save = Some(SaveCommand::SaveAs);
+                    }
+                });
                 ui.separator();
                 undo = ui.button("Undo").clicked();
                 redo = ui.button("Redo").clicked();
@@ -695,6 +838,9 @@ impl SeamlimeApp {
         }
         if redo {
             self.redo();
+        }
+        if let Some(c) = save {
+            self.run_save_command(c);
         }
         if let Some(a) = action {
             self.request(a);
@@ -786,6 +932,7 @@ impl SeamlimeApp {
         }
         let count = self.dirty_count();
         let mut choice = None;
+        let mut save_all = false;
         egui::Modal::new(egui::Id::unique("unsaved_changes")).show(ctx, |ui| {
             ui.heading("Unsaved changes");
             ui.label(format!(
@@ -793,6 +940,10 @@ impl SeamlimeApp {
             ));
             ui.add_space(8.0);
             ui.horizontal(|ui| {
+                save_all = ui
+                    .button("Save all")
+                    .on_hover_text("Save each file to its last destination or the default folder")
+                    .clicked();
                 if ui.button("Discard").clicked() {
                     choice = Some(true);
                 }
@@ -801,7 +952,9 @@ impl SeamlimeApp {
                 }
             });
         });
-        if let Some(discard) = choice {
+        if save_all {
+            self.resolve_pending_save_all();
+        } else if let Some(discard) = choice {
             self.resolve_pending(discard);
         }
     }
