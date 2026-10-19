@@ -2,6 +2,7 @@
 
 pub mod error;
 pub mod riff;
+pub mod smpl;
 #[cfg(any(test, feature = "testwav"))]
 pub mod testwav;
 pub mod wav;
