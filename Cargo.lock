@@ -1940,6 +1940,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "limewave"
+version = "0.1.0"
+dependencies = [
+ "arc-swap",
+ "cpal",
+ "eframe",
+ "egui_kittest",
+ "limewave-core",
+ "midir",
+ "rfd",
+ "rtrb",
+ "tempfile",
+]
+
+[[package]]
+name = "limewave-core"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "linebender_resource_handle"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3144,29 +3167,6 @@ dependencies = [
  "memmap2",
  "smithay-client-toolkit 0.19.2",
  "tiny-skia",
-]
-
-[[package]]
-name = "seamlime"
-version = "0.1.0"
-dependencies = [
- "arc-swap",
- "cpal",
- "eframe",
- "egui_kittest",
- "midir",
- "rfd",
- "rtrb",
- "seamlime-core",
- "tempfile",
-]
-
-[[package]]
-name = "seamlime-core"
-version = "0.1.0"
-dependencies = [
- "tempfile",
- "thiserror 2.0.21",
 ]
 
 [[package]]

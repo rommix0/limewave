@@ -1,0 +1,21 @@
+[package]
+name = "limewave"
+description = "Limewave: a loop and one-shot WAV sample editor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+limewave-core = { path = "../limewave-core" }
+eframe = "0.37"
+cpal = "0.18"
+midir = "0.11"
+rfd = "0.17"
+arc-swap = "1.9"
+rtrb = "0.4"
+
+[dev-dependencies]
+limewave-core = { path = "../limewave-core", features = ["testwav"] }
+egui_kittest = "0.37"
+tempfile = "3"

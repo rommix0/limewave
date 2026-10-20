@@ -1,6 +1,6 @@
-# Seamlime
+# Limewave
 
-Seamlime is an open-source loop and one-shot WAV sample editor, written in Rust. Open a WAV file or a folder of them, set the loop points, root key and fine tune by hand, listen to the result while you edit, and save files that samplers read correctly. It runs on Windows, macOS and Linux.
+Limewave is an open-source loop and one-shot WAV sample editor, written in Rust. Open a WAV file or a folder of them, set the loop points, root key and fine tune by hand, listen to the result while you edit, and save files that samplers read correctly. It runs on Windows, macOS and Linux.
 
 What it does in version 0.1:
 
@@ -19,7 +19,7 @@ What it does in version 0.1:
 You need a recent stable Rust toolchain (https://rustup.rs).
 
 ```
-cargo run --release -p seamlime
+cargo run --release -p limewave
 ```
 
 To run the tests: `cargo test --workspace`.
@@ -54,17 +54,17 @@ Note names follow the convention that MIDI note 60 is C4.
 
 - The audio is saved in the file's original format (same bit depth and sample rate). Only the frames between the Start and End markers are kept.
 - A `smpl` chunk holds the root key, fine tune and loop. The loop end is stored inclusive, and the fine tune is stored the way the RIFF definition describes it (a pitch fraction upward from the unity note). With the loop off, the chunk is written with zero loops so the root key and tune still travel with the file. If a file had no `smpl` chunk and you changed nothing about tuning or looping, none is added.
-- A `LIST/INFO` chunk with `ISFT` set to `Seamlime <version>`. Other INFO fields (such as the name) are kept.
+- A `LIST/INFO` chunk with `ISFT` set to `Limewave <version>`. Other INFO fields (such as the name) are kept.
 - Cue markers (`cue ` and `LIST/adtl` chunks) are removed. The inspector warns you when a file has them.
 - A crossfade is baked into the saved audio. A WAV file does not record that a crossfade was applied, so a saved file reopens with a crossfade of 0.
 - Other chunks are copied through unchanged, in their original order. Existing `inst` and `acid` chunks have their root note (and, for `inst`, fine tune) updated to agree with the `smpl` chunk.
 
 Where files go:
 
-- By default a save writes into a new `seamlime` folder next to the source file, keeping the file name. Your originals are not touched.
+- By default a save writes into a new `limewave` folder next to the source file, keeping the file name. Your originals are not touched.
 - Originals are modified only if you choose **Overwrite originals**. Each file is first copied to `<name>.wav.bak` (or `.1.bak`, `.2.bak` and so on if that exists); if the backup fails, that file is not saved.
-- A file that Seamlime itself wrote into its output folder, and then reopened, is replaced in place when you save it again.
-- Seamlime asks before replacing any other existing file.
+- A file that Limewave itself wrote into its output folder, and then reopened, is replaced in place when you save it again.
+- Limewave asks before replacing any other existing file.
 - Files are written to a temporary file and renamed into place, so a failed save never leaves a half-written file.
 - After a save, the open document continues from the saved audio and the undo history starts fresh.
 
@@ -73,7 +73,7 @@ Where files go:
 A small pack of test files lets you confirm that tuning and looping come out right in the sampler of your choice:
 
 ```
-cargo run -p seamlime-core --example check_pack --features testwav -- <out dir>
+cargo run -p limewave-core --example check_pack --features testwav -- <out dir>
 ```
 
 This writes three 48 kHz, 16-bit mono files, each with root note 69 (A4): `sine_A4_plus25c.wav` and `sine_A4_minus25c.wav` (sines 25 cents above and below 440 Hz, tuned by +25 and -25 cents) and `sine_A4_loop.wav` (a 440 Hz sine with an exact-period loop). Each should play in tune at A4, and the last should loop without a click.
