@@ -298,7 +298,7 @@ pub fn render_tail(
     let cut = cut_of(e, frames);
     let resolved = resolve(s, &analysis, rate);
     let g = match s.method {
-        TailMethod::Granular => granular::render(audio, cut, &analysis, &resolved, e, rate),
+        TailMethod::Granular => granular::render(audio, cut, &analysis, &resolved, e, rate)?,
     };
     let first = cut - g.overlap;
     let len = frame_count(&g.audio);

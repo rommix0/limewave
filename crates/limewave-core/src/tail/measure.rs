@@ -4,6 +4,10 @@
 //!
 //! Ranges are inclusive (`first..=last`) and clamped to the shortest channel. Channels are
 //! combined by energy or by their largest step, never by summing samples.
+//!
+//! The references a measure compares against (the source region's steps, the level at the
+//! cut) always come from the *input*, the audio before the tail step: the rendered audio
+//! already has its join overlap replaced, so a faulty join could inflate its own reference.
 
 use crate::dsp::envelope::{level_db, rms_db_frames};
 
@@ -12,9 +16,6 @@ const JOIN_WINDOW_S: f64 = 0.002;
 
 /// The level after the cut is measured over this many seconds.
 const LEVEL_WINDOW_S: f64 = 0.050;
-
-/// The level at the cut is the RMS of this many seconds before it (v0.3 §4.2).
-const CUT_LEVEL_S: f64 = 0.020;
 
 /// A sustain body's level is measured in frames of this many seconds.
 const BODY_FRAME_S: f64 = 0.050;
@@ -62,10 +63,16 @@ pub fn step_percentile_99(audio: &[Vec<f32>], first: usize, last: usize) -> f32 
     steps[lo] + (steps[hi] - steps[lo]) * frac
 }
 
-/// The join score at frame `at`: the largest step within 2 ms of `at` (from `at − 2 ms` to
-/// `at + 2 ms`), divided by the 99th-percentile step inside the source region. 1.5 or less
-/// counts as click-free (v0.3 §8.1).
-pub fn join_score(audio: &[Vec<f32>], at: usize, source: (usize, usize), rate: u32) -> f32 {
+/// The join score at frame `at` of `audio`: the largest step within 2 ms of `at` (from
+/// `at − 2 ms` to `at + 2 ms`), divided by the 99th-percentile step inside the source region
+/// of `input`, the audio before the tail. 1.5 or less counts as click-free (v0.3 §8.1).
+pub fn join_score(
+    audio: &[Vec<f32>],
+    at: usize,
+    input: &[Vec<f32>],
+    source: (usize, usize),
+    rate: u32,
+) -> f32 {
     let len = frames(audio);
     if len < 2 {
         return 0.0;
@@ -74,15 +81,16 @@ pub fn join_score(audio: &[Vec<f32>], at: usize, source: (usize, usize), rate: u
     let lo = at.saturating_sub(w).min(len - 2);
     let hi = at.saturating_add(w).min(len - 1);
     let worst = (lo..hi).map(|i| step(audio, i, i + 1)).fold(0.0, f32::max);
-    worst / (step_percentile_99(audio, source.0, source.1) + TINY)
+    worst / (step_percentile_99(input, source.0, source.1) + TINY)
 }
 
-/// The loop-wrap score of the inclusive loop `(start, end)`: the largest step in the 2 ms
-/// before the loop end followed by the 2 ms from the loop start, as a wrap plays them, divided
-/// by the 99th-percentile step inside the source region.
+/// The loop-wrap score of the inclusive loop `(start, end)` of `audio`: the largest step in
+/// the 2 ms before the loop end followed by the 2 ms from the loop start, as a wrap plays them,
+/// divided by the 99th-percentile step inside the source region of `input`.
 pub fn wrap_score(
     audio: &[Vec<f32>],
     (start, end): (usize, usize),
+    input: &[Vec<f32>],
     source: (usize, usize),
     rate: u32,
 ) -> f32 {
@@ -100,19 +108,21 @@ pub fn wrap_score(
         .windows(2)
         .map(|p| step(audio, p[0], p[1]))
         .fold(0.0, f32::max);
-    worst / (step_percentile_99(audio, source.0, source.1) + TINY)
+    worst / (step_percentile_99(input, source.0, source.1) + TINY)
 }
 
-/// The level of the first 50 ms from `cut` (the first new frame), compared with the level at
-/// the cut (the 20 ms before it), allowing for a tail that falls at `rate_db_s` dB per second
-/// over those 50 ms. Positive is quieter than it should be, in dB.
-pub fn level_step_db(audio: &[Vec<f32>], cut: usize, rate: u32, rate_db_s: f32) -> f32 {
+/// The level of the first 50 ms of `audio` from `cut` (the first new frame), compared with
+/// `level_at_cut_db` (the analysis of the input measures it, [`super::TailAnalysis`]), allowing
+/// for a tail that falls at `rate_db_s` dB per second over those 50 ms. Positive is quieter
+/// than it should be, in dB.
+pub fn level_step_db(
+    audio: &[Vec<f32>],
+    cut: usize,
+    level_at_cut_db: f32,
+    rate: u32,
+    rate_db_s: f32,
+) -> f32 {
     let n = frames_in(LEVEL_WINDOW_S, rate);
-    let before = level_db(
-        audio,
-        cut.saturating_sub(frames_in(CUT_LEVEL_S, rate)),
-        cut.saturating_sub(1),
-    );
     let after = level_db(audio, cut, cut + n - 1);
     // The mean energy of a decay over the window, relative to its start.
     let per_frame = f64::from(rate_db_s) / f64::from(rate.max(1));
@@ -121,7 +131,7 @@ pub fn level_step_db(audio: &[Vec<f32>], cut: usize, rate: u32, rate_db_s: f32) 
         .sum::<f64>()
         / n as f64;
     let expected = (10.0 * mean.log10()) as f32;
-    before + expected - after
+    level_at_cut_db + expected - after
 }
 
 /// The 50 ms RMS levels of `first..=last` in dB, frame by frame from `first`.
@@ -209,10 +219,14 @@ mod tests {
         let p = step_percentile_99(&audio, 0, 999);
         assert!(p > 0.0 && p < 0.1, "{p}");
         // The first 100 frames hold only small steps, so a drop scores 99 against them.
-        let s = join_score(&audio, 300, (0, 99), 1000);
+        let s = join_score(&audio, 300, &audio, (0, 99), 1000);
         assert!(s > 1.5, "a wrap step is a click: {s}");
-        let s = join_score(&audio, 350, (0, 99), 1000);
+        let s = join_score(&audio, 350, &audio, (0, 99), 1000);
         assert!(s <= 1.01, "{s}");
+        // The reference comes from the input: a louder input halves the score.
+        let loud: Vec<Vec<f32>> = vec![audio[0].iter().map(|v| v * 2.0).collect()];
+        let s2 = join_score(&audio, 350, &loud, (0, 99), 1000);
+        assert!((s2 - s / 2.0).abs() < 1e-4, "{s2} vs {s}");
 
         // Stereo correlation of a channel with itself, its negative and silence.
         let l: Vec<f32> = (0..500).map(|i| (i as f32 * 0.3).sin()).collect();
@@ -232,24 +246,27 @@ mod tests {
             .map(|i| (i as f32 * std::f32::consts::TAU / 16.0).sin() * 0.5)
             .collect();
         let audio = vec![s];
-        assert!(level_step_db(&audio, 4000, rate, 0.0).abs() < 0.1);
+        let at_cut = level_db(&audio, 4000 - 160, 3999);
+        assert!(level_step_db(&audio, 4000, at_cut, rate, 0.0).abs() < 0.1);
+        // 6 dB quieter than the level at the cut reads +6.
+        assert!((level_step_db(&audio, 4000, at_cut + 6.0, rate, 0.0) - 6.0).abs() < 0.1);
         assert!(body_spread_db(&audio, 0, 7999, rate) < 0.1);
         assert!(level_deviation_db(&audio, 0, 7999, -9.03, rate) < 0.1);
         assert!(envelope_error_db(&audio, 0, &audio, 0, rate) < 1e-6);
-        assert!(wrap_score(&audio, (0, 7999), (0, 7999), rate).is_finite());
+        assert!(wrap_score(&audio, (0, 7999), &audio, (0, 7999), rate).is_finite());
     }
 
     #[test]
     fn measures_handle_degenerate_input() {
         let empty: Vec<Vec<f32>> = vec![];
         assert_eq!(step_percentile_99(&empty, 0, 10), 0.0);
-        assert_eq!(join_score(&empty, 0, (0, 10), 8000), 0.0);
-        assert_eq!(wrap_score(&empty, (0, 10), (0, 10), 8000), 0.0);
-        assert!(level_step_db(&empty, 0, 8000, 10.0).is_finite());
+        assert_eq!(join_score(&empty, 0, &empty, (0, 10), 8000), 0.0);
+        assert_eq!(wrap_score(&empty, (0, 10), &empty, (0, 10), 8000), 0.0);
+        assert!(level_step_db(&empty, 0, -20.0, 8000, 10.0).is_finite());
         assert_eq!(body_spread_db(&empty, 0, 10, 8000), 0.0);
         assert_eq!(envelope_error_db(&empty, 0, &empty, 0, 8000), 0.0);
         let one = vec![vec![0.5f32]];
-        assert_eq!(join_score(&one, 0, (0, 0), 8000), 0.0);
+        assert_eq!(join_score(&one, 0, &one, (0, 0), 8000), 0.0);
         assert_eq!(channel_correlation(&[vec![], vec![]], 0, 10), 0.0);
     }
 }

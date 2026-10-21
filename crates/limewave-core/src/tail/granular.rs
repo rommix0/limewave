@@ -11,8 +11,8 @@
 use std::f64::consts::TAU;
 
 use super::{
-    CUT_LEVEL_S, Generated, Resolved, TailAnalysis, TailMode, TailWarning, decay_envelope,
-    end_ramp, join_overlap, secs_to_frames, tail_length,
+    CUT_LEVEL_S, Generated, Resolved, TailAnalysis, TailError, TailMode, TailWarning,
+    decay_envelope, end_ramp, join_overlap, secs_to_frames, tail_length,
 };
 use crate::dsp::rng::SplitMix64;
 use crate::dsp::spectrum::{Complex32, Fft};
@@ -371,6 +371,9 @@ fn darken(x: &mut [f32], amount: f32, t60: f32, rate: u32) {
 }
 
 /// Renders the tail after `cut` by quilting patches of the analysed source region.
+///
+/// `SourceTooShort` when the region cannot hold a patch and two overlaps, which only happens
+/// at very low sample rates, where 30 ms is a frame or two.
 pub(super) fn render(
     audio: &[Vec<f32>],
     cut: usize,
@@ -378,11 +381,16 @@ pub(super) fn render(
     s: &Resolved,
     e: &EditState,
     rate: u32,
-) -> Generated {
+) -> Result<Generated, TailError> {
     let (first, last) = a.source;
     let n = last + 1 - first;
     let sz = sizes(a, n, rate);
     let (p, o) = (sz.patch, sz.overlap);
+    // The last position whose patch fits in the source, with room before it for an overlap.
+    let hi = match n.checked_sub(o + p) {
+        Some(hi) if hi >= o => hi,
+        _ => return Err(TailError::SourceTooShort),
+    };
     let tonal = sz.period.is_some();
     let mut warnings = Vec::new();
     if sz.short {
@@ -426,9 +434,6 @@ pub(super) fn render(
     let mut q = Quilter::new(flat.iter().map(|ch| &ch[..n]).collect(), &sz, s.seed);
     // The flattened audio just before the cut: what the first patch must follow.
     let context: Vec<Vec<f32>> = flat.iter().map(|ch| ch[m - o..].to_vec()).collect();
-    // The last position whose patch fits in the source.
-    let hi = n - o - p;
-
     // Sustain leaves room before o₁ for the seamless last patch: up to 2 patches + 2 periods.
     let lo1 = match s.mode {
         TailMode::Decay => 0,
@@ -481,13 +486,13 @@ pub(super) fn render(
             y
         })
         .collect();
-    Generated {
+    Ok(Generated {
         audio,
         overlap: join,
         body,
         loop_crossfade,
         warnings,
-    }
+    })
 }
 
 /// Where the sustain body starts and what it may draw on.
@@ -549,7 +554,6 @@ fn sustain(
             best = Some((score, l));
         }
     }
-    let seamless = best.is_some();
     let crossfade = match best {
         Some((_, l)) => {
             q.append(out, o1 - l - o, l);
@@ -567,17 +571,17 @@ fn sustain(
     };
     let body = len(out);
 
-    // The release: what a wrap plays (the source from o₁) at the body level until the first
-    // release patch joins, then a fade.
+    // The release: what a wrap plays (the source from o₁, the loop start's own audio) at the
+    // body level until the first release patch joins, then a fade. With the crossfade
+    // fallback too: the crossfade ends the loop on the audio just before the loop start, which
+    // the source from o₁ continues.
     let mut hold = 0;
     if s.release_t60 > 0.0 {
         let fade_len = tail_length(a.level_at_cut_db, s.release_t60, rate, 1);
-        if seamless {
-            for (ch, src) in out.iter_mut().zip(&q.src) {
-                ch.extend_from_slice(&src[o1..o1 + p]);
-            }
-            hold = p - o;
+        for (ch, src) in out.iter_mut().zip(&q.src) {
+            ch.extend_from_slice(&src[o1..o1 + p]);
         }
+        hold = p - o;
         let total = body + hold + fade_len;
         while len(out) < total {
             q.extend(out, 0, hi);
@@ -641,8 +645,8 @@ mod tests {
         for (name, x, cut) in all() {
             let (r, out) = run(&x, &cut_at(&x, cut), &decay());
             let src = r.analysis.source;
-            let at_cut = join_score(&out, cut, src, RATE);
-            let at_start = join_score(&out, r.step.first, src, RATE);
+            let at_cut = join_score(&out, cut, &x, src, RATE);
+            let at_start = join_score(&out, r.step.first, &x, src, RATE);
             assert!(at_cut <= 1.5, "{name}: join at the cut {at_cut}");
             assert!(
                 at_start <= 1.5,
@@ -655,7 +659,7 @@ mod tests {
     fn granular_decay_starts_at_the_cut_level() {
         for (name, x, cut) in all() {
             let (r, out) = run(&x, &cut_at(&x, cut), &decay());
-            let step = level_step_db(&out, cut, RATE, tail_rate(&r));
+            let step = level_step_db(&out, cut, r.analysis.level_at_cut_db, RATE, tail_rate(&r));
             assert!(step.abs() <= 1.5, "{name}: level step {step} dB");
         }
     }
@@ -702,7 +706,13 @@ mod tests {
             assert!(r.warnings.is_empty(), "{name}: {:?}", r.warnings);
             let body = ed.loop_len();
             assert!(body.abs_diff(at(1.0)) < at(0.05), "{name}: body {body}");
-            let wrap = wrap_score(&out, (ed.loop_start, ed.loop_end), r.analysis.source, RATE);
+            let wrap = wrap_score(
+                &out,
+                (ed.loop_start, ed.loop_end),
+                &x,
+                r.analysis.source,
+                RATE,
+            );
             assert!(wrap <= 1.5, "{name}: wrap {wrap}");
             let dev = level_deviation_db(
                 &out,
@@ -712,7 +722,7 @@ mod tests {
                 RATE,
             );
             assert!(dev <= 1.5, "{name}: body level strays {dev} dB");
-            let join = join_score(&out, cut, r.analysis.source, RATE);
+            let join = join_score(&out, cut, &x, r.analysis.source, RATE);
             assert!(join <= 1.5, "{name}: join {join}");
         }
     }
@@ -830,9 +840,9 @@ mod tests {
             let src = r.analysis.source;
             println!(
                 "{name} decay: join {:.2}, overlap start {:.2}, level step {:+.2} dB, tail {:.2} s, corr {:.3} vs {:.3}",
-                join_score(&out, cut, src, RATE),
-                join_score(&out, r.step.first, src, RATE),
-                level_step_db(&out, cut, RATE, tail_rate(&r)),
+                join_score(&out, cut, &x, src, RATE),
+                join_score(&out, r.step.first, &x, src, RATE),
+                level_step_db(&out, cut, r.analysis.level_at_cut_db, RATE, tail_rate(&r)),
                 (out[0].len() - cut) as f32 / RATE as f32,
                 channel_correlation(&out, cut, out[0].len() - 1),
                 channel_correlation(&x, src.0, src.1),
@@ -847,8 +857,8 @@ mod tests {
             let ed = &r.edit;
             println!(
                 "{name} sustain: join {:.2}, wrap {:.2}, body dev {:.2} dB, spread {:.2} dB, warnings {:?}",
-                join_score(&out, cut, src, RATE),
-                wrap_score(&out, (ed.loop_start, ed.loop_end), src, RATE),
+                join_score(&out, cut, &x, src, RATE),
+                wrap_score(&out, (ed.loop_start, ed.loop_end), &x, src, RATE),
                 level_deviation_db(
                     &out,
                     ed.loop_start,
@@ -872,7 +882,7 @@ mod tests {
         };
         let (r, out) = run(&x, &e, &dark);
         let (_, plain) = run(&x, &e, &decay());
-        let join = join_score(&out, cut, r.analysis.source, RATE);
+        let join = join_score(&out, cut, &x, r.analysis.source, RATE);
         assert!(join <= 1.5, "join {join}");
         // Late in the tail the dark version has lost its highs: smaller steps for its level.
         let late = cut + at(0.9);
@@ -889,5 +899,93 @@ mod tests {
             ratio(&out),
             ratio(&plain)
         );
+    }
+
+    #[test]
+    fn crossfade_fallback_release_continues_after_the_crossfade() {
+        // 60 ms of noise leaves no room before o₁ for the seamless last patch. The noise is
+        // heavily low-passed, so its steps are small and a jump between unrelated samples
+        // shows as a click.
+        let mut rng = crate::dsp::rng::SplitMix64::new(8);
+        let mut z = 0.0f32;
+        let smooth: Vec<f32> = (0..at(1.5))
+            .map(|_| {
+                z = 0.98 * z + 0.02 * (rng.next_f32() * 2.0 - 1.0);
+                z
+            })
+            .collect();
+        let (x, cut) = (vec![smooth], at(1.0));
+        let e = cut_at(&x, cut);
+        let n = at(0.06);
+        let sel = Some((cut - n, cut - 1));
+        let r = render_tail(&x, &e, sel, RATE, &sustain()).unwrap();
+        assert!(
+            r.warnings.contains(&TailWarning::LoopCrossfadeFallback),
+            "{:?}",
+            r.warnings
+        );
+        // The overlap of a shrunk noisy patch: a quarter of 2/5 of the source.
+        let o = n * 2 / 5 / 4;
+        let ed = &r.edit;
+        assert_eq!((ed.loop_mode, ed.crossfade), (LoopMode::Forward, o));
+        assert_eq!(ed.clone().clamped(x[0].len()), *ed);
+        let mut out = x.clone();
+        apply_effect(&mut out, &r.step);
+        assert!(out[0].len() > ed.loop_end + at(0.2), "there is a release");
+
+        // As played and saved: the loop crossfade applied, then the wrap and the release.
+        let heard = crate::render::render(&out, ed);
+        let src = r.analysis.source;
+        let wrap = wrap_score(&heard, (ed.loop_start, ed.loop_end), &x, src, RATE);
+        let release = join_score(&heard, ed.loop_end + 1, &x, src, RATE);
+        assert!(wrap <= 1.5, "wrap {wrap}");
+        assert!(release <= 1.5, "into the release {release}");
+    }
+
+    #[test]
+    fn tiny_sources_at_very_low_rates_are_refused() {
+        // 30 ms at 50 Hz is a frame and a half, so 2 or 3 frames pass the time check but
+        // cannot hold a patch and two overlaps.
+        for frames in [2, 3] {
+            let x = vec![
+                (0..frames)
+                    .map(|i| 0.5 - 0.3 * i as f32)
+                    .collect::<Vec<f32>>(),
+            ];
+            let e = EditState::default_for(frames);
+            for mode in [TailMode::Decay, TailMode::Sustain] {
+                for loop_on in [true, false] {
+                    let s = TailSettings {
+                        mode,
+                        loop_on,
+                        ..TailSettings::default()
+                    };
+                    assert_eq!(
+                        render_tail(&x, &e, None, 50, &s),
+                        Err(TailError::SourceTooShort),
+                        "{frames} frames, {mode:?}"
+                    );
+                }
+            }
+        }
+        // A few more frames render without a panic.
+        let x = vec![
+            (0..12)
+                .map(|i| ((i * 7) % 5) as f32 * 0.2 - 0.4)
+                .collect::<Vec<f32>>(),
+        ];
+        let e = EditState::default_for(12);
+        for mode in [TailMode::Decay, TailMode::Sustain] {
+            let s = TailSettings {
+                mode,
+                ..TailSettings::default()
+            };
+            if let Ok(r) = render_tail(&x, &e, None, 50, &s) {
+                let Op::Splice(sp) = &r.step.op else {
+                    panic!("not a splice")
+                };
+                assert!(sp.audio.iter().flatten().all(|v| v.is_finite()));
+            }
+        }
     }
 }
