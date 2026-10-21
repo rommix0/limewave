@@ -12,6 +12,7 @@ pub mod render;
 pub mod riff;
 pub mod save;
 pub mod smpl;
+pub mod tail;
 #[cfg(any(test, feature = "testwav"))]
 pub mod testwav;
 pub mod wav;
