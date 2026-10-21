@@ -1,6 +1,6 @@
 # Limewave: design
 
-Status: draft for approval · 2026-10-19
+Status: draft for approval · 2026-10-19. v0.1 is built. Version 0.2 and the new milestone order are specified in `2026-10-20-limewave-v0.2-design.md`, which wins where the two disagree.
 
 Limewave is an open-source, cross-platform editor for audio one-shots and loops. You open WAV files (and later SFZ instruments), set and audition loop points, root key and fine tune by hand, and save samplers-ready files. Later versions add analysis that does the tedious parts for you: pitch detection, a one-shot/sustain classifier, an automatic loop finder, and tail rendering for samples that were cut off.
 
@@ -261,6 +261,8 @@ Suggested crates (all permissive): `eframe`/`egui`, `cpal`, `midir`, `rfd` (nati
 - A dependency licence check (e.g. `cargo deny`) in CI to keep GPL-family crates out.
 
 ## 9. Roadmap after v0.1
+
+*The order below was changed on 2026-10-20: v0.2, then tail rendering, then SFZ, then the rest. See the v0.2 design, §6.*
 
 Each milestone gets its own short design pass. The DSP details for M2–M5 are already worked out in the local planning brief (`docs/LOOP_EDIT_HANDOFF.md`, git-ignored), which the builder should read when those milestones start.
 
