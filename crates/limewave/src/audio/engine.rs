@@ -260,8 +260,8 @@ pub fn process(
 struct Callback {
     state: MixerState,
     buffer: Arc<ArcSwap<PlayBuffer>>,
-    /// The buffer last loaded, and the one from a different source before it, which voices
-    /// released on the previous file finish on.
+    /// The buffer last loaded, and the last one from a different, non-empty source before it,
+    /// which voices released on the previous file finish on.
     ///
     /// The callback never frees a buffer: everything it holds came from `buffer`, and
     /// `AudioEngine::set_buffer` keeps each buffer it swaps out in its `retired` list until
@@ -301,11 +301,16 @@ impl Callback {
     fn render(&mut self, out: &mut [f32]) {
         // `load_full` only bumps a reference count. A buffer from another source pushes the
         // old one to `previous`; the same source replaces it, so live edits are heard at once.
+        // The empty buffer (source 0) never becomes `previous`: after a switch through it (a
+        // file still loading), voices released on the file before it can still finish.
         let loaded = self.buffer.load_full();
         if loaded.source == self.current.source {
             self.current = loaded;
         } else {
-            self.previous = std::mem::replace(&mut self.current, loaded);
+            let old = std::mem::replace(&mut self.current, loaded);
+            if old.source != 0 {
+                self.previous = old;
+            }
         }
         while let Ok(cmd) = self.midi_rx.pop() {
             self.state.apply(cmd, &self.current, self.device_rate);
@@ -763,6 +768,28 @@ mod tests {
         let mut notes = active(&state);
         notes.sort_unstable();
         assert_eq!(notes, [60, 61, 62, 63, 64, 65, 66, 68]);
+    }
+
+    #[test]
+    fn a_switch_through_the_empty_buffer_keeps_the_release_tail() {
+        // File A plays, then a still-loading file silences the engine (the empty buffer),
+        // then file C arrives. A's tail keeps sounding throughout.
+        let (mut cb, swap, mut tx) = callback(constant(1, 0.25));
+        let mut retired = Vec::new();
+        tx.push(Command::SetEnvelope(FLAT)).unwrap();
+        tx.push(Command::NoteOn { note: 60, from: 0 }).unwrap();
+        render(&mut cb, 64);
+        tx.push(Command::AllOff).unwrap();
+        retired.push(swap.swap(Arc::new(empty_buffer(RATE))));
+        let mut out = left(&render(&mut cb, 100));
+        retired.push(swap.swap(Arc::new(constant(3, -0.5))));
+        out.extend(left(&render(&mut cb, 100)));
+        assert!(out.iter().all(|s| *s > 0.0), "A's 10 ms release sounds on");
+        let worst = out
+            .windows(2)
+            .map(|w| (w[1] - w[0]).abs())
+            .fold(0.0f32, f32::max);
+        assert!(worst <= 0.25 / 480.0 + 1e-6, "a step of {worst}");
     }
 
     #[test]
