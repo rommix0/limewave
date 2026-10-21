@@ -77,23 +77,35 @@ fn track(
     }
 }
 
-/// Draws the inspector of `s`. Returns the Save button clicked, if any.
+/// What the user asked of the app in the inspector this frame.
+#[derive(Default, Debug, PartialEq, Eq)]
+pub struct InspectorAction {
+    /// The Save button clicked.
+    pub save: Option<SaveCommand>,
+    /// The "Set from MIDI" toggle was clicked.
+    pub toggle_midi_learn: bool,
+}
+
+/// Draws the inspector of `s`. Returns what the user clicked that the app has to act on.
 pub fn inspector(
     ui: &mut Ui,
     s: &mut Session,
     ui_state: &UiState,
     engine: Option<&AudioEngine>,
-) -> Option<SaveCommand> {
+) -> InspectorAction {
     ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
             file_section(ui, s);
             ui.separator();
-            tuning_section(ui, s, engine);
+            let toggle_midi_learn = tuning_section(ui, s, ui_state, engine);
             ui.separator();
             loop_section(ui, s, ui_state, engine);
             ui.separator();
-            save_section(ui, s)
+            InspectorAction {
+                save: save_section(ui, s),
+                toggle_midi_learn,
+            }
         })
         .inner
 }
@@ -230,9 +242,28 @@ fn root_field(ui: &mut Ui, s: &mut Session, engine: Option<&AudioEngine>) {
     });
 }
 
-fn tuning_section(ui: &mut Ui, s: &mut Session, engine: Option<&AudioEngine>) {
+/// Returns whether the "Set from MIDI" toggle was clicked.
+fn tuning_section(
+    ui: &mut Ui,
+    s: &mut Session,
+    ui_state: &UiState,
+    engine: Option<&AudioEngine>,
+) -> bool {
     ui.heading("Tuning");
     root_field(ui, s, engine);
+    let mut toggled = false;
+    if ui_state.midi_connected {
+        let listening = ui_state.midi_learn.is_some();
+        let text = if listening {
+            "Listening…"
+        } else {
+            "Set from MIDI"
+        };
+        toggled = ui
+            .selectable_label(listening, text)
+            .on_hover_text("The next note from the MIDI device becomes the root key")
+            .clicked();
+    }
     ui.horizontal(|ui| {
         let name = ui.label("Fine tune");
         let mut cents = s.shown_edit().cents;
@@ -253,6 +284,7 @@ fn tuning_section(ui: &mut Ui, s: &mut Session, engine: Option<&AudioEngine>) {
         let field = field.labelled_by(name.id);
         track(s, engine, &field, |e| EditState { cents, ..e.clone() });
     });
+    toggled
 }
 
 fn loop_section(ui: &mut Ui, s: &mut Session, ui_state: &UiState, engine: Option<&AudioEngine>) {

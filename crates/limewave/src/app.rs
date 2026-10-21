@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
@@ -25,15 +25,15 @@ use limewave_core::wav::SampleFormat;
 
 use crate::audio::engine::{AudioEngine, Command, Cursor};
 use crate::audio::keys::{octave_shift, qwerty_note};
-use crate::audio::midi::{MidiConnection, connect_midi, list_midi_ports};
+use crate::audio::midi::{MidiConnection, connect_midi, decode_last_note, list_midi_ports};
 use crate::audio::voice::{PlayBuffer, play_buffer};
 use crate::folder;
 use crate::theme::{self, colors};
 use crate::ui::coords::ViewTransform;
 use crate::ui::effects::{EffectDialog, EffectParams, edit_menu, effect_dialog, effects_menu};
 use crate::ui::filelist;
-use crate::ui::inspector::inspector;
-use crate::ui::keyboard::keyboard_strip;
+use crate::ui::inspector::{InspectorAction, inspector};
+use crate::ui::keyboard::{KeyEvent, keyboard_strip};
 use crate::ui::overview::overview;
 use crate::ui::save_dialog::{
     SaveCommand, SaveDialogState, SaveRequest, SaveResult, other_file_in_the_way, perform_save,
@@ -337,6 +337,10 @@ pub struct UiState {
     pub effect_params: EffectParams,
     /// The Effects dialog that is open.
     pub effect_dialog: Option<EffectDialog>,
+    /// Set while "Set from MIDI" is armed: the note-on sequence number seen when it was armed.
+    pub midi_learn: Option<u32>,
+    /// Whether a MIDI input is connected; set each frame for the inspector.
+    pub midi_connected: bool,
     /// Why the last action did nothing, shown in the toolbar until the next action.
     pub message: Option<String>,
 }
@@ -357,6 +361,8 @@ impl Default for UiState {
             play_from: None,
             effect_params: EffectParams::default(),
             effect_dialog: None,
+            midi_learn: None,
+            midi_connected: false,
             message: None,
         }
     }
@@ -382,6 +388,9 @@ pub struct LimewaveApp {
     pub save_results: Option<Vec<SaveResult>>,
     /// The selected file's Start frame, read by the MIDI thread for each note-on.
     start_frame: Arc<AtomicUsize>,
+    /// The sequence number and note of the last MIDI note-on, written by the MIDI thread (see
+    /// [`decode_last_note`]).
+    pub midi_last_note: Arc<AtomicU32>,
     midi: Option<MidiConnection>,
     /// The MIDI command producer while no connection holds it.
     midi_spare: Option<rtrb::Producer<Command>>,
@@ -430,6 +439,7 @@ impl LimewaveApp {
             pending: None,
             save_results: None,
             start_frame: Arc::new(AtomicUsize::new(0)),
+            midi_last_note: Arc::new(AtomicU32::new(0)),
             midi: None,
             midi_spare,
             midi_ports: Vec::new(),
@@ -812,6 +822,7 @@ impl LimewaveApp {
     /// Switches the MIDI input to port `index`, or off for `None`.
     fn choose_midi_port(&mut self, index: Option<usize>) {
         self.send(Command::AllOff);
+        self.ui.midi_learn = None;
         let producer = match self.midi.take() {
             Some(conn) => Some(conn.close()),
             None => self.midi_spare.take(),
@@ -823,7 +834,8 @@ impl LimewaveApp {
             return;
         };
         let Some(tx) = producer else { return };
-        match connect_midi(index, tx, Arc::clone(&self.start_frame)) {
+        let last_note = Arc::clone(&self.midi_last_note);
+        match connect_midi(index, tx, Arc::clone(&self.start_frame), last_note) {
             Ok(conn) => {
                 self.midi = Some(conn);
                 self.midi_selected = Some(index);
@@ -832,6 +844,49 @@ impl LimewaveApp {
                 self.midi_spare = Some(tx);
                 self.midi_error = Some(message);
             }
+        }
+    }
+
+    /// Makes `note` the root key of the selected file as one undoable step. Does nothing when
+    /// it already is.
+    fn set_root(&mut self, note: u8) {
+        let engine = self.engine.as_ref();
+        if let Some(FileEntry::Loaded(s)) = self.selected.and_then(|i| self.files.get_mut(i))
+            && s.edit().root != note
+        {
+            let e = EditState {
+                root: note,
+                ..s.edit().clone()
+            };
+            s.apply(e, engine);
+        }
+    }
+
+    /// Arms "Set from MIDI", or cancels it when it is already armed.
+    fn toggle_midi_learn(&mut self) {
+        self.ui.midi_learn = match self.ui.midi_learn {
+            Some(_) => None,
+            None => {
+                let seen = decode_last_note(self.midi_last_note.load(Ordering::Relaxed));
+                Some(seen.map_or(0, |(sequence, _)| sequence))
+            }
+        };
+    }
+
+    /// While "Set from MIDI" is armed, a note-on newer than the one seen when it was armed
+    /// becomes the root key and disarms it. Waits by repainting, as the MIDI thread cannot
+    /// wake the UI.
+    fn update_midi_learn(&mut self, ctx: &egui::Context) {
+        self.ui.midi_connected = self.midi.is_some();
+        let Some(seen) = self.ui.midi_learn else {
+            return;
+        };
+        match decode_last_note(self.midi_last_note.load(Ordering::Relaxed)) {
+            Some((sequence, note)) if sequence != seen => {
+                self.ui.midi_learn = None;
+                self.set_root(note);
+            }
+            _ => ctx.request_repaint_after(Duration::from_millis(50)),
         }
     }
 
@@ -954,7 +1009,10 @@ impl LimewaveApp {
         if select_all {
             self.select_all();
         } else if clear {
-            self.clear_selection();
+            // Escape cancels "Set from MIDI" first and leaves the selection alone.
+            if self.ui.midi_learn.take().is_none() {
+                self.clear_selection();
+            }
         }
     }
 
@@ -976,6 +1034,7 @@ impl LimewaveApp {
         self.handle_shortcuts(&ctx);
         self.sync_audio();
         self.handle_keyboard(&ctx);
+        self.update_midi_learn(&ctx);
 
         self.toolbar(ui);
         if !self.single_file {
@@ -1027,17 +1086,20 @@ impl LimewaveApp {
         let engine = self.engine.as_ref();
         let ui_state = &self.ui;
         let selected = self.selected.and_then(|i| self.files.get_mut(i));
-        let mut command = None;
+        let mut action = InspectorAction::default();
         egui::Panel::right("inspector")
             .resizable(true)
             .default_size(300.0)
             .size_range(220.0..=480.0)
             .show(ui, |ui| {
                 if let Some(FileEntry::Loaded(s)) = selected {
-                    command = inspector(ui, s, ui_state, engine);
+                    action = inspector(ui, s, ui_state, engine);
                 }
             });
-        if let Some(c) = command {
+        if action.toggle_midi_learn {
+            self.toggle_midi_learn();
+        }
+        if let Some(c) = action.save {
             self.run_save_command(c);
         }
     }
@@ -1054,14 +1116,19 @@ impl LimewaveApp {
                     note_name(self.ui.octave_base),
                     note_name(root)
                 ));
-                ui.add_enabled_ui(live, |ui| {
+                // Not disabled when silent: right-clicking a key still sets the root.
+                ui.scope(|ui| {
+                    if !live {
+                        ui.multiply_opacity(0.5);
+                    }
                     key = keyboard_strip(ui, root, &self.ui.held);
                 });
             });
         match key {
-            Some((note, true)) => self.note_on(note),
-            Some((note, false)) => self.note_off(note),
-            None => {}
+            Some(KeyEvent::Press(note)) if live => self.note_on(note),
+            Some(KeyEvent::Release(note)) => self.note_off(note),
+            Some(KeyEvent::SetRoot(note)) => self.set_root(note),
+            Some(KeyEvent::Press(_)) | None => {}
         }
     }
 

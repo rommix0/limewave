@@ -1,6 +1,6 @@
 //! MIDI input: note-on/off messages become [`Command`]s for the audio thread.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use midir::{MidiInput, MidiInputConnection};
@@ -25,6 +25,13 @@ pub fn list_midi_ports() -> Vec<String> {
         .collect()
 }
 
+/// Splits the value the MIDI thread stores on each note-on into `(sequence, note)`, or `None`
+/// before any note has arrived (0). The sequence counts note-ons, so the UI can tell a new
+/// note from one it has already seen, even when the same key is hit twice.
+pub fn decode_last_note(v: u32) -> Option<(u32, u8)> {
+    (v != 0).then_some((v >> 8, (v & 0x7f) as u8))
+}
+
 type Slot = Mutex<Option<rtrb::Producer<Command>>>;
 
 /// An open MIDI input port. The port stays open while this value is alive.
@@ -47,7 +54,8 @@ impl MidiConnection {
 }
 
 /// Opens input port `index`. Each note message is pushed to `tx` (dropped if the queue is full);
-/// a NoteOn starts from the frame currently stored in `start_frame`.
+/// a NoteOn starts from the frame currently stored in `start_frame` and also advances
+/// `last_note` (read it with [`decode_last_note`]).
 ///
 /// On failure the error message comes back together with `tx`. To switch ports, call
 /// [`MidiConnection::close`] on the old connection to get the producer back, then call
@@ -56,6 +64,7 @@ pub fn connect_midi(
     index: usize,
     tx: rtrb::Producer<Command>,
     start_frame: Arc<AtomicUsize>,
+    last_note: Arc<AtomicU32>,
 ) -> Result<MidiConnection, (String, rtrb::Producer<Command>)> {
     let input = match MidiInput::new(CLIENT_NAME) {
         Ok(input) => input,
@@ -70,7 +79,7 @@ pub fn connect_midi(
     match input.connect(
         port,
         "Limewave input",
-        move |_, msg, _| forward(&cb_slot, msg, &start_frame),
+        move |_, msg, _| forward(&cb_slot, msg, &start_frame, &last_note),
         (),
     ) {
         Ok(conn) => Ok(MidiConnection { conn, slot }),
@@ -83,10 +92,16 @@ pub fn connect_midi(
 
 /// The MIDI callback body. It never blocks: if the slot is busy or already taken, or the queue
 /// is full, the message is dropped.
-fn forward(slot: &Slot, msg: &[u8], start_frame: &AtomicUsize) {
+fn forward(slot: &Slot, msg: &[u8], start_frame: &AtomicUsize, last_note: &AtomicU32) {
     let Some(cmd) = parse_midi(msg, start_frame) else {
         return;
     };
+    if let Command::NoteOn { note, .. } = cmd {
+        // This callback is the only writer, so a load then a store cannot lose an update.
+        let previous = last_note.load(Ordering::Relaxed);
+        let sequence = (previous >> 8).wrapping_add(1);
+        last_note.store((sequence << 8) | u32::from(note), Ordering::Relaxed);
+    }
     if let Ok(mut guard) = slot.try_lock()
         && let Some(tx) = guard.as_mut()
     {
@@ -129,7 +144,7 @@ mod tests {
     fn midi_failed_connect_returns_the_producer() {
         let (tx, mut rx) = rtrb::RingBuffer::new(4);
         let start = Arc::new(AtomicUsize::new(0));
-        let Err((msg, mut tx)) = connect_midi(usize::MAX, tx, start) else {
+        let Err((msg, mut tx)) = connect_midi(usize::MAX, tx, start, Arc::default()) else {
             panic!("port usize::MAX cannot exist");
         };
         assert!(!msg.is_empty());
@@ -142,14 +157,32 @@ mod tests {
         let (tx, mut rx) = rtrb::RingBuffer::new(4);
         let slot = Mutex::new(Some(tx));
         let start = AtomicUsize::new(7);
-        forward(&slot, &[0x90, 60, 1], &start);
+        let last = AtomicU32::new(0);
+        forward(&slot, &[0x90, 60, 1], &start, &last);
         assert_eq!(rx.pop(), Ok(Command::NoteOn { note: 60, from: 7 }));
         let mut tx = take(&slot);
         // Once taken, messages are dropped instead of panicking.
-        forward(&slot, &[0x80, 60, 0], &start);
+        forward(&slot, &[0x80, 60, 0], &start, &last);
         assert!(rx.pop().is_err());
         tx.push(Command::AllOff).unwrap();
         assert_eq!(rx.pop(), Ok(Command::AllOff));
+    }
+
+    #[test]
+    fn note_on_advances_the_last_note() {
+        let (tx, _rx) = rtrb::RingBuffer::new(4);
+        let slot = Mutex::new(Some(tx));
+        let start = AtomicUsize::new(0);
+        let last = AtomicU32::new(0);
+        assert_eq!(decode_last_note(last.load(Ordering::Relaxed)), None);
+        forward(&slot, &[0x90, 60, 100], &start, &last);
+        let now = || decode_last_note(last.load(Ordering::Relaxed));
+        assert_eq!(now(), Some((1, 60)));
+        forward(&slot, &[0x90, 64, 100], &start, &last);
+        assert_eq!(now(), Some((2, 64)));
+        // A note-off leaves it alone.
+        forward(&slot, &[0x80, 64, 0], &start, &last);
+        assert_eq!(now(), Some((2, 64)));
     }
 
     #[test]
