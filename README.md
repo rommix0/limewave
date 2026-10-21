@@ -9,13 +9,13 @@ What it does in version 0.2:
 - Waveform view with zoom, scroll and an overview strip; draggable Start, Loop start, Loop end and End markers with optional zero-crossing snap. Drag a marker by its label as well as its line, or double-click the label to type an exact frame.
 - A seam view that overlays the audio before the loop end on the audio after the loop start, so you can see a bad splice before you hear it, with nudge buttons and a "lock length" option.
 - Loop crossfade (equal-power or linear), previewed live and rendered into the audio on save. Crossfade is switched off for backward loops.
-- Selection and the **Edit** menu: drag on the waveform to select (Shift-click extends it), then play the selection, set the loop to the selection, or set Start and End to the selection. **Trim after loop end** and **Crop to loop** set the trims from the loop points, with an adjustable padding.
+- Selection and the **Edit** menu: drag on the waveform to select (Shift-click extends an existing selection, or makes one from the play-from point), then play the selection, set the loop to the selection, or set Start and End to the selection. **Trim after loop end** and **Crop to loop** set the trims from the loop points, with an adjustable padding.
 - The **Effects** menu: gain, normalize, fade in and out (linear, exponential or S-curve), invert polarity, remove DC offset, reverse, stereo to mono, swap left and right, mono to stereo, and auto-trim silence. Effects work on the selection, or on the whole file or Start to End when nothing is selected. Each is one undo step, and the effects run before the crossfade and the trim when you save.
 - Live audition through your sound card, from the computer keyboard, an on-screen keyboard or a MIDI keyboard. Loop edits are heard while notes are sounding.
 - An ADSR envelope (attack, decay, sustain, release) for the audition notes. Stopping a note releases it instead of cutting it. The envelope is remembered between runs; it is not saved into WAV files.
 - Playback cursors in the waveform, the overview and the seam view show where each sounding note is. A click on the waveform sets the point the **Play** button starts from.
 - Right-click a key on the on-screen keyboard to set the root key. With a MIDI keyboard connected, "Set from MIDI" sets the root key from the next note you play.
-- Window size and panel sizes are remembered between runs.
+- The window size and position are saved between runs by eframe's standard persistence, which also keeps egui's own layout memory, such as panel sizes. This has not yet been checked by hand.
 - Undo and redo for every edit.
 
 *Screenshot coming soon.*
@@ -49,12 +49,12 @@ Notes play when the **Audition** toggle is on and no text field has focus.
 | - and = | Move both rows down or up one octave. |
 | Ctrl/Cmd+Z | Undo |
 | Ctrl/Cmd+Shift+Z or Ctrl/Cmd+Y | Redo |
-| Ctrl/Cmd+A | Select all (the whole file) |
-| Escape | Clear the selection (or cancel "Set from MIDI") |
+| Ctrl/Cmd+A | Select Start…End |
+| Escape | Clear the selection and the play-from point (or cancel "Set from MIDI"). With a menu open, Escape only closes the menu. |
 | Ctrl/Cmd+S | Save |
 | Ctrl/Cmd+Shift+S | Save as… |
 | Hold Shift while dragging a marker | Turn zero-crossing snap off for that drag |
-| Shift-click on the waveform | Extend the selection |
+| Shift-click on the waveform | Extend an existing selection, or make one from the play-from point |
 | Mouse wheel over the waveform | Zoom around the cursor |
 
 Note names follow the convention that MIDI note 60 is C4.
@@ -66,7 +66,7 @@ Note names follow the convention that MIDI note 60 is C4.
 - A `LIST/INFO` chunk with `ISFT` set to `Limewave <version>`. Other INFO fields (such as the name) are kept.
 - Every chunk Limewave does not edit is kept, including cue markers and their labels (`cue ` and `LIST/adtl`). Cue positions follow trims and reverses, and cues that fall outside the saved range are dropped with their labels. The `fact` chunk follows the saved frame count.
 - Effects, a crossfade and trims are baked into the saved audio. A WAV file does not record that they were applied, so a saved file reopens with a crossfade of 0 and no effects to undo.
-- Other chunks are copied through unchanged, in their original order. Existing `inst` and `acid` chunks have their root note (and, for `inst`, fine tune) updated to agree with the `smpl` chunk.
+- Other chunks are copied through unchanged, in their original order. When you change the root key or fine tune, existing `inst` and `acid` chunks have their root note (and, for `inst`, fine tune) updated to agree with the `smpl` chunk; otherwise they are left as they are. A file without a `smpl` chunk opens with the root key and fine tune of its `inst` chunk, or else the root key of its `acid` chunk.
 - A file you open and save with no edits comes back byte for byte, apart from the `ISFT` tag.
 
 Where files go:
