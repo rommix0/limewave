@@ -12,7 +12,8 @@ use limewave_core::save::{Destination, SaveOutcome, default_folder, save_wav};
 use limewave_core::software_tag;
 
 use crate::app::{FileEntry, LimewaveApp, Session};
-use crate::audio::engine::Command;
+use crate::audio::engine::{AudioEngine, Command};
+use crate::audio::voice::PlayBuffer;
 use crate::theme::colors;
 
 /// One file's save result: the source path and what was written, or why not.
@@ -416,6 +417,34 @@ fn save_session(
 /// When a save gives the selected file a new source (its frames moved), every note is
 /// released first: the voices fade out on the old audio instead of freezing on it.
 pub fn perform_save(app: &mut LimewaveApp, req: SaveRequest) -> Vec<SaveResult> {
+    let mut engine = app.engine.take();
+    let results = save_and_hand_over(app, req, engine.as_mut());
+    app.engine = engine;
+    results
+}
+
+/// What a save tells the audio engine, so the hand-over can be tested without a device.
+trait Player {
+    fn send(&mut self, c: Command);
+    fn set_buffer(&self, b: PlayBuffer);
+}
+
+impl Player for AudioEngine {
+    fn send(&mut self, c: Command) {
+        AudioEngine::send(self, c);
+    }
+
+    fn set_buffer(&self, b: PlayBuffer) {
+        AudioEngine::set_buffer(self, b);
+    }
+}
+
+/// [`perform_save`] with the engine taken out of `app` as `player`.
+fn save_and_hand_over(
+    app: &mut LimewaveApp,
+    req: SaveRequest,
+    mut player: Option<&mut impl Player>,
+) -> Vec<SaveResult> {
     let mut results = Vec::with_capacity(req.indices.len());
     for &i in &req.indices {
         let Some(entry) = app.files.get_mut(i) else {
@@ -433,11 +462,11 @@ pub fn perform_save(app: &mut LimewaveApp, req: SaveRequest) -> Vec<SaveResult> 
             app.ui.selection = None;
             app.ui.play_from = None;
             app.ui.marker_entry = None;
-            if let Some(engine) = &mut app.engine {
+            if let Some(player) = player.as_deref_mut() {
                 if s.source != old_source {
-                    engine.send(Command::AllOff);
+                    player.send(Command::AllOff);
                 }
-                engine.set_buffer(s.play_buffer());
+                player.set_buffer(s.play_buffer());
             }
         }
         results.push((source, result));
@@ -780,6 +809,69 @@ mod tests {
         let s = session(&mut app, 0);
         assert_eq!(s.doc.frames, 8000 - 100, "the head was trimmed");
         assert_ne!(s.source, id, "the frames moved: a new source");
+    }
+
+    /// A [`Player`] that records what it is told.
+    #[derive(Default)]
+    struct Recorder {
+        sent: Vec<Command>,
+        /// The source of each buffer handed over.
+        buffers: std::cell::RefCell<Vec<u64>>,
+    }
+
+    impl Player for Recorder {
+        fn send(&mut self, c: Command) {
+            self.sent.push(c);
+        }
+
+        fn set_buffer(&self, b: PlayBuffer) {
+            self.buffers.borrow_mut().push(b.source);
+        }
+    }
+
+    #[test]
+    fn a_save_that_moves_frames_releases_every_note_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = [
+            write_looped(dir.path(), "a.wav"),
+            write_looped(dir.path(), "b.wav"),
+        ];
+        let out = dir.path().join("out");
+        let mut app = app_with(&paths);
+        let mut player = Recorder::default();
+
+        // Frames unmoved: the new buffer keeps the source and no note is released.
+        let s = session(&mut app, 0);
+        let id = s.source;
+        let e = edit_with(s, |e| e.root = 62);
+        s.apply(e, None);
+        let results =
+            save_and_hand_over(&mut app, folder_request(vec![0], &out), Some(&mut player));
+        assert!(results[0].1.is_ok(), "{:?}", results[0].1);
+        assert_eq!(player.sent, vec![]);
+        assert_eq!(*player.buffers.borrow(), vec![id]);
+
+        // A head trim moves the frames: every note is released before the new buffer.
+        let s = session(&mut app, 0);
+        let e = edit_with(s, |e| e.start = 100);
+        s.apply(e, None);
+        let results =
+            save_and_hand_over(&mut app, folder_request(vec![0], &out), Some(&mut player));
+        assert!(results[0].1.is_ok(), "{:?}", results[0].1);
+        let new = session(&mut app, 0).source;
+        assert_ne!(new, id);
+        assert_eq!(player.sent, vec![Command::AllOff]);
+        assert_eq!(*player.buffers.borrow(), vec![id, new]);
+
+        // A file that is not selected tells the player nothing.
+        let s = session(&mut app, 1);
+        let e = edit_with(s, |e| e.start = 100);
+        s.apply(e, None);
+        let results =
+            save_and_hand_over(&mut app, folder_request(vec![1], &out), Some(&mut player));
+        assert!(results[0].1.is_ok(), "{:?}", results[0].1);
+        assert_eq!(player.sent, vec![Command::AllOff]);
+        assert_eq!(player.buffers.borrow().len(), 2);
     }
 
     #[test]
