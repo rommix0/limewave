@@ -38,6 +38,17 @@ pub enum Command {
         from: usize,
         to: usize,
     },
+    /// Whether voices started from now on leave the loop when released and play on to End
+    /// (v0.3 §7.3). Sounding voices keep the setting they started with.
+    SetReleasePastLoop(bool),
+    /// A dialog preview (plan ruling R2): like `NoteOn`, with the session attack, but its
+    /// release always leaves the loop and holds its level until End, so the generated release
+    /// is heard as it is. `NoteOff` releases it that way; `AllOff` (Stop) fades it out over
+    /// [`STEAL_FADE_MS`], so Stop silences it at once.
+    PreviewOn {
+        note: u8,
+        from: usize,
+    },
 }
 
 /// Where one sounding voice is: its read position in file frames and its envelope level.
@@ -118,6 +129,8 @@ pub struct MixerState {
     counter: u64,
     /// The envelope new voices start with.
     adsr: Adsr,
+    /// Whether new voices leave the loop on release ([`Command::SetReleasePastLoop`]).
+    release_past_loop: bool,
 }
 
 impl MixerState {
@@ -128,14 +141,21 @@ impl MixerState {
             age: [0; MAX_VOICES],
             counter: 0,
             adsr: Adsr::DEFAULT,
+            release_past_loop: false,
         }
     }
 
     fn apply(&mut self, cmd: Command, buf: &PlayBuffer, device_rate: u32) {
         match cmd {
-            Command::NoteOn { note, from } => self.note_on(note, from, None, buf, device_rate),
+            Command::NoteOn { note, from } => {
+                self.note_on(note, from, None, false, buf, device_rate);
+            }
+            Command::PreviewOn { note, from } => {
+                self.note_on(note, from, None, true, buf, device_rate);
+            }
+            Command::SetReleasePastLoop(on) => self.release_past_loop = on,
             Command::PlayRange { note, from, to } => {
-                self.note_on(note, from, Some(to), buf, device_rate);
+                self.note_on(note, from, Some(to), false, buf, device_rate);
             }
             Command::NoteOff { note } => self
                 .voices
@@ -143,7 +163,15 @@ impl MixerState {
                 .flatten()
                 .filter(|v| v.note() == note)
                 .for_each(Voice::release),
-            Command::AllOff => self.voices.iter_mut().flatten().for_each(Voice::release),
+            Command::AllOff => {
+                for v in self.voices.iter_mut().flatten() {
+                    if v.is_preview() {
+                        v.fade_out(STEAL_FADE_MS);
+                    } else {
+                        v.release();
+                    }
+                }
+            }
             Command::SetEnvelope(a) => {
                 let a = a.clamped();
                 self.adsr = a;
@@ -157,12 +185,13 @@ impl MixerState {
     /// Releases any voice already playing `note`, then starts a new one in a free slot. With no
     /// free slot a voice is stolen: the one that was playing `note`, else the oldest releasing
     /// voice, else the oldest. The stolen voice fades out over [`STEAL_FADE_MS`] in a spare
-    /// slot rather than being cut.
+    /// slot rather than being cut. `preview` starts a [`Command::PreviewOn`] voice.
     fn note_on(
         &mut self,
         note: u8,
         from: usize,
         stop_at: Option<usize>,
+        preview: bool,
         buf: &PlayBuffer,
         device_rate: u32,
     ) {
@@ -181,7 +210,9 @@ impl MixerState {
                 victim
             }
         };
-        self.voices[slot] = Some(Voice::new(note, from, buf, device_rate, self.adsr, stop_at));
+        let voice = Voice::new(note, from, buf, device_rate, self.adsr, stop_at)
+            .release_past_loop(self.release_past_loop);
+        self.voices[slot] = Some(if preview { voice.preview() } else { voice });
         self.age[slot] = self.counter;
         self.counter += 1;
     }
@@ -1014,6 +1045,92 @@ mod tests {
         tx.push(Command::SetEnvelope(wild)).unwrap();
         block(&mut state, &b, &mut rx, 16);
         assert_eq!(state.adsr, wild.clamped());
+    }
+
+    /// [`constant`] with 0.75 after the loop end, so a voice that leaves the loop shows it.
+    fn with_release_audio() -> PlayBuffer {
+        let mut b = constant(1, 0.25);
+        for ch in &mut b.audio {
+            ch[3000..].fill(0.75);
+        }
+        b
+    }
+
+    #[test]
+    fn set_release_past_loop_reaches_new_voices() {
+        let b = with_release_audio();
+        let (mut tx, mut rx) = rtrb::RingBuffer::new(256);
+        let mut state = MixerState::new();
+        tx.push(Command::SetEnvelope(Adsr {
+            release_ms: 1000.0,
+            ..FLAT
+        }))
+        .unwrap();
+        // 72 (an octave up, two frames a frame) starts with the setting off and keeps it; 60
+        // starts with it on.
+        tx.push(Command::NoteOn { note: 72, from: 0 }).unwrap();
+        block(&mut state, &b, &mut rx, 16);
+        tx.push(Command::SetReleasePastLoop(true)).unwrap();
+        tx.push(Command::NoteOn { note: 60, from: 0 }).unwrap();
+        block(&mut state, &b, &mut rx, 16);
+        tx.push(Command::NoteOff { note: 72 }).unwrap();
+        tx.push(Command::NoteOff { note: 60 }).unwrap();
+        let out = left(&block(&mut state, &b, &mut rx, 4100));
+        // 72 (at 64) passes the loop end at frame 1468 and wraps; 60 (at 16) reaches 3000 at
+        // frame 2984 and dies after End at 3999.
+        assert!(out[1500] < 0.5, "the old voice wraps: {}", out[1500]);
+        assert!(out[2960] < 0.5, "both in the loop: {}", out[2960]);
+        assert!(
+            out[3010] > 0.9,
+            "the new voice plays the release: {}",
+            out[3010]
+        );
+        assert!(out[4050] < 0.5, "the new voice ended at End: {}", out[4050]);
+        assert_eq!(active(&state), [72]);
+    }
+
+    #[test]
+    fn preview_uses_the_attack_and_holds_after_note_off() {
+        let b = with_release_audio();
+        let (mut tx, mut rx) = rtrb::RingBuffer::new(256);
+        let mut state = MixerState::new();
+        // The default envelope: a 2 ms attack and a 30 ms release.
+        tx.push(Command::PreviewOn {
+            note: 60,
+            from: 2000,
+        })
+        .unwrap();
+        let out = left(&block(&mut state, &b, &mut rx, 200));
+        assert!(out[0] < 0.01, "the attack starts near silence");
+        assert!((out[199] - 0.25).abs() < 1e-6);
+        tx.push(Command::NoteOff { note: 60 }).unwrap();
+        // 200 + 800 frames reach the loop end at 2999; the release audio plays at full level.
+        let out = left(&block(&mut state, &b, &mut rx, 1500));
+        assert!(out[..800].iter().all(|s| (*s - 0.25).abs() < 1e-6));
+        assert!(out[800..].iter().all(|s| (*s - 0.75).abs() < 1e-6));
+        assert_eq!(
+            active(&state),
+            [60],
+            "still sounding 30 ms after the release"
+        );
+    }
+
+    #[test]
+    fn stop_silences_a_preview_voice_within_10_ms() {
+        let b = with_release_audio();
+        let (mut tx, mut rx) = rtrb::RingBuffer::new(256);
+        let mut state = MixerState::new();
+        tx.push(Command::PreviewOn {
+            note: 60,
+            from: 2000,
+        })
+        .unwrap();
+        block(&mut state, &b, &mut rx, 400);
+        tx.push(Command::AllOff).unwrap();
+        let out = left(&block(&mut state, &b, &mut rx, 480));
+        assert!(active(&state).is_empty(), "gone within 10 ms");
+        assert!(out.windows(2).all(|w| w[1] <= w[0]), "a fade, not a cut");
+        assert!(out[240..].iter().all(|s| *s == 0.0));
     }
 
     #[test]

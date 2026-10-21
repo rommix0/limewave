@@ -253,6 +253,12 @@ pub struct Voice {
     stage_pos: u32,
     /// The level the release started from.
     release_from: f32,
+    /// On release, leave the loop: turn forward and play on to End.
+    past_loop: bool,
+    /// Released with `past_loop`: the loop is ignored from now on.
+    leaving: bool,
+    /// The release holds `release_from` instead of fading (preview voices).
+    hold_release: bool,
     /// The envelope level of the last frame played.
     level: f32,
 }
@@ -282,16 +288,40 @@ impl Voice {
             stage: Stage::Attack,
             stage_pos: 0,
             release_from: 0.0,
+            past_loop: false,
+            leaving: false,
+            hold_release: false,
             level: 0.0,
         }
     }
 
+    /// Sets whether a release leaves the loop and plays on to End (v0.3 §7.3).
+    pub fn release_past_loop(mut self, on: bool) -> Voice {
+        self.past_loop = on;
+        self
+    }
+
+    /// Makes this a dialog preview voice (plan ruling R2): its release always leaves the loop,
+    /// and holds the level reached instead of fading, so the voice plays the audio after the
+    /// loop end in full and ends at End. [`Voice::fade_out`] still fades it.
+    pub fn preview(mut self) -> Voice {
+        self.past_loop = true;
+        self.hold_release = true;
+        self
+    }
+
     /// Starts the release from the current level; it takes effect on the next `render_add`.
+    /// With [`Voice::release_past_loop`] set, the voice also turns forward and stops wrapping,
+    /// so it plays through the loop end and ends at End like a one-shot.
     pub fn release(&mut self) {
         if self.stage != Stage::Release {
             self.stage = Stage::Release;
             self.stage_pos = 0;
             self.release_from = self.level;
+            if self.past_loop {
+                self.leaving = true;
+                self.forward = true;
+            }
         }
     }
 
@@ -312,6 +342,7 @@ impl Voice {
     /// Fades the voice out from its current level over `ms`, whatever stage it is in. Used when
     /// the voice is stolen, so it ends quickly without a jump.
     pub fn fade_out(&mut self, ms: f32) {
+        self.hold_release = false;
         self.stage = Stage::Release;
         self.stage_pos = 0;
         self.release_from = self.level;
@@ -321,6 +352,11 @@ impl Voice {
     /// Whether the voice is in its release.
     pub fn is_releasing(&self) -> bool {
         self.stage == Stage::Release
+    }
+
+    /// Whether this is a preview voice ([`Voice::preview`]) that has not been faded out.
+    pub fn is_preview(&self) -> bool {
+        self.hold_release
     }
 
     pub fn note(&self) -> u8 {
@@ -353,10 +389,13 @@ impl Voice {
         if self.dead {
             return false;
         }
-        let Some(region) = Region::new(buf, self.stop_at.is_some()) else {
+        let Some(mut region) = Region::new(buf, self.stop_at.is_some()) else {
             self.dead = true;
             return false;
         };
+        if self.leaving {
+            region.looping = None;
+        }
         if out_channels == 0 {
             return true;
         }
@@ -417,9 +456,15 @@ impl Voice {
         true
     }
 
-    /// Whether the release has played all its frames.
+    /// Whether the release has played all its frames. A held release lasts until End, unless
+    /// it holds silence (released before any level was reached).
     fn release_over(&self, rate: u32) -> bool {
-        self.stage == Stage::Release && self.stage_pos >= stage_frames(self.adsr.release_ms, rate)
+        self.stage == Stage::Release
+            && if self.hold_release {
+                self.release_from <= 0.0
+            } else {
+                self.stage_pos >= stage_frames(self.adsr.release_ms, rate)
+            }
     }
 
     /// Moves the envelope on by one output frame and returns that frame's level. Attack and
@@ -432,6 +477,10 @@ impl Voice {
                 Stage::Decay => (a.decay_ms, Stage::Sustain),
                 Stage::Sustain => {
                     self.level = a.sustain;
+                    return self.level;
+                }
+                Stage::Release if self.hold_release => {
+                    self.level = self.release_from;
                     return self.level;
                 }
                 Stage::Release => {
@@ -974,6 +1023,105 @@ mod tests {
         let tail = positions.len() - at_end;
         assert!(tail <= 480, "died {tail} frames after 199");
         assert!(tail >= 470, "the release ran its course: {tail}");
+    }
+
+    /// Ones up to the loop end at 1999 (loop 1000..=1999), then twos to End at 2999.
+    fn ones_then_twos() -> PlayBuffer {
+        let mut x = vec![1.0; 3000];
+        x[2000..].fill(2.0);
+        buf(vec![x], LoopMode::Forward, 1000, 1999)
+    }
+
+    /// Holds from 1000 for 1500 frames (to frame 1500, wrapped), releases, then renders 2000.
+    fn release_into(b: &PlayBuffer, past_loop: bool) -> (Voice, Vec<f32>, bool) {
+        let mut v = Voice::new(60, 1000, b, RATE, adsr(0.0, 0.0, 1.0, 10_000.0), None)
+            .release_past_loop(past_loop);
+        let (held, _) = render_frames(&mut v, b, 1500);
+        assert!(held.iter().all(|s| *s == 1.0));
+        assert_eq!(v.pos, 1500.0);
+        v.release();
+        let (out, alive) = render_frames(&mut v, b, 2000);
+        (v, out, alive)
+    }
+
+    #[test]
+    fn released_voice_plays_past_loop_end_when_enabled() {
+        let b = ones_then_twos();
+        let (_, out, alive) = release_into(&b, true);
+        // Frames 1500..=1999 are ones, 2000..=2999 twos, each scaled by the 10 s release.
+        let level = |k: usize| 1.0 - k as f32 / 480_000.0;
+        for (k, s) in out[..1500].iter().enumerate() {
+            let want = if k < 500 { 1.0 } else { 2.0 } * level(k);
+            assert!((s - want).abs() < 1e-5, "frame {k}: {s} want {want}");
+        }
+        assert!(!alive, "dies at End like a one-shot");
+        assert!(out[1500..].iter().all(|s| *s == 0.0));
+    }
+
+    #[test]
+    fn released_voice_stays_in_loop_when_disabled() {
+        let b = ones_then_twos();
+        let (v, out, alive) = release_into(&b, false);
+        assert!(alive, "the 10 s release is still sounding");
+        assert!(
+            out.iter().all(|s| *s > 0.99 && *s <= 1.0),
+            "never reads past the loop"
+        );
+        assert!(v.pos >= 1000.0 && v.pos < 2000.0, "pos {}", v.pos);
+    }
+
+    #[test]
+    fn ping_pong_voice_turns_forward_on_release_past_loop() {
+        let b = buf(ramp(3000), LoopMode::PingPong, 1000, 1099);
+        let mut v = Voice::new(60, 1090, &b, RATE, adsr(0.0, 0.0, 1.0, 10_000.0), None)
+            .release_past_loop(true);
+        render_frames(&mut v, &b, 20);
+        assert!(!v.forward, "moving backward after the reflection");
+        let at_release = v.pos;
+        v.release();
+        let mut positions = vec![v.pos];
+        loop {
+            let (_, alive) = render_frames(&mut v, &b, 1);
+            if !alive || positions.len() > 3000 {
+                break;
+            }
+            positions.push(v.pos);
+        }
+        assert!(
+            positions.windows(2).all(|w| w[1] == w[0] + 1.0),
+            "turns forward at once and never wraps"
+        );
+        assert_eq!(positions.last().copied(), Some(2999.0), "plays on to End");
+        assert_eq!(positions.len() as f64, 2999.0 - at_release + 1.0);
+    }
+
+    #[test]
+    fn preview_voice_holds_level_through_release() {
+        let b = ones(10_000, LoopMode::Forward, 100, 999);
+        let mut v = Voice::new(60, 0, &b, RATE, adsr(0.0, 0.0, 1.0, 30.0), None).preview();
+        render_frames(&mut v, &b, 500);
+        v.release();
+        // 100 ms later, three times the 30 ms release, it is still at full level.
+        let (out, alive) = render_frames(&mut v, &b, 4800);
+        assert!(alive);
+        assert!(out.iter().all(|s| *s == 1.0));
+        assert_eq!(v.pos, 5300.0, "left the loop");
+        // Frames 5300..=9999 remain, then it stops at End.
+        let (out, alive) = render_frames(&mut v, &b, 5000);
+        assert!(!alive);
+        assert!(out[..4700].iter().all(|s| *s == 1.0));
+        assert!(out[4700..].iter().all(|s| *s == 0.0));
+    }
+
+    #[test]
+    fn a_stolen_preview_voice_still_fades() {
+        let b = ones(10_000, LoopMode::Forward, 100, 999);
+        let mut v = Voice::new(60, 0, &b, RATE, adsr(0.0, 0.0, 1.0, 30.0), None).preview();
+        render_frames(&mut v, &b, 500);
+        v.fade_out(5.0);
+        let (out, alive) = render_frames(&mut v, &b, 241);
+        assert!(!alive, "gone after 5 ms");
+        assert!(out.windows(2).all(|w| w[1] < w[0]));
     }
 
     #[test]

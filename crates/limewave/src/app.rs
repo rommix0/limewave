@@ -419,6 +419,9 @@ pub struct UiState {
     pub midi_learn: Option<u32>,
     /// The audition envelope, shared by every file and remembered between runs.
     pub envelope: Adsr,
+    /// "Release plays after loop end" (v0.3 §7.3): released looped notes leave the loop and
+    /// play on to End. Off by default and remembered between runs.
+    pub release_after_loop: bool,
     /// Whether a MIDI input is connected; set each frame for the inspector.
     pub midi_connected: bool,
     /// Why the last action did nothing, shown in the toolbar until the next action.
@@ -443,6 +446,7 @@ impl Default for UiState {
             effect_dialog: None,
             midi_learn: None,
             envelope: Adsr::DEFAULT,
+            release_after_loop: false,
             midi_connected: false,
             message: None,
         }
@@ -490,6 +494,8 @@ impl CursorWatch {
 
 /// The key the audition envelope is saved under in the app settings.
 const ENVELOPE_KEY: &str = "envelope";
+/// The key "Release plays after loop end" is saved under, as `"1"` or `"0"`.
+const RELEASE_AFTER_LOOP_KEY: &str = "release_after_loop";
 
 pub struct LimewaveApp {
     pub files: Vec<FileEntry>,
@@ -514,6 +520,8 @@ pub struct LimewaveApp {
     midi_error: Option<String>,
     /// The envelope last sent to the engine, so it is sent only when it changes.
     sent_envelope: Option<Adsr>,
+    /// The "Release plays after loop end" setting last sent to the engine.
+    sent_release_after_loop: Option<bool>,
     /// True while the engine has been silenced because no loaded file is selected.
     silenced: bool,
     /// Keeps the play cursors moving; see [`CursorWatch`].
@@ -538,14 +546,23 @@ impl LimewaveApp {
             Err(e) => (None, Some(e)),
         };
         let mut app = Self::build(cc.egui_ctx.clone(), engine, audio_error);
-        if let Some(envelope) = cc
-            .storage
-            .and_then(|s| s.get_string(ENVELOPE_KEY))
-            .and_then(|s| Adsr::from_storage_string(&s))
-        {
-            app.ui.envelope = envelope;
+        if let Some(storage) = cc.storage {
+            app.load_settings(storage);
         }
         app
+    }
+
+    /// Reads the settings remembered between runs: the envelope and "Release plays after loop
+    /// end". A missing or unreadable value leaves the default.
+    fn load_settings(&mut self, storage: &dyn eframe::Storage) {
+        if let Some(envelope) = storage
+            .get_string(ENVELOPE_KEY)
+            .and_then(|s| Adsr::from_storage_string(&s))
+        {
+            self.ui.envelope = envelope;
+        }
+        self.ui.release_after_loop =
+            storage.get_string(RELEASE_AFTER_LOOP_KEY).as_deref() == Some("1");
     }
 
     /// An app with no audio engine and no MIDI, for tests.
@@ -575,6 +592,7 @@ impl LimewaveApp {
             midi_selected: None,
             midi_error: None,
             sent_envelope: None,
+            sent_release_after_loop: None,
             silenced: false,
             cursor_watch: CursorWatch::default(),
             midi_seen: None,
@@ -1262,7 +1280,8 @@ impl LimewaveApp {
         }
     }
 
-    /// Sends the envelope to the audio engine when it differs from the one last sent.
+    /// Sends the envelope and "Release plays after loop end" to the audio engine when they
+    /// differ from the ones last sent.
     fn sync_envelope(&mut self) {
         let envelope = self.ui.envelope.clamped();
         if self.sent_envelope != Some(envelope) {
@@ -1270,6 +1289,13 @@ impl LimewaveApp {
                 engine.set_envelope(envelope);
             }
             self.sent_envelope = Some(envelope);
+        }
+        let past_loop = self.ui.release_after_loop;
+        if self.sent_release_after_loop != Some(past_loop) {
+            if let Some(engine) = &mut self.engine {
+                engine.send(Command::SetReleasePastLoop(past_loop));
+            }
+            self.sent_release_after_loop = Some(past_loop);
         }
     }
 
@@ -1552,6 +1578,8 @@ impl eframe::App for LimewaveApp {
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         storage.set_string(ENVELOPE_KEY, self.ui.envelope.clamped().to_storage_string());
+        let past_loop = if self.ui.release_after_loop { "1" } else { "0" };
+        storage.set_string(RELEASE_AFTER_LOOP_KEY, past_loop.to_string());
     }
 }
 
@@ -1648,6 +1676,64 @@ mod tests {
         assert_eq!(sent.release_ms, 80.0);
         app.sync_envelope();
         assert_eq!(app.sent_envelope, Some(sent));
+    }
+
+    /// App settings held in memory, standing in for eframe's storage.
+    #[derive(Default)]
+    struct MemStorage(std::collections::HashMap<String, String>);
+
+    impl eframe::Storage for MemStorage {
+        fn get_string(&self, key: &str) -> Option<String> {
+            self.0.get(key).cloned()
+        }
+        fn set_string(&mut self, key: &str, value: String) {
+            self.0.insert(key.to_string(), value);
+        }
+        fn remove_string(&mut self, key: &str) {
+            self.0.remove(key);
+        }
+        fn flush(&mut self) {}
+    }
+
+    #[test]
+    fn release_after_loop_setting_is_remembered() {
+        use eframe::Storage as _;
+        assert!(!UiState::default().release_after_loop, "off by default");
+        let mut app = LimewaveApp::for_test();
+        app.ui.release_after_loop = true;
+        let mut storage = MemStorage::default();
+        eframe::App::save(&mut app, &mut storage);
+        assert_eq!(
+            storage.get_string("release_after_loop").as_deref(),
+            Some("1")
+        );
+
+        let mut restored = LimewaveApp::for_test();
+        restored.load_settings(&storage);
+        assert!(restored.ui.release_after_loop);
+
+        let mut fresh = LimewaveApp::for_test();
+        fresh.load_settings(&MemStorage::default());
+        assert!(!fresh.ui.release_after_loop, "a missing key gives false");
+
+        app.ui.release_after_loop = false;
+        eframe::App::save(&mut app, &mut storage);
+        assert_eq!(
+            storage.get_string("release_after_loop").as_deref(),
+            Some("0")
+        );
+        restored.load_settings(&storage);
+        assert!(!restored.ui.release_after_loop);
+    }
+
+    #[test]
+    fn release_after_loop_is_sent_when_it_changes() {
+        let mut app = LimewaveApp::for_test();
+        app.sync_envelope();
+        assert_eq!(app.sent_release_after_loop, Some(false));
+        app.ui.release_after_loop = true;
+        app.sync_envelope();
+        assert_eq!(app.sent_release_after_loop, Some(true));
     }
 
     #[test]

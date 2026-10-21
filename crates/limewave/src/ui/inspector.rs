@@ -103,7 +103,7 @@ pub fn inspector(
             ui.separator();
             loop_section(ui, s, ui_state, engine);
             ui.separator();
-            envelope_section(ui, &mut ui_state.envelope);
+            envelope_section(ui, &mut ui_state.envelope, &mut ui_state.release_after_loop);
             ui.separator();
             InspectorAction {
                 save: save_section(ui, s),
@@ -411,8 +411,9 @@ fn loop_section(ui: &mut Ui, s: &mut Session, ui_state: &UiState, engine: Option
     }
 }
 
-/// The audition envelope: attack, decay and release in ms, sustain in %.
-fn envelope_section(ui: &mut Ui, envelope: &mut Adsr) {
+/// The audition envelope: attack, decay and release in ms, sustain in %, then "Release plays
+/// after loop end" (v0.3 §7.3).
+fn envelope_section(ui: &mut Ui, envelope: &mut Adsr, release_after_loop: &mut bool) {
     ui.heading("Envelope");
     let time = |ui: &mut Ui, name: &str, ms: &mut f32| {
         ui.horizontal(|ui| {
@@ -445,6 +446,10 @@ fn envelope_section(ui: &mut Ui, envelope: &mut Adsr) {
         }
     });
     time(ui, "Release", &mut envelope.release_ms);
+    ui.checkbox(release_after_loop, "Release plays after loop end")
+        .on_hover_text(
+            "When a looped note is released, it stops looping and plays on through the loop              end into the rest of the audio, as a sampler with a sustain loop does. The              envelope's release still applies; a long release lets the whole release be heard.",
+        );
 }
 
 #[cfg(test)]

@@ -341,7 +341,14 @@ fn backward_crossing_nudge_puts_the_next_sample_on_a_downward_crossing() {
 #[test]
 fn envelope_section_is_shown() {
     let h = harness(&looped());
-    for label in ["Envelope", "Attack", "Decay", "Sustain", "Release"] {
+    for label in [
+        "Envelope",
+        "Attack",
+        "Decay",
+        "Sustain",
+        "Release",
+        "Release plays after loop end",
+    ] {
         let _ = h.get_by_label(label);
     }
 }
