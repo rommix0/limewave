@@ -264,6 +264,7 @@ pub fn build_wav_bytes(doc: &WavDocument, e: &EditState) -> Vec<u8> {
                     }
                 )
             }));
+    let tuning_changed = (e.root, e.cents) != (init.root, init.cents);
     let fact_frames = u32::try_from(e.end - e.start + 1)
         .unwrap_or(u32::MAX)
         .to_le_bytes();
@@ -298,8 +299,9 @@ pub fn build_wav_bytes(doc: &WavDocument, e: &EditState) -> Vec<u8> {
                     c.data = bytes;
                 }
             }
-            b"inst" => sync_inst(&mut c.data, e.root, e.cents),
-            b"acid" => sync_acid(&mut c.data, e.root),
+            // `inst` and `acid` follow a tuning change; otherwise they stay as they are.
+            b"inst" if tuning_changed => sync_inst(&mut c.data, e.root, e.cents),
+            b"acid" if tuning_changed => sync_acid(&mut c.data, e.root),
             _ => {}
         }
         chunks.push(c);
@@ -996,6 +998,91 @@ mod tests {
         let acid = &c[find(&c, b"acid").unwrap()].data;
         assert_eq!(acid[4..6], 48u16.to_le_bytes());
         assert_eq!(acid[..4], [0xAA; 4]);
+    }
+
+    /// An `acid` chunk body with `root` at byte 4 and 0xAA elsewhere.
+    fn acid_chunk(root: u16) -> Chunk {
+        let mut acid = vec![0xAA; 24];
+        acid[4..6].copy_from_slice(&root.to_le_bytes());
+        chunk(b"acid", acid)
+    }
+
+    #[test]
+    fn no_edit_save_keeps_the_acid_root_of_a_file_without_smpl() {
+        let tag = software_tag();
+        let bytes = file(vec![acid_chunk(57), info(&[(b"ISFT", &tag)])], vec![]);
+        let d = doc(&bytes);
+        let init = d.initial_edit();
+        assert_eq!((init.root, init.cents), (57, 0.0));
+        assert_eq!(build_wav_bytes(&d, &init), bytes);
+    }
+
+    #[test]
+    fn no_edit_save_keeps_the_inst_root_and_tune_of_a_file_without_smpl() {
+        let tag = software_tag();
+        let bytes = file(
+            vec![
+                chunk(b"inst", vec![48, (-12i8) as u8, 0, 0, 127, 1, 127]),
+                // `inst` wins over `acid`.
+                acid_chunk(50),
+                info(&[(b"ISFT", &tag)]),
+            ],
+            vec![],
+        );
+        let d = doc(&bytes);
+        let init = d.initial_edit();
+        assert_eq!((init.root, init.cents), (48, 12.0));
+        assert_eq!(build_wav_bytes(&d, &init), bytes);
+    }
+
+    #[test]
+    fn no_edit_save_leaves_an_inst_that_disagrees_with_smpl() {
+        let tag = software_tag();
+        let bytes = file(
+            vec![
+                smpl_chunk(vec![fwd(2532, 2915)]),
+                chunk(b"inst", vec![62, 0, 0, 0, 127, 1, 127]),
+                acid_chunk(64),
+                info(&[(b"ISFT", &tag)]),
+            ],
+            vec![],
+        );
+        let d = doc(&bytes);
+        assert_eq!(d.initial_edit().root, 60, "smpl wins");
+        assert_eq!(build_wav_bytes(&d, &d.initial_edit()), bytes);
+    }
+
+    #[test]
+    fn a_tuning_change_still_syncs_inst_and_acid() {
+        let bytes = file(
+            vec![
+                chunk(b"inst", vec![48, 0, 0, 0, 127, 1, 127]),
+                acid_chunk(48),
+            ],
+            vec![],
+        );
+        let d = doc(&bytes);
+        let inst_acid = |e: &EditState| {
+            let c = chunks(&build_wav_bytes(&d, e));
+            (
+                c[find(&c, b"inst").unwrap()].data[..2].to_vec(),
+                c[find(&c, b"acid").unwrap()].data[4..6].to_vec(),
+            )
+        };
+        let init = d.initial_edit();
+        let tuned = EditState {
+            cents: 10.0,
+            ..init.clone()
+        };
+        assert_eq!(
+            inst_acid(&tuned),
+            (vec![48, (-10i8) as u8], 48u16.to_le_bytes().to_vec())
+        );
+        let rooted = EditState { root: 50, ..init };
+        assert_eq!(
+            inst_acid(&rooted),
+            (vec![50, 0], 50u16.to_le_bytes().to_vec())
+        );
     }
 
     #[test]

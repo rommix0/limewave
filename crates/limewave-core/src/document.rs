@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use crate::cue::check_markers;
 use crate::edit::{EditState, LoopMode};
 use crate::error::{LoadError, WavError};
-use crate::meta::{info_get, info_warnings};
-use crate::riff::{RiffFile, find, parse_riff};
+use crate::meta::{info_get, info_warnings, read_acid, read_inst};
+use crate::riff::{Chunk, RiffFile, find, parse_riff};
 use crate::smpl::{Smpl, smpl_to_tuning};
 use crate::wav::{WavFormat, decode, parse_fmt};
 
@@ -68,7 +68,7 @@ pub fn load_wav_bytes(path: PathBuf, bytes: &[u8]) -> Result<WavDocument, LoadEr
             None
         }
     });
-    warnings.extend(derive_edit(frames, smpl.as_ref()).1);
+    warnings.extend(derive_edit(frames, smpl.as_ref(), &riff.chunks).1);
 
     warnings.extend(info_warnings(&riff.chunks));
     let name = info_get(&riff.chunks, b"INAM");
@@ -90,12 +90,26 @@ pub fn load_wav_bytes(path: PathBuf, bytes: &[u8]) -> Result<WavDocument, LoadEr
     })
 }
 
+/// The root note and tuning of a file without a `smpl` chunk: from the first `inst` chunk
+/// (root and fine tune), else from the first `acid` chunk (root only), read the way
+/// [`crate::meta::sync_inst`] and [`crate::meta::sync_acid`] write them.
+fn fallback_tuning(chunks: &[Chunk]) -> Option<(u8, f32)> {
+    let body = |id: &[u8; 4]| find(chunks, id).map(|i| chunks[i].data.as_slice());
+    body(b"inst")
+        .and_then(read_inst)
+        .or_else(|| body(b"acid").and_then(read_acid).map(|root| (root, 0.0)))
+}
+
 /// The edit state implied by a file's `smpl` chunk (root note, tuning and the first loop),
-/// plus the warnings raised while converting it.
-fn derive_edit(frames: usize, smpl: Option<&Smpl>) -> (EditState, Vec<String>) {
+/// plus the warnings raised while converting it. Without a `smpl` chunk, the root and tuning
+/// come from `inst` or `acid` in `chunks`, when present.
+fn derive_edit(frames: usize, smpl: Option<&Smpl>, chunks: &[Chunk]) -> (EditState, Vec<String>) {
     let mut warnings = Vec::new();
     let mut e = EditState::default_for(frames);
     let Some(smpl) = smpl else {
+        if let Some((root, cents)) = fallback_tuning(chunks) {
+            (e.root, e.cents) = (root, cents);
+        }
         return (e, warnings);
     };
 
@@ -133,10 +147,11 @@ fn derive_edit(frames: usize, smpl: Option<&Smpl>) -> (EditState, Vec<String>) {
 }
 
 impl WavDocument {
-    /// The edit state implied by the file: root note, tuning and the first `smpl` loop. The
-    /// warnings this raises are already in `self.warnings`.
+    /// The edit state implied by the file: root note, tuning and the first `smpl` loop (the
+    /// root and tuning from `inst` or `acid` when there is no `smpl`). The warnings this
+    /// raises are already in `self.warnings`.
     pub fn initial_edit(&self) -> EditState {
-        derive_edit(self.frames, self.smpl.as_ref()).0
+        derive_edit(self.frames, self.smpl.as_ref(), &self.riff.chunks).0
     }
 
     /// The raw bytes of the `data` chunk.

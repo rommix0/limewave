@@ -161,6 +161,25 @@ pub fn sync_acid(data: &mut [u8], root: u8) {
     data[4..6].copy_from_slice(&u16::from(root).to_le_bytes());
 }
 
+/// Reads what [`sync_inst`] writes: the root note and the tuning offset in cents (the
+/// negated fine tune, clamped to ±50). `None` if the body is shorter than 7 bytes or the
+/// root is not a MIDI note (above 127).
+pub fn read_inst(data: &[u8]) -> Option<(u8, f32)> {
+    if data.len() < 7 || data[0] > 127 {
+        return None;
+    }
+    // `0 - tune` rather than `-tune`, so a fine tune of 0 reads as +0 cents, not -0.
+    let cents = 0.0 - f32::from(data[1] as i8);
+    Some((data[0], cents.clamp(-50.0, 50.0)))
+}
+
+/// Reads what [`sync_acid`] writes: the root note (u16 at byte 4). `None` if the body is
+/// shorter than 6 bytes or the root is not a MIDI note (above 127).
+pub fn read_acid(data: &[u8]) -> Option<u8> {
+    let root = u16::from_le_bytes([*data.get(4)?, *data.get(5)?]);
+    u8::try_from(root).ok().filter(|r| *r <= 127)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -395,5 +414,27 @@ mod tests {
         let mut short = [1u8; 5];
         sync_acid(&mut short, 48);
         assert_eq!(short, [1; 5]);
+    }
+
+    #[test]
+    fn read_inst_and_acid_mirror_the_sync() {
+        let mut inst = [0u8; 7];
+        sync_inst(&mut inst, 48, -12.0);
+        assert_eq!(read_inst(&inst), Some((48, -12.0)));
+        sync_inst(&mut inst, 61, 30.0);
+        assert_eq!(read_inst(&inst), Some((61, 30.0)));
+        assert_eq!(read_inst(&[60, 0, 0, 0, 0, 0]), None, "too short");
+        assert_eq!(read_inst(&[200, 0, 0, 0, 0, 0, 0]), None, "not a note");
+        assert_eq!(
+            read_inst(&[60, (-128i8) as u8, 0, 0, 0, 0, 0]),
+            Some((60, 50.0))
+        );
+
+        let mut acid = [0xAAu8; 24];
+        sync_acid(&mut acid, 57);
+        assert_eq!(read_acid(&acid), Some(57));
+        assert_eq!(read_acid(&[0; 5]), None, "too short");
+        acid[4..6].copy_from_slice(&300u16.to_le_bytes());
+        assert_eq!(read_acid(&acid), None, "not a note");
     }
 }

@@ -1413,6 +1413,24 @@ mod tests {
     }
 
     #[test]
+    fn session_shows_the_acid_root_of_a_file_without_smpl() {
+        let mut acid = vec![0; 24];
+        acid[4..6].copy_from_slice(&57u16.to_le_bytes());
+        let bytes = wav_bytes(
+            &[sine(220.0, 44100, 100, 0.5)],
+            44100,
+            SampleFormat::Int { bits: 16 },
+            vec![limewave_core::riff::Chunk {
+                id: *b"acid",
+                data: acid,
+            }],
+        );
+        let s = Session::new(load_wav_bytes(PathBuf::from("t.wav"), &bytes).unwrap());
+        assert_eq!(s.edit().root, 57);
+        assert!(!s.history.is_dirty());
+    }
+
+    #[test]
     fn envelope_default_and_sync() {
         assert_eq!(UiState::default().envelope, Adsr::DEFAULT);
         let mut app = LimewaveApp::for_test();
