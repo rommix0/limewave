@@ -202,7 +202,8 @@ fn edited_smpl(doc: &WavDocument, init: &EditState, e: &EditState) -> Smpl {
 
 /// Whether the original `smpl` chunk can be written back as it is: the loop mode, points, root
 /// and cents are those of the file, nothing moves the sample numbers (no head trim, no
-/// marker-mirroring reverse), and every extra loop still lies inside the kept frames.
+/// marker-mirroring reverse), and every extra loop still lies inside the kept frames, as does
+/// loop 0 after a tail trim.
 fn smpl_unchanged(doc: &WavDocument, init: &EditState, e: &EditState) -> bool {
     let Some(smpl) = &doc.smpl else {
         return false;
@@ -229,6 +230,13 @@ fn smpl_unchanged(doc: &WavDocument, init: &EditState, e: &EditState) -> bool {
             .iter()
             .skip(1)
             .all(|l| l.start as usize <= e.end && l.end as usize <= e.end)
+        // Loop 0 too, even when it was disabled on load for lying out of range; unless the
+        // tail is untouched, so a no-edit save still gives the file back as it was.
+        && (e.end + 1 == doc.frames
+            || smpl
+                .loops
+                .first()
+                .is_none_or(|l| l.start as usize <= e.end && l.end as usize <= e.end))
 }
 
 /// The complete WAV file for `doc` edited by `e` (spec §6.5–6.6). `e` is clamped to the
@@ -1741,6 +1749,24 @@ mod tests {
         let s = Smpl::parse(&smpl_bytes(&cut)).unwrap();
         assert_eq!(s.loops.len(), 1);
         assert_eq!(s.loops[0].cue_id, 0);
+    }
+
+    #[test]
+    fn a_tail_trim_rebuilds_a_smpl_whose_loop_0_was_out_of_range() {
+        let tag = software_tag();
+        let bytes = file(
+            vec![smpl_chunk(vec![fwd(3000, 9000)]), info(&[(b"ISFT", &tag)])],
+            vec![],
+        );
+        let d = doc(&bytes);
+        let init = d.initial_edit();
+        assert_eq!(init.loop_mode, LoopMode::Off, "disabled on load");
+        // With no edits the file still comes back as it was.
+        assert_eq!(build_wav_bytes(&d, &init), bytes);
+
+        let trimmed = EditState { end: 2000, ..init };
+        let s = smpl_of(&build_wav_bytes(&d, &trimmed)).unwrap();
+        assert!(s.loops.is_empty(), "{:?}", s.loops);
     }
 
     #[test]
