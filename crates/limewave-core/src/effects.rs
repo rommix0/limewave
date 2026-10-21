@@ -1,6 +1,8 @@
 //! Replayable effects: what the user picks (`Effect`), the resolved deterministic step that is
 //! stored in the edit state (`AppliedEffect`), and the functions that plan, apply and replay them.
 
+use std::sync::Arc;
+
 use crate::edit::{EditState, LoopMode};
 
 /// The shape of a fade.
@@ -53,6 +55,26 @@ pub enum Op {
     StereoToMono(MonoSource),
     SwapChannels,
     MonoToStereo,
+    /// Replace the range with new audio, which may change the frame count. The audio is
+    /// shared, so replaying the step and copying edit states stay cheap.
+    Splice(Arc<Splice>),
+}
+
+/// Which tool made a splice.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum SpliceKind {
+    Tail,
+    SpectrumLoop,
+}
+
+/// The finished audio that a splice step puts in place of its range.
+#[derive(Clone, PartialEq, Debug)]
+pub struct Splice {
+    pub kind: SpliceKind,
+    /// The replacement, one `Vec` per channel, all the same length.
+    pub audio: Vec<Vec<f32>>,
+    /// The inclusive range inside `audio` that is synthetic, shown tinted.
+    pub generated: (usize, usize),
 }
 
 /// An operation with the inclusive frame range it works on.
@@ -177,9 +199,22 @@ pub fn fade_gain(curve: FadeCurve, t: f32) -> f32 {
 
 /// Applies one step to the audio in place. The range is cut to the file, and a range that is
 /// empty or starts past the end changes nothing, as in [`EditState::clamped`]; channel tools
-/// ignore it. Every effect keeps the frame count.
+/// ignore it. Every effect keeps the frame count except a splice, which replaces its range
+/// with its own audio and is skipped when that audio has a different channel count.
 pub fn apply_effect(audio: &mut Vec<Vec<f32>>, a: &AppliedEffect) {
     match &a.op {
+        Op::Splice(s) => {
+            if s.audio.len() != audio.len() {
+                return;
+            }
+            for (ch, new) in audio.iter_mut().zip(&s.audio) {
+                if a.first > a.last || a.first >= ch.len() {
+                    continue;
+                }
+                let last = a.last.min(ch.len() - 1);
+                ch.splice(a.first..=last, new.iter().copied());
+            }
+        }
         Op::StereoToMono(pick) => {
             if audio.len() >= 2 {
                 let kept = match pick {
@@ -250,8 +285,42 @@ fn apply_in_range(op: &Op, channel: usize, s: &mut [f32]) {
             .for_each(|(i, v)| *v *= fade_gain(*c, 1.0 - t(i))),
         Op::Invert => s.iter_mut().for_each(|v| *v = -*v),
         Op::Reverse { .. } => s.reverse(),
-        Op::StereoToMono(_) | Op::SwapChannels | Op::MonoToStereo => {}
+        Op::StereoToMono(_) | Op::SwapChannels | Op::MonoToStereo | Op::Splice(_) => {}
     }
+}
+
+/// The frame count after step `a` on an input of `input` frames: unchanged, except for a
+/// splice, whose range (cut to the input as in [`apply_effect`]) becomes its audio.
+pub fn output_frames(a: &AppliedEffect, input: usize) -> usize {
+    match &a.op {
+        Op::Splice(s) if a.first <= a.last && a.first < input => {
+            let replaced = a.last.min(input - 1) + 1 - a.first;
+            (input - replaced).saturating_add(frame_count(&s.audio))
+        }
+        _ => input,
+    }
+}
+
+/// The input frame count of each step, for a file of `original` frames.
+pub fn step_inputs(original: usize, effects: &[AppliedEffect]) -> Vec<usize> {
+    effects
+        .iter()
+        .scan(original, |frames, a| {
+            let input = *frames;
+            *frames = output_frames(a, input);
+            Some(input)
+        })
+        .collect()
+}
+
+/// The frame count after every step, for a file of `original` frames.
+pub fn frames_after(original: usize, effects: &[AppliedEffect]) -> usize {
+    effects.iter().fold(original, |f, a| output_frames(a, f))
+}
+
+/// Whether any step changes the frame count: the list holds a splice.
+pub fn changes_length(effects: &[AppliedEffect]) -> bool {
+    effects.iter().any(|a| matches!(a.op, Op::Splice(_)))
 }
 
 /// Replays `effects` in order on a copy of the original audio.
@@ -273,17 +342,87 @@ pub fn peak(audio: &[Vec<f32>], first: usize, last: usize) -> f32 {
         .fold(0.0, |m, v| f32::max(m, v.abs()))
 }
 
-/// Where the frame `f` of the original lands after the marker-mirroring reverses in
-/// `effects`: each `Reverse { mirror_markers: true }` whose range contains the frame reflects
-/// it to `first + last - f`, in order. Never overflows, whatever the ranges.
-pub fn map_frame(effects: &[AppliedEffect], f: usize) -> usize {
-    effects.iter().fold(f, |f, a| match a.op {
+/// Where the frame `f` of the original lands after `effects`, in order, or `None` when a
+/// splice replaced it.
+///
+/// - Each `Reverse { mirror_markers: true }` whose range contains the frame reflects it to
+///   `first + last - f`.
+/// - A splice keeps frames before its range, drops those inside it, and shifts those after it
+///   by the change in length. The end-of-file position (the input length) counts as after,
+///   so it lands on the new length.
+///
+/// Never overflows, whatever the ranges.
+pub fn map_frame(effects: &[AppliedEffect], f: usize) -> Option<usize> {
+    effects.iter().try_fold(f, |f, a| map_step(a, f))
+}
+
+/// [`map_frame`] for one step.
+fn map_step(a: &AppliedEffect, f: usize) -> Option<usize> {
+    match &a.op {
         // `last - (f - first)` is `first + last - f` without the overflowing sum.
         Op::Reverse {
             mirror_markers: true,
-        } if (a.first..=a.last).contains(&f) => a.last - (f - a.first),
-        _ => f,
-    })
+        } if (a.first..=a.last).contains(&f) => Some(a.last - (f - a.first)),
+        Op::Splice(s) if a.first <= a.last && f >= a.first => {
+            if f <= a.last {
+                None
+            } else {
+                // `f - (last + 1 - first) + len`, without overflowing.
+                Some(
+                    (f - a.last - 1)
+                        .saturating_add(a.first)
+                        .saturating_add(frame_count(&s.audio)),
+                )
+            }
+        }
+        _ => Some(f),
+    }
+}
+
+/// Where the inclusive range `first..=last` of the original lands after `effects`, or `None`
+/// when nothing of it survives. Each end maps as in [`map_frame`]; a reverse mirrors the range
+/// and puts it back in order. A range that crosses a splice's replaced block keeps the part
+/// before the block if there is one, otherwise the part after it.
+pub fn map_range(effects: &[AppliedEffect], first: usize, last: usize) -> Option<(usize, usize)> {
+    let (mut lo, mut hi) = (first.min(last), first.max(last));
+    for a in effects {
+        if matches!(a.op, Op::Splice(_)) && a.first <= a.last && lo <= a.last && hi >= a.first {
+            if lo < a.first {
+                hi = a.first - 1;
+            } else if hi > a.last {
+                lo = a.last + 1;
+            } else {
+                return None;
+            }
+        }
+        let (x, y) = (map_step(a, lo)?, map_step(a, hi)?);
+        (lo, hi) = (x.min(y), x.max(y));
+    }
+    Some((lo, hi))
+}
+
+/// The synthetic range of every splice in `effects`, in the coordinates after the last step:
+/// each is placed at its splice's start and mapped through the later steps with [`map_range`].
+/// Ranges that nothing survives of are left out.
+pub fn generated_ranges(effects: &[AppliedEffect]) -> Vec<(usize, usize)> {
+    effects
+        .iter()
+        .enumerate()
+        .filter_map(|(i, a)| {
+            let Op::Splice(s) = &a.op else {
+                return None;
+            };
+            let (g0, g1) = s.generated;
+            if a.first > a.last || g0 > g1 || g1 >= frame_count(&s.audio) {
+                return None;
+            }
+            map_range(
+                &effects[i + 1..],
+                a.first.saturating_add(g0),
+                a.first.saturating_add(g1),
+            )
+        })
+        .collect()
 }
 
 /// The edit state after a marker-mirroring reverse of `first..=last`: the loop points swap
@@ -335,6 +474,7 @@ pub fn silence_bounds(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     const CURVES: [FadeCurve; 3] = [FadeCurve::Linear, FadeCurve::Exponential, FadeCurve::SCurve];
 
@@ -557,11 +697,11 @@ mod tests {
             first: 100,
             last: 899,
         };
-        assert_eq!(map_frame(std::slice::from_ref(&rev), 300), 699);
-        assert_eq!(map_frame(std::slice::from_ref(&rev), 50), 50);
+        assert_eq!(map_frame(std::slice::from_ref(&rev), 300), Some(699));
+        assert_eq!(map_frame(std::slice::from_ref(&rev), 50), Some(50));
         let twice = [rev.clone(), rev];
         for f in [0, 100, 300, 899, 950] {
-            assert_eq!(map_frame(&twice, f), f);
+            assert_eq!(map_frame(&twice, f), Some(f));
         }
         let sel = AppliedEffect {
             op: Op::Reverse {
@@ -570,7 +710,7 @@ mod tests {
             first: 100,
             last: 899,
         };
-        assert_eq!(map_frame(&[sel], 300), 300);
+        assert_eq!(map_frame(&[sel], 300), Some(300));
     }
 
     #[test]
@@ -582,9 +722,9 @@ mod tests {
             first: 10,
             last: usize::MAX,
         }];
-        assert_eq!(map_frame(&wild, usize::MAX - 1), 11);
-        assert_eq!(map_frame(&wild, 10), usize::MAX);
-        assert_eq!(map_frame(&wild, 5), 5);
+        assert_eq!(map_frame(&wild, usize::MAX - 1), Some(11));
+        assert_eq!(map_frame(&wild, 10), Some(usize::MAX));
+        assert_eq!(map_frame(&wild, 5), Some(5));
     }
 
     #[test]
@@ -749,6 +889,141 @@ mod tests {
         // Below the threshold counts as silence.
         let quiet = constant(50, 0.0005);
         assert_eq!(silence_bounds(&quiet, -60.0, &e), None);
+    }
+
+    fn splice(kind: SpliceKind, first: usize, last: usize, frames: usize) -> AppliedEffect {
+        let new = (0..frames)
+            .map(|i| -(i as f32) / 1000.0)
+            .collect::<Vec<f32>>();
+        AppliedEffect {
+            op: Op::Splice(Arc::new(Splice {
+                kind,
+                audio: vec![new.clone(), new],
+                generated: (0, frames.saturating_sub(1)),
+            })),
+            first,
+            last,
+        }
+    }
+
+    fn stereo_ramp(frames: usize) -> Vec<Vec<f32>> {
+        let ramp: Vec<f32> = (0..frames).map(|i| i as f32 / frames as f32).collect();
+        vec![ramp.clone(), ramp]
+    }
+
+    #[test]
+    fn splice_replaces_the_range_and_changes_the_length() {
+        let x = stereo_ramp(1000);
+        let s = splice(SpliceKind::Tail, 900, 999, 300);
+        let Op::Splice(ref sp) = s.op else {
+            panic!("not a splice")
+        };
+        let y = applied(&x, &s);
+        for c in 0..2 {
+            assert_eq!(y[c].len(), 1200);
+            assert_eq!(y[c][..900], x[c][..900]);
+            assert_eq!(y[c][900..], sp.audio[c][..]);
+        }
+    }
+
+    #[test]
+    fn splice_with_wrong_channel_count_is_skipped() {
+        let x = stereo_ramp(1000);
+        let mono = AppliedEffect {
+            op: Op::Splice(Arc::new(Splice {
+                kind: SpliceKind::Tail,
+                audio: vec![vec![0.5; 300]],
+                generated: (0, 299),
+            })),
+            first: 900,
+            last: 999,
+        };
+        assert_eq!(applied(&x, &mono), x);
+    }
+
+    #[test]
+    fn step_inputs_and_frames_after_follow_each_step() {
+        let effects = [
+            AppliedEffect {
+                op: Op::Scale(0.5),
+                first: 0,
+                last: 999,
+            },
+            splice(SpliceKind::Tail, 900, 999, 300),
+            AppliedEffect {
+                op: Op::Reverse {
+                    mirror_markers: true,
+                },
+                first: 0,
+                last: 1199,
+            },
+        ];
+        assert_eq!(step_inputs(1000, &effects), vec![1000, 1000, 1200]);
+        assert_eq!(frames_after(1000, &effects), 1200);
+        assert!(changes_length(&effects));
+        assert!(!changes_length(&effects[..1]));
+        assert_eq!(output_frames(&effects[0], 1000), 1000);
+        assert_eq!(output_frames(&effects[1], 1000), 1200);
+        assert_eq!(process(&stereo_ramp(1000), &effects)[0].len(), 1200);
+    }
+
+    #[test]
+    fn map_frame_shifts_drops_and_keeps_end_of_file() {
+        let s = [splice(SpliceKind::SpectrumLoop, 400, 599, 50)];
+        assert_eq!(map_frame(&s, 100), Some(100));
+        assert_eq!(map_frame(&s, 450), None);
+        assert_eq!(map_frame(&s, 700), Some(550));
+        // The old length, an end-of-file position, lands on the new length.
+        assert_eq!(map_frame(&s, 1000), Some(850));
+    }
+
+    #[test]
+    fn map_range_clips_at_a_replaced_boundary() {
+        let s = [splice(SpliceKind::SpectrumLoop, 400, 599, 50)];
+        assert_eq!(map_range(&s, 300, 500), Some((300, 399)));
+        // Only the part after the block survives: 600 maps to 450 and 700 to 550.
+        assert_eq!(map_range(&s, 450, 700), Some((450, 550)));
+        assert_eq!(map_range(&s, 420, 580), None);
+        // Reverse mirrors and reorders.
+        let rev = [AppliedEffect {
+            op: Op::Reverse {
+                mirror_markers: true,
+            },
+            first: 100,
+            last: 899,
+        }];
+        assert_eq!(map_range(&rev, 200, 300), Some((699, 799)));
+    }
+
+    #[test]
+    fn generated_ranges_follow_later_splices() {
+        let tail = AppliedEffect {
+            op: Op::Splice(Arc::new(Splice {
+                kind: SpliceKind::Tail,
+                audio: vec![vec![0.0; 600]],
+                generated: (20, 119),
+            })),
+            first: 900,
+            last: 999,
+        };
+        assert_eq!(
+            generated_ranges(std::slice::from_ref(&tail)),
+            vec![(920, 1019)]
+        );
+        // A spectrum loop earlier in the file shortens it by 100: 400 frames become 300.
+        let spectrum = AppliedEffect {
+            op: Op::Splice(Arc::new(Splice {
+                kind: SpliceKind::SpectrumLoop,
+                audio: vec![vec![0.0; 300]],
+                generated: (0, 299),
+            })),
+            first: 200,
+            last: 599,
+        };
+        assert_eq!(
+            generated_ranges(&[tail, spectrum]),
+            vec![(820, 919), (200, 499)]
+        );
     }
 
     #[test]

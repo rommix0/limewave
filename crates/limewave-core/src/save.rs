@@ -41,7 +41,8 @@ fn to_u32(n: usize) -> u32 {
 }
 
 /// The inclusive frame ranges (sorted, merged) that effects or the crossfade change in a file
-/// of `frames` frames. A channel tool changes every frame whatever its stored range.
+/// of `frames` frames. A channel tool changes every frame whatever its stored range, and a
+/// splice every frame from its start.
 fn changed_ranges(
     effects: &[AppliedEffect],
     crossfade: Option<(usize, usize)>,
@@ -54,6 +55,7 @@ fn changed_ranges(
         .iter()
         .map(|a| match a.op {
             Op::StereoToMono(_) | Op::SwapChannels | Op::MonoToStereo => (0, last_frame),
+            Op::Splice(_) => (a.first, last_frame),
             _ => (a.first, a.last.min(last_frame)),
         })
         .chain(crossfade)
@@ -180,8 +182,8 @@ fn edited_smpl(doc: &WavDocument, init: &EditState, e: &EditState) -> Smpl {
         .skip(1)
         .map(|l| {
             let (start, end) = (
-                map_frame(&e.effects, l.start as usize),
-                map_frame(&e.effects, l.end as usize),
+                map_frame(&e.effects, l.start as usize).unwrap_or(l.start as usize),
+                map_frame(&e.effects, l.end as usize).unwrap_or(l.end as usize),
             );
             // A mirroring reverse swaps the ends; an ordered loop stays ordered.
             if l.start <= l.end && start > end {
@@ -202,8 +204,8 @@ fn edited_smpl(doc: &WavDocument, init: &EditState, e: &EditState) -> Smpl {
 
 /// Whether the original `smpl` chunk can be written back as it is: the loop mode, points, root
 /// and cents are those of the file, nothing moves the sample numbers (no head trim, no
-/// marker-mirroring reverse), and every extra loop still lies inside the kept frames, as does
-/// loop 0 after a tail trim.
+/// marker-mirroring reverse, no splice), and every extra loop still lies inside the kept
+/// frames, as does loop 0 after a tail trim.
 fn smpl_unchanged(doc: &WavDocument, init: &EditState, e: &EditState) -> bool {
     let Some(smpl) = &doc.smpl else {
         return false;
@@ -222,7 +224,7 @@ fn smpl_unchanged(doc: &WavDocument, init: &EditState, e: &EditState) -> bool {
                 a.op,
                 Op::Reverse {
                     mirror_markers: true
-                }
+                } | Op::Splice(_)
             )
         })
         && smpl
@@ -260,8 +262,8 @@ pub fn build_wav_bytes(doc: &WavDocument, e: &EditState) -> Vec<u8> {
         .and_then(|bytes| parse_fmt(bytes).ok())
         .unwrap_or(doc.format);
     let mut data = Some(edited_data(doc, &e, audio, &format));
-    // With no trim and no marker-mirroring reverse, no frame moves: cue and `fact` chunks are
-    // written back as they are, so a save with no edits stays byte for byte.
+    // With no trim and no marker-mirroring reverse or splice, no frame moves: cue and `fact`
+    // chunks are written back as they are, so a save with no edits stays byte for byte.
     let frames_move = doc.frames != 0
         && (e.start != 0
             || e.end + 1 != doc.frames
@@ -270,7 +272,7 @@ pub fn build_wav_bytes(doc: &WavDocument, e: &EditState) -> Vec<u8> {
                     a.op,
                     Op::Reverse {
                         mirror_markers: true
-                    }
+                    } | Op::Splice(_)
                 )
             }));
     let tuning_changed = (e.root, e.cents) != (init.root, init.cents);
@@ -318,7 +320,12 @@ pub fn build_wav_bytes(doc: &WavDocument, e: &EditState) -> Vec<u8> {
     // Cue positions follow the trim and the reverses. An unreadable chunk stays as it is;
     // loading has already warned.
     if frames_move {
-        let _ = remap_markers(&mut chunks, &|f| map_frame(&e.effects, f), e.start, e.end);
+        let _ = remap_markers(
+            &mut chunks,
+            &|f| map_frame(&e.effects, f).unwrap_or(f),
+            e.start,
+            e.end,
+        );
     }
     if let Some(bytes) = smpl {
         let at = data_at.map_or(chunks.len(), |i| i + 1);

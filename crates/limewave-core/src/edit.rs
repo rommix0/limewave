@@ -1,6 +1,6 @@
 //! Edit state (trim and loop markers, tuning, effects), marker-move constraints and undo history.
 
-use crate::effects::{AppliedEffect, Op};
+use crate::effects::{AppliedEffect, Op, frames_after, output_frames};
 
 /// How the sample loops on playback.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -52,11 +52,31 @@ impl EditState {
         }
     }
 
-    /// Forces the state to be valid for a file of `frames` frames.
+    /// Forces the state to be valid for an original file of `original_frames` frames.
     ///
-    /// If a loop of at least 2 frames cannot fit, the loop is turned off. Effect ranges are
-    /// cut to the file, and effects left with nothing to work on are dropped.
-    pub fn clamped(mut self, frames: usize) -> EditState {
+    /// Each effect's range is cut to its own input, the length after the steps before it, and
+    /// effects left with nothing to work on are dropped, as is a splice whose range no longer
+    /// fits. The markers are then kept inside the length after every effect; if a loop of at
+    /// least 2 frames cannot fit, the loop is turned off.
+    pub fn clamped(mut self, original_frames: usize) -> EditState {
+        // Effect ranges end inside their input; an empty one, or one wholly past the end, does
+        // nothing and is dropped. Channel tools ignore their range and are kept as they are.
+        let mut frames = original_frames;
+        self.effects.retain_mut(|a| {
+            let keep = match a.op {
+                Op::StereoToMono(_) | Op::SwapChannels | Op::MonoToStereo => true,
+                Op::Splice(_) => a.first <= a.last && a.last < frames,
+                _ => {
+                    a.last = a.last.min(frames.saturating_sub(1));
+                    frames > 0 && a.first <= a.last
+                }
+            };
+            if keep {
+                frames = output_frames(a, frames);
+            }
+            keep
+        });
+
         let last = frames.saturating_sub(1);
         self.end = self.end.min(last);
         self.start = self.start.min(self.end);
@@ -78,18 +98,6 @@ impl EditState {
             self.loop_end = self.loop_end.clamp(self.loop_start + 1, self.end);
             self.crossfade = self.crossfade.min(self.max_crossfade());
         }
-        // Effect ranges end inside the file; an empty one, or one wholly past the end, does
-        // nothing and is dropped. Channel tools ignore their range and are kept as they are.
-        self.effects.retain_mut(|a| {
-            if matches!(
-                a.op,
-                Op::StereoToMono(_) | Op::SwapChannels | Op::MonoToStereo
-            ) {
-                return true;
-            }
-            a.last = a.last.min(last);
-            frames > 0 && a.first <= a.last
-        });
         self
     }
 
@@ -123,13 +131,14 @@ pub enum Marker {
 }
 
 /// Moves `m` to frame `to`, respecting the constraints between markers, and returns the
-/// clamped result. With `lock_length`, moving either loop marker shifts both.
+/// clamped result (see [`EditState::clamped`] for `original_frames`). With `lock_length`,
+/// moving either loop marker shifts both.
 pub fn move_marker(
     e: &EditState,
     m: Marker,
     to: usize,
     lock_length: bool,
-    frames: usize,
+    original_frames: usize,
 ) -> EditState {
     let mut s = e.clone();
     let loop_on = e.loop_mode != LoopMode::Off;
@@ -162,12 +171,16 @@ pub fn move_marker(
             }
         }
     }
-    s.clamped(frames)
+    s.clamped(original_frames)
 }
 
 /// Makes the selection the loop. A loop that is off becomes forward; other modes are kept.
 /// Start and End move outward to include the selection.
-pub fn set_loop_to_selection(e: &EditState, sel: (usize, usize), frames: usize) -> EditState {
+pub fn set_loop_to_selection(
+    e: &EditState,
+    sel: (usize, usize),
+    original_frames: usize,
+) -> EditState {
     let (lo, hi) = (sel.0.min(sel.1), sel.0.max(sel.1));
     let loop_mode = match e.loop_mode {
         LoopMode::Off => LoopMode::Forward,
@@ -181,7 +194,7 @@ pub fn set_loop_to_selection(e: &EditState, sel: (usize, usize), frames: usize) 
         loop_end: hi,
         ..e.clone()
     }
-    .clamped(frames)
+    .clamped(original_frames)
 }
 
 /// Makes the selection the trim. Fails when the loop is on and does not lie inside it.
@@ -197,26 +210,24 @@ pub fn set_trim_to_selection(e: &EditState, sel: (usize, usize)) -> Result<EditS
     })
 }
 
-/// Ends the sample `padding` frames after the loop end (at most the last frame). Unchanged
-/// when the loop is off.
-pub fn trim_after_loop(e: &EditState, padding: usize, frames: usize) -> EditState {
+/// Ends the sample `padding` frames after the loop end (at most the last frame after the
+/// effects). Unchanged when the loop is off.
+pub fn trim_after_loop(e: &EditState, padding: usize, original_frames: usize) -> EditState {
     if e.loop_mode == LoopMode::Off {
         return e.clone();
     }
-    let end = e
-        .loop_end
-        .saturating_add(padding)
-        .min(frames.saturating_sub(1));
-    move_marker(e, Marker::End, end, false, frames)
+    let last = frames_after(original_frames, &e.effects).saturating_sub(1);
+    let end = e.loop_end.saturating_add(padding).min(last);
+    move_marker(e, Marker::End, end, false, original_frames)
 }
 
 /// As [`trim_after_loop`], and also starts the sample at the loop start.
-pub fn crop_to_loop(e: &EditState, padding: usize, frames: usize) -> EditState {
-    let t = trim_after_loop(e, padding, frames);
+pub fn crop_to_loop(e: &EditState, padding: usize, original_frames: usize) -> EditState {
+    let t = trim_after_loop(e, padding, original_frames);
     if t.loop_mode == LoopMode::Off {
         return t;
     }
-    move_marker(&t, Marker::Start, t.loop_start, false, frames)
+    move_marker(&t, Marker::Start, t.loop_start, false, original_frames)
 }
 
 /// Linear undo/redo history of edit states, tracking which one was last saved.
@@ -281,6 +292,8 @@ impl History {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::effects::{Splice, SpliceKind};
+    use std::sync::Arc;
 
     fn looped(frames: usize, end: usize, ls: usize, le: usize) -> EditState {
         EditState {
@@ -355,6 +368,60 @@ mod tests {
         let mut empty = EditState::default_for(0);
         empty.effects = vec![fx(Op::Invert, 0, 0), fx(Op::MonoToStereo, 0, 0)];
         assert_eq!(empty.clamped(0).effects, vec![fx(Op::MonoToStereo, 0, 0)]);
+    }
+
+    /// A tail that replaces 900..=999 of a 1000-frame file with 600 frames, making it 1500.
+    fn lengthening_tail() -> AppliedEffect {
+        AppliedEffect {
+            op: Op::Splice(Arc::new(Splice {
+                kind: SpliceKind::Tail,
+                audio: vec![vec![0.0; 600]],
+                generated: (100, 599),
+            })),
+            first: 900,
+            last: 999,
+        }
+    }
+
+    #[test]
+    fn clamped_clamps_each_step_to_its_own_input() {
+        let gain = AppliedEffect {
+            op: Op::Scale(0.5),
+            first: 1200,
+            last: 1400,
+        };
+        let mut e = EditState::default_for(1000);
+        e.effects = vec![lengthening_tail(), gain.clone()];
+        e.end = usize::MAX;
+        let c = e.clamped(1000);
+        assert_eq!(c.effects, vec![lengthening_tail(), gain]);
+        assert_eq!(c.end, 1499);
+    }
+
+    #[test]
+    fn clamped_drops_a_splice_that_no_longer_fits() {
+        let mut e = EditState::default_for(800);
+        e.effects = vec![lengthening_tail()];
+        assert!(e.clamped(800).effects.is_empty());
+    }
+
+    #[test]
+    fn move_marker_reaches_the_new_end() {
+        let mut e = EditState::default_for(1000);
+        e.effects = vec![lengthening_tail()];
+        assert_eq!(move_marker(&e, Marker::End, 1499, false, 1000).end, 1499);
+        assert_eq!(move_marker(&e, Marker::End, 5000, false, 1000).end, 1499);
+        let looped = EditState {
+            loop_mode: LoopMode::Forward,
+            loop_start: 100,
+            loop_end: 500,
+            ..e
+        };
+        assert_eq!(trim_after_loop(&looped, 2000, 1000).end, 1499);
+        assert_eq!(
+            set_loop_to_selection(&looped, (1300, 1450), 1000).loop_end,
+            1450
+        );
     }
 
     #[test]
