@@ -318,6 +318,32 @@ fn select_all_and_escape() {
 }
 
 #[test]
+fn escape_with_a_menu_open_only_closes_the_menu() {
+    let mut h = looped_harness();
+    h.state_mut().ui.selection = Some((2000, 3000));
+    h.state_mut().ui.play_from = Some(1234);
+    h.get_by_label("Edit").click();
+    h.run();
+    assert_eq!(h.query_all_by_label("Crop to loop").count(), 1, "menu open");
+
+    h.key_press(Key::Escape);
+    h.run();
+    assert_eq!(
+        h.query_all_by_label("Crop to loop").count(),
+        0,
+        "menu closed"
+    );
+    assert_eq!(h.state().ui.selection, Some((2000, 3000)));
+    assert_eq!(h.state().ui.play_from, Some(1234));
+
+    // With the menu gone, Escape clears them again.
+    h.key_press(Key::Escape);
+    h.run();
+    assert_eq!(h.state().ui.selection, None);
+    assert_eq!(h.state().ui.play_from, None);
+}
+
+#[test]
 fn play_starts_from_the_play_from_point() {
     let mut app = app_with(&looped_bytes());
     let start = session(&app).edit().start;

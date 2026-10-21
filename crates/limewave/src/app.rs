@@ -1017,10 +1017,12 @@ impl LimewaveApp {
         if self.focus_last_frame || ctx.egui_wants_keyboard_input() {
             return;
         }
+        // An open menu or popup closes on Escape when it is drawn, so leave the key to it.
+        let popup_open = egui::Popup::is_any_open(ctx);
         let (select_all, clear) = ctx.input_mut(|i| {
             (
                 i.consume_shortcut(&SELECT_ALL_SHORTCUT),
-                i.consume_key(Modifiers::NONE, Key::Escape),
+                !popup_open && i.consume_key(Modifiers::NONE, Key::Escape),
             )
         });
         if select_all {
