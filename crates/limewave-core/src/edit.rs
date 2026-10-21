@@ -1,4 +1,6 @@
-//! Edit state (trim and loop markers, tuning), marker-move constraints and undo history.
+//! Edit state (trim and loop markers, tuning, effects), marker-move constraints and undo history.
+
+use crate::effects::AppliedEffect;
 
 /// How the sample loops on playback.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -28,6 +30,8 @@ pub struct EditState {
     pub fade_shape: FadeShape,
     pub root: u8,
     pub cents: f32,
+    /// Effects replayed on the original audio, in order, before the crossfade and the trim.
+    pub effects: Vec<AppliedEffect>,
 }
 
 impl EditState {
@@ -44,6 +48,7 @@ impl EditState {
             fade_shape: FadeShape::EqualPower,
             root: 60,
             cents: 0.0,
+            effects: Vec::new(),
         }
     }
 
@@ -209,6 +214,7 @@ impl History {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::effects::Op;
 
     fn looped(frames: usize, end: usize, ls: usize, le: usize) -> EditState {
         EditState {
@@ -234,6 +240,22 @@ mod tests {
         let c = d.clone().clamped(0);
         assert_eq!(c, d);
         assert_eq!(c.loop_mode, LoopMode::Off);
+    }
+
+    #[test]
+    fn default_state_has_no_effects() {
+        assert!(EditState::default_for(1000).effects.is_empty());
+    }
+
+    #[test]
+    fn clamped_keeps_the_effects() {
+        let mut e = EditState::default_for(100);
+        e.effects.push(AppliedEffect {
+            op: Op::Invert,
+            first: 0,
+            last: 99,
+        });
+        assert_eq!(e.clone().clamped(100).effects, e.effects);
     }
 
     #[test]

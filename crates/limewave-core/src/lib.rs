@@ -3,6 +3,7 @@
 pub mod document;
 pub mod dsp;
 pub mod edit;
+pub mod effects;
 pub mod error;
 pub mod meta;
 pub mod notes;
