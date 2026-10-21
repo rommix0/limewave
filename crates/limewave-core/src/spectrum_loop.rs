@@ -28,7 +28,7 @@ use std::sync::Arc;
 
 use thiserror::Error;
 
-use crate::dsp::lsq::harmonic_fit;
+use crate::dsp::lsq::HarmonicFitter;
 use crate::dsp::pitch::character;
 use crate::dsp::rng::SplitMix64;
 use crate::dsp::spectrum::{Complex32, Complex64, Fft, frame_size_for, hann, welch_power};
@@ -56,16 +56,13 @@ const REFINE_HARMONICS: usize = 8;
 /// A harmonic is used only within 70 dB (in power) of the loudest one.
 const HARMONIC_RANGE: f64 = 1e-7;
 
-/// The most harmonics Steady fits, which bounds the cost of the least-squares fits.
-const STEADY_MAX_HARMONICS: usize = 60;
-
 /// Steady's amplitude window: four periods or 50 ms, whichever is longer.
 const FIT_PERIODS: f64 = 4.0;
 const FIT_MIN_S: f64 = 0.05;
 
 /// Steady averages at most this many windows, evenly spread over the consecutive ones, so a
 /// long range does not make the fits slow.
-const MAX_FIT_WINDOWS: usize = 8;
+const MAX_FIT_WINDOWS: usize = 16;
 
 /// Ensemble's floor from the averaged spectrum: −60 dB, in power.
 const ENSEMBLE_FLOOR: f64 = 1e-6;
@@ -417,10 +414,11 @@ impl Job<'_> {
 }
 
 /// Steady (v0.3 §5.1, §5.3): each harmonic `hs` of `f0` becomes one exact tone at a multiple
-/// of the loop's rounded fundamental, `m` cycles per loop.
+/// of the loop's rounded fundamental, `m` cycles per loop. Every harmonic up to the Nyquist
+/// frequency is kept.
 ///
 /// - Amplitudes: the RMS over consecutive windows (four periods or 50 ms) across the range of
-///   least-squares fits of the harmonics.
+///   joint least-squares fits of all the harmonics.
 /// - Entry: a fit at `a` gives the original's harmonics; each glides on a raised cosine to the
 ///   loop's amplitude while the fundamental glides from `f0` to the rounded pitch, and the
 ///   residual fades out. The loop's phases are the ones the glide arrives at.
@@ -440,8 +438,8 @@ fn steady(job: &Job, f0: f64, m: usize, hs: &[usize]) -> Result<Parts, SpectrumL
     } = *job;
     let frames = job.an.frames;
     let f0q = m as f64 * rate / l as f64;
-    let freqs: Vec<f64> = hs.iter().map(|&h| h as f64 * f0).collect();
     let w = ((FIT_PERIODS * rate / f0).max(FIT_MIN_S * rate).round() as usize).max(1);
+    let fitter = |len: usize| HarmonicFitter::new(len, f0, hs, rate as u32);
 
     // Amplitudes: RMS of the fits over consecutive windows, at most MAX_FIT_WINDOWS of them.
     let len = b - a;
@@ -454,12 +452,15 @@ fn steady(job: &Job, f0: f64, m: usize, hs: &[usize]) -> Result<Parts, SpectrumL
             .map(|i| a + i * (count - 1) / (MAX_FIT_WINDOWS - 1) * wl)
             .collect()
     };
+    let window_fit = fitter(wl);
+    let full_fit = if wl == w { None } else { Some(fitter(w)) };
+    let full_fit = full_fit.as_ref().unwrap_or(&window_fit);
     let mut amps: Vec<Vec<f64>> = audio
         .iter()
         .map(|ch| {
+            let windows: Vec<&[f32]> = starts.iter().map(|&s| &ch[s..s + wl]).collect();
             let mut sum = vec![0.0; hs.len()];
-            for &s in &starts {
-                let c = harmonic_fit(&ch[s..s + wl], &freqs, rate as u32);
+            for c in window_fit.fit(&windows) {
                 sum.iter_mut()
                     .zip(&c)
                     .for_each(|(acc, c)| *acc += c.norm_sqr());
@@ -470,10 +471,18 @@ fn steady(job: &Job, f0: f64, m: usize, hs: &[usize]) -> Result<Parts, SpectrumL
         })
         .collect();
 
-    // The original's harmonics at the start of the entry.
+    // The original's harmonics at the start of the entry (one fit window, or what is left of
+    // the file, read as zero-padded by the fitter only when the file is shorter than that).
     let fit_in: Vec<Vec<Complex64>> = audio
         .iter()
-        .map(|ch| harmonic_fit(&ch[a..a + w.min(frames - a)], &freqs, rate as u32))
+        .map(|ch| {
+            let x = &ch[a..a + w.min(frames - a)];
+            if x.len() == w {
+                full_fit.fit(&[x]).remove(0)
+            } else {
+                fitter(x.len()).fit(&[x]).remove(0)
+            }
+        })
         .collect();
 
     // The fundamental's phase through the entry glide, from 0 at `a`.
@@ -515,28 +524,51 @@ fn steady(job: &Job, f0: f64, m: usize, hs: &[usize]) -> Result<Parts, SpectrumL
     amps.iter_mut().flatten().for_each(|v| *v *= gain);
     let looped = build(&amps);
 
+    // Sums of many harmonics are evaluated with powers of one rotation per frame, not one
+    // cosine per harmonic: `powers(θ)[h] = e^{i·h·θ}`.
+    let top = hs.iter().copied().max().unwrap_or(0);
+    let mut pa = vec![Complex64::default(); top + 1];
+    let mut pb = vec![Complex64::default(); top + 1];
+    let powers = |out: &mut [Complex64], theta: f64| {
+        let step = Complex64::from_polar(1.0, theta);
+        let mut z = Complex64::new(1.0, 0.0);
+        for p in out {
+            *p = z;
+            z *= step;
+        }
+    };
     let w0 = TAU * f0 / rate;
-    let entry: Vec<Vec<f32>> = audio
+
+    // The original's phase at `a` of each harmonic, as a unit rotation.
+    let units_in: Vec<Vec<Complex64>> = fit_in
         .iter()
-        .zip(&fit_in)
-        .zip(&amps)
-        .map(|((x, c_in), amp)| {
-            (0..t)
-                .map(|i| {
-                    let mut model = 0.0;
-                    let mut glide = 0.0;
-                    for ((c, &h), &target) in c_in.iter().zip(hs).zip(amp) {
-                        let h = h as f64;
-                        model += c.norm() * (c.arg() + h * w0 * i as f64).cos();
-                        let level = (1.0 - g[i]) * c.norm() + g[i] * target;
-                        glide += level * (c.arg() + h * phi[i]).cos();
-                    }
-                    let resid = f64::from(x[a + i]) - model;
-                    (glide + (1.0 - g[i]) * resid) as f32
-                })
+        .map(|c| {
+            c.iter()
+                .map(|c| Complex64::from_polar(1.0, c.arg()))
                 .collect()
         })
         .collect();
+    let mut entry = vec![Vec::with_capacity(t); audio.len()];
+    for i in 0..t {
+        // The original's model runs at f0; the glide at the gliding fundamental.
+        powers(&mut pa, w0 * i as f64);
+        powers(&mut pb, phi[i]);
+        for (((out, x), (c_in, units)), amp) in entry
+            .iter_mut()
+            .zip(audio)
+            .zip(fit_in.iter().zip(&units_in))
+            .zip(&amps)
+        {
+            let (mut model, mut glide) = (0.0, 0.0);
+            for (((c, unit), &h), &target) in c_in.iter().zip(units).zip(hs).zip(amp) {
+                model += (c * pa[h]).re;
+                let level = (1.0 - g[i]) * c.norm() + g[i] * target;
+                glide += level * (unit * pb[h]).re;
+            }
+            let resid = f64::from(x[a + i]) - model;
+            out.push((glide + (1.0 - g[i]) * resid) as f32);
+        }
+    }
 
     let exit = if tx == 0 {
         vec![Vec::new(); audio.len()]
@@ -548,15 +580,17 @@ fn steady(job: &Job, f0: f64, m: usize, hs: &[usize]) -> Result<Parts, SpectrumL
         for j in 0..tx {
             psi[j + 1] = psi[j] + TAU * ((1.0 - gx[j]) * f0q + gx[j] * f0) / rate;
         }
-        audio
+        let fit_out: Vec<Vec<Complex64>> = audio
+            .iter()
+            .map(|x| full_fit.fit(&[&x[b..b + w]]).remove(0))
+            .collect();
+        // The shortest-way correction that lands each harmonic on the original's phase at
+        // the last exit frame.
+        let delta: Vec<Vec<f64>> = fit_out
             .iter()
             .zip(&start_phase)
-            .zip(&amps)
-            .map(|((x, start), amp)| {
-                let c_out = harmonic_fit(&x[b..b + w], &freqs, rate as u32);
-                // The shortest-way correction that lands each harmonic on the original's
-                // phase at the last exit frame.
-                let delta: Vec<f64> = c_out
+            .map(|(c_out, start)| {
+                c_out
                     .iter()
                     .zip(hs)
                     .zip(start)
@@ -565,25 +599,32 @@ fn steady(job: &Job, f0: f64, m: usize, hs: &[usize]) -> Result<Parts, SpectrumL
                         let target = c.arg() + h * w0 * (tx - 1) as f64;
                         wrap_phase(target - (s + h * psi[tx - 1]))
                     })
-                    .collect();
-                (0..tx)
-                    .map(|j| {
-                        let mut model = 0.0;
-                        let mut glide = 0.0;
-                        for ((((c, &h), &s), &d), &from) in
-                            c_out.iter().zip(hs).zip(start).zip(&delta).zip(amp)
-                        {
-                            let h = h as f64;
-                            model += c.norm() * (c.arg() + h * w0 * j as f64).cos();
-                            let level = (1.0 - gx[j]) * from + gx[j] * c.norm();
-                            glide += level * (s + h * psi[j] + gx[j] * d).cos();
-                        }
-                        let resid = f64::from(x[b + j]) - model;
-                        (glide + gx[j] * resid) as f32
-                    })
                     .collect()
             })
-            .collect()
+            .collect();
+        let mut exit = vec![Vec::with_capacity(tx); audio.len()];
+        for j in 0..tx {
+            powers(&mut pa, w0 * j as f64);
+            powers(&mut pb, psi[j]);
+            for ((((out, x), c_out), (start, d)), amp) in exit
+                .iter_mut()
+                .zip(audio)
+                .zip(&fit_out)
+                .zip(start_phase.iter().zip(&delta))
+                .zip(&amps)
+            {
+                let (mut model, mut glide) = (0.0, 0.0);
+                for ((((c, &h), &s), &d), &from) in c_out.iter().zip(hs).zip(start).zip(d).zip(amp)
+                {
+                    model += (c * pa[h]).re;
+                    let level = (1.0 - gx[j]) * from + gx[j] * c.norm();
+                    glide += level * (Complex64::from_polar(1.0, s + gx[j] * d) * pb[h]).re;
+                }
+                let resid = f64::from(x[b + j]) - model;
+                out.push((glide + gx[j] * resid) as f32);
+            }
+        }
+        exit
     };
     Ok(Parts {
         entry,
@@ -788,17 +829,13 @@ fn render_parts(
         None => Flavour::Plain,
         Some(f0) if detune == 0.0 => {
             let m = ((f0 * l as f64 / rate_f).round() as usize).max(1);
-            let hs: Vec<usize> = harmonic_peaks(
-                &an.total,
-                an.summary.fft_size,
-                rate_f,
-                f0,
-                STEADY_MAX_HARMONICS,
-            )
-            .into_iter()
-            .map(|(h, _)| h)
-            .filter(|&h| 2 * h * m < l)
-            .collect();
+            // Every harmonic up to the Nyquist frequency.
+            let hs: Vec<usize> =
+                harmonic_peaks(&an.total, an.summary.fft_size, rate_f, f0, usize::MAX)
+                    .into_iter()
+                    .map(|(h, _)| h)
+                    .filter(|&h| 2 * h * m < l)
+                    .collect();
             if hs.is_empty() {
                 Flavour::Plain
             } else {
@@ -812,8 +849,13 @@ fn render_parts(
             Flavour::Ensemble(f0, detune)
         }
     };
+    // With Pitch lock on, Plain means no usable pitch: either none was found, or Steady found
+    // no harmonic it can place in the loop. The result then reports no pitch either, so the
+    // warning and `analysis.pitch_hz` always agree.
+    let mut summary = an.summary;
     if s.pitch_lock && matches!(flavour, Flavour::Plain) {
         warnings.push(SpectrumLoopWarning::NoPitch);
+        summary.pitch_hz = None;
     }
 
     let job = Job {
@@ -875,6 +917,14 @@ fn render_parts(
     } else {
         place(e.end)
     };
+    // The loop must lie inside Start…End. A range wholly outside the trim would leave it
+    // outside, so the trim widens to take it in: Start moves back to the loop start, and End
+    // forward to the exit end (the loop end when there is no exit). Ranges inside or
+    // overlapping the trim are already covered by the moves above and do not change.
+    edit.start = edit.start.min(loop_start);
+    if edit.end < loop_end {
+        edit.end = loop_end + tx;
+    }
     edit.loop_mode = LoopMode::Forward;
     edit.loop_start = loop_start;
     edit.loop_end = loop_end;
@@ -886,7 +936,7 @@ fn render_parts(
             step,
             edit,
             warnings,
-            analysis: an.summary,
+            analysis: summary,
         },
         parts.looped,
     ))
@@ -894,6 +944,8 @@ fn render_parts(
 
 #[cfg(test)]
 mod tests {
+
+    use std::f64::consts::TAU as TAU64;
 
     use super::*;
     use crate::dsp::lsq::harmonic_fit;
@@ -1015,6 +1067,8 @@ mod tests {
         assert_eq!(r.edit.crossfade, 0);
         assert_eq!(r.edit.loop_len(), looped[0].len());
         assert!(out.iter().flatten().all(|v| v.is_finite()), "finite");
+        check_trim(&r, x[0].len());
+        check_pitch_agrees(&r, s);
         (r, looped, out)
     }
 
@@ -1334,6 +1388,133 @@ mod tests {
         assert_eq!(r.edit.end, r.edit.loop_end);
         assert_eq!(r.step.last, frames - 1);
         assert_eq!(out[0].len(), r.edit.loop_end + 1);
+    }
+
+    /// The returned edit keeps the loop inside Start…End, so clamping it changes nothing about
+    /// the loop.
+    fn check_trim(r: &SpectrumLoopRender, original_frames: usize) {
+        let e = &r.edit;
+        assert!(
+            e.start <= e.loop_start && e.loop_start < e.loop_end && e.loop_end <= e.end,
+            "start {} loop {}..={} end {}",
+            e.start,
+            e.loop_start,
+            e.loop_end,
+            e.end
+        );
+        let c = e.clone().clamped(original_frames);
+        assert_eq!(
+            (c.loop_mode, c.loop_start, c.loop_end, c.crossfade),
+            (e.loop_mode, e.loop_start, e.loop_end, e.crossfade),
+            "clamping leaves the loop alone"
+        );
+    }
+
+    /// With Pitch lock on, the `NoPitch` warning and a missing pitch go together.
+    fn check_pitch_agrees(r: &SpectrumLoopRender, s: &SpectrumLoopSettings) {
+        if s.pitch_lock {
+            assert_eq!(
+                r.warnings.contains(&SpectrumLoopWarning::NoPitch),
+                r.analysis.pitch_hz.is_none(),
+                "{:?} with pitch {:?}",
+                r.warnings,
+                r.analysis.pitch_hz
+            );
+        }
+    }
+
+    #[test]
+    fn a_range_outside_the_trim_widens_it() {
+        let x = tone();
+        let frames = x[0].len();
+        let (a, last) = sel();
+        let b = last + 1;
+        let (t, l) = (at(0.1), at(1.0));
+        let s = steady(1.0);
+
+        // The selection lies wholly after End: End moves to the exit end.
+        let mut e = EditState::default_for(frames);
+        e.end = a - 100;
+        let (r, _, _) = run(&x, &e, Some(sel()), &s);
+        assert_eq!(r.edit.start, 0);
+        assert_eq!(r.edit.end, a + t + l + t - 1);
+
+        // The selection lies wholly before Start: Start moves back to the loop start, and End
+        // shifts with the audio after the range.
+        let mut e = EditState::default_for(frames);
+        e.start = b + 500;
+        let (r, _, _) = run(&x, &e, Some(sel()), &s);
+        assert_eq!(r.edit.start, a + t);
+        assert_eq!(r.edit.end, frames - 1 + t + l - (b - a));
+
+        // Wholly after End with no audio after the range: End moves to the loop end.
+        let mut e = EditState::default_for(frames);
+        e.end = a - 100;
+        let (r, _, _) = run(&x, &e, Some((a, frames - 1)), &s);
+        assert_eq!(r.edit.end, r.edit.loop_end);
+        assert_eq!(r.step.last, frames - 1);
+    }
+
+    #[test]
+    fn steady_keeps_every_harmonic_up_to_nyquist() {
+        // A low, bright 50 Hz tone with 219 harmonics, the highest at 10.95 kHz.
+        let f0 = 50.0f32;
+        let x = vec![
+            (0..at(1.5))
+                .map(|i| {
+                    let t = f64::from(i as u32) / f64::from(RATE);
+                    let v: f64 = (1..=219)
+                        .map(|h| {
+                            let w = std::f64::consts::TAU * f64::from(f0) * f64::from(h) * t;
+                            (w + 0.37 * f64::from(h * h)).cos() / f64::from(h).sqrt()
+                        })
+                        .sum();
+                    (0.02 * v) as f32
+                })
+                .collect::<Vec<f32>>(),
+        ];
+        let (a, last) = sel();
+        let (r, looped, _) = run_sel(&x, &steady(1.0));
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        let n = r.analysis.fft_size;
+        let above = |p: Vec<f32>| -> f32 {
+            p.iter()
+                .enumerate()
+                .filter(|(k, _)| *k as f32 * r.analysis.bin_hz > 60.0 * f0 + f0 / 2.0)
+                .map(|(_, v)| v)
+                .sum()
+        };
+        let src = above(welch_power(&x[0], a, last, n));
+        let lp: Vec<f32> = looped[0].iter().chain(&looped[0]).copied().collect();
+        let got = above(welch_power(&lp, 0, lp.len() - 1, n));
+        let d = 10.0 * (got / src).log10();
+        assert!(d.abs() <= 3.0, "energy above the 60th harmonic: {d} dB");
+        // The whole spectrum keeps its level too.
+        let d = db(rms(&looped[0]) / rms(&x[0][a..=last]));
+        assert!(d.abs() <= 0.5, "level {d} dB");
+    }
+
+    #[test]
+    fn steady_without_a_usable_harmonic_reports_no_pitch() {
+        // At 4 kHz a 1379 Hz tone is found as the pitch, but its first harmonic already lies
+        // within half a fundamental of the Nyquist frequency, so Steady has nothing to place
+        // and falls back to Plain.
+        let rate = 4000;
+        let x = vec![
+            (0..rate as usize)
+                .map(|i| 0.3 * (TAU64 * 1379.0 * i as f64 / f64::from(rate)).sin() as f32)
+                .collect::<Vec<f32>>(),
+        ];
+        let e = EditState::default_for(x[0].len());
+        let s = steady(1.0);
+        let found = analyse_range(&x, &e, None, rate, None).expect("analyses");
+        assert!(found.pitch_hz.is_some(), "the analysis finds a pitch");
+        let r = render_spectrum_loop(&x, &e, None, rate, &s).expect("renders");
+        assert_eq!(r.warnings, vec![SpectrumLoopWarning::NoPitch]);
+        assert_eq!(r.analysis.pitch_hz, None);
+        check_pitch_agrees(&r, &s);
+        let plain = render_spectrum_loop(&x, &e, None, rate, &plain(1.0)).expect("renders");
+        assert_eq!(r.step, plain.step, "it is Plain");
     }
 
     #[test]
