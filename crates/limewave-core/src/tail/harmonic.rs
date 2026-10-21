@@ -425,6 +425,38 @@ mod tests {
     }
 
     #[test]
+    fn harmonic_sustain_body_holds_the_cut_level() {
+        for (name, x, cut) in all() {
+            let (r, out) = run(&x, &cut_at(&x, cut), &sustain());
+            let (a, b) = (r.edit.loop_start, r.edit.loop_end);
+            // The general §8.1 bound. As for Smooth, the 20 ms level at the cut reads the steady
+            // tone's 97 Hz pulse wave about 1.3 dB low, which uses most of this margin there.
+            let dev = level_deviation_db(&out, a, b, r.analysis.level_at_cut_db, RATE);
+            assert!(dev <= 1.5, "{name}: body level strays {dev} dB");
+        }
+    }
+
+    #[test]
+    fn harmonic_follows_the_real_ending() {
+        let (x, cut) = decaying_tone();
+        let (_, out) = run(&x, &cut_at(&x, cut), &decay());
+        let err = envelope_error_db(&out, cut, &x, cut, RATE);
+        assert!(err <= 3.0, "envelope error {err} dB");
+    }
+
+    #[test]
+    fn harmonic_keeps_stereo_correlation() {
+        let (x, cut) = stereo_tone();
+        for s in [decay(), sustain()] {
+            let (r, out) = run(&x, &cut_at(&x, cut), &s);
+            let (s0, s1) = r.analysis.source;
+            let want = channel_correlation(&x, s0, s1);
+            let got = channel_correlation(&out, cut, out[0].len() - 1);
+            assert!((got - want).abs() <= 0.1, "{:?}: {got} vs {want}", s.mode);
+        }
+    }
+
+    #[test]
     fn harmonic_sustain_loop_is_exactly_periodic() {
         for (name, x, cut) in all() {
             let e = cut_at(&x, cut);
