@@ -10,9 +10,12 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Event, Key, KeyboardShortcut, Modifiers};
 use limewave_core::document::{WavDocument, load_wav};
 use limewave_core::dsp::{PeakPyramid, mono_sum};
-use limewave_core::edit::{EditState, History, Marker};
+use limewave_core::edit::{
+    EditState, History, Marker, crop_to_loop, set_loop_to_selection, set_trim_to_selection,
+    trim_after_loop,
+};
 use limewave_core::effects::{
-    AppliedEffect, Effect, Op, apply_effect, mirror_edit, plan_effect, process,
+    AppliedEffect, Effect, Op, apply_effect, mirror_edit, plan_effect, process, silence_bounds,
 };
 use limewave_core::notes::note_name;
 use limewave_core::render::render;
@@ -25,6 +28,7 @@ use crate::audio::voice::{PlayBuffer, play_buffer};
 use crate::folder;
 use crate::theme::{self, colors};
 use crate::ui::coords::ViewTransform;
+use crate::ui::effects::edit_menu;
 use crate::ui::filelist;
 use crate::ui::inspector::inspector;
 use crate::ui::keyboard::keyboard_strip;
@@ -42,6 +46,8 @@ const PREVIEW_PUSH_INTERVAL: Duration = Duration::from_millis(50);
 const SAVE_SHORTCUT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::S);
 const SAVE_AS_SHORTCUT: KeyboardShortcut =
     KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::S);
+pub(crate) const SELECT_ALL_SHORTCUT: KeyboardShortcut =
+    KeyboardShortcut::new(Modifiers::COMMAND, Key::A);
 
 /// Default height of the seam panel: its controls plus a plot of about 200 px.
 const SEAM_PANEL_HEIGHT: f32 = 300.0;
@@ -313,6 +319,12 @@ pub struct UiState {
     pub save_dialog: SaveDialogState,
     /// The marker whose exact position is being typed, and the text typed so far.
     pub marker_entry: Option<(Marker, String)>,
+    /// The selected frames of the shown file (inclusive), from dragging on the waveform.
+    pub selection: Option<(usize, usize)>,
+    /// Where Play starts instead of Start, set by clicking on the waveform.
+    pub play_from: Option<usize>,
+    /// Why the last action did nothing, shown in the toolbar until the next action.
+    pub message: Option<String>,
 }
 
 impl Default for UiState {
@@ -327,6 +339,9 @@ impl Default for UiState {
             seam_channel: SeamChannel::default(),
             save_dialog: SaveDialogState::default(),
             marker_entry: None,
+            selection: None,
+            play_from: None,
+            message: None,
         }
     }
 }
@@ -359,6 +374,10 @@ pub struct LimewaveApp {
     midi_error: Option<String>,
     /// True while the engine has been silenced because no loaded file is selected.
     silenced: bool,
+    /// Whether a widget held the keyboard focus at the end of the last frame. egui drops the
+    /// focus when Escape arrives, before this app sees the key, so the field that Escape
+    /// closes would otherwise look unfocused.
+    focus_last_frame: bool,
     ctx: egui::Context,
     loader: Option<Receiver<LoadResult>>,
     single_file: bool,
@@ -401,6 +420,7 @@ impl LimewaveApp {
             midi_selected: None,
             midi_error: None,
             silenced: false,
+            focus_last_frame: false,
             ctx,
             loader: None,
             single_file: false,
@@ -563,6 +583,9 @@ impl LimewaveApp {
     pub fn select(&mut self, i: usize) {
         self.selected = Some(i);
         self.ui.marker_entry = None;
+        self.ui.selection = None;
+        self.ui.play_from = None;
+        self.ui.message = None;
         self.release_all();
         let loaded = matches!(self.files.get(i), Some(FileEntry::Loaded(_)));
         match (self.files.get(i), &mut self.engine) {
@@ -574,7 +597,7 @@ impl LimewaveApp {
     }
 
     /// The selected file, if it is loaded.
-    fn selected_session(&self) -> Option<&Session> {
+    pub(crate) fn selected_session(&self) -> Option<&Session> {
         match self.selected.and_then(|i| self.files.get(i)) {
             Some(FileEntry::Loaded(s)) => Some(s),
             _ => None,
@@ -606,13 +629,113 @@ impl LimewaveApp {
         }
     }
 
-    /// Plays the root note from the start (`from_loop == false`) or from the loop start.
+    /// Where Play starts: the loop start for Play loop, otherwise the play-from point or
+    /// Start. `None` without a loaded file.
+    pub fn play_start(&self, from_loop: bool) -> Option<usize> {
+        let e = self.selected_session()?.shown_edit();
+        Some(if from_loop {
+            e.loop_start
+        } else {
+            self.ui.play_from.unwrap_or(e.start)
+        })
+    }
+
+    /// Plays the root note from [`LimewaveApp::play_start`].
     fn play(&mut self, from_loop: bool) {
-        let Some(e) = self.selected_session().map(|s| s.shown_edit().clone()) else {
+        let (Some(from), Some(note)) = (
+            self.play_start(from_loop),
+            self.selected_session().map(|s| s.shown_edit().root),
+        ) else {
             return;
         };
-        let from = if from_loop { e.loop_start } else { e.start };
-        self.send(Command::NoteOn { note: e.root, from });
+        self.send(Command::NoteOn { note, from });
+    }
+
+    /// Selects Start...End.
+    pub fn select_all(&mut self) {
+        self.ui.message = None;
+        if let Some(e) = self.selected_session().map(|s| s.shown_edit()) {
+            self.ui.selection = Some((e.start, e.end));
+        }
+    }
+
+    /// Clears the selection and the play-from point.
+    pub fn clear_selection(&mut self) {
+        self.ui.message = None;
+        self.ui.selection = None;
+        self.ui.play_from = None;
+    }
+
+    /// Plays the selection once at the root key, releasing at its end.
+    pub fn play_selection(&mut self) {
+        self.ui.message = None;
+        let (Some((first, last)), Some(note)) = (
+            self.ui.selection,
+            self.selected_session().map(|s| s.shown_edit().root),
+        ) else {
+            return;
+        };
+        // The selection is inclusive: the voice stops on the frame after its last one.
+        self.send(Command::PlayRange {
+            note,
+            from: first,
+            to: last + 1,
+        });
+    }
+
+    /// Records the edit `f` makes of the selected file's current edit as one history entry,
+    /// or shows why it refused. An edit that changes nothing adds no entry.
+    fn edit_selected(&mut self, f: impl FnOnce(&Session) -> Result<EditState, String>) {
+        self.ui.message = None;
+        let engine = self.engine.as_ref();
+        let Some(FileEntry::Loaded(s)) = self.selected.and_then(|i| self.files.get_mut(i)) else {
+            return;
+        };
+        match f(s) {
+            Ok(e) if e != *s.edit() => s.apply(e, engine),
+            Ok(_) => {}
+            Err(message) => self.ui.message = Some(message),
+        }
+    }
+
+    /// Makes the selection the loop.
+    pub fn set_loop_to_selection(&mut self) {
+        let Some(sel) = self.ui.selection else { return };
+        self.edit_selected(|s| Ok(set_loop_to_selection(s.edit(), sel, s.doc.frames)));
+    }
+
+    /// Makes the selection the trim; refused when the loop would fall outside it.
+    pub fn set_trim_to_selection(&mut self) {
+        let Some(sel) = self.ui.selection else { return };
+        self.edit_selected(|s| set_trim_to_selection(s.edit(), sel));
+    }
+
+    /// Moves End to the loop end plus the save dialog's padding.
+    pub fn trim_after_loop(&mut self) {
+        let padding = self.ui.save_dialog.padding;
+        self.edit_selected(|s| Ok(trim_after_loop(s.edit(), padding, s.doc.frames)));
+    }
+
+    /// Moves Start to the loop start and End to the loop end plus the padding.
+    pub fn crop_to_loop(&mut self) {
+        let padding = self.ui.save_dialog.padding;
+        self.edit_selected(|s| Ok(crop_to_loop(s.edit(), padding, s.doc.frames)));
+    }
+
+    /// Moves Start and End in to the first and last frame at or above `threshold_db` (kept
+    /// outside the loop while it is on).
+    pub fn auto_trim_silence(&mut self, threshold_db: f32) {
+        self.edit_selected(|s| {
+            let e = s.edit();
+            let (start, end) = silence_bounds(&s.processed, threshold_db, e)
+                .ok_or("Everything is below the threshold; nothing to keep")?;
+            Ok(EditState {
+                start,
+                end,
+                ..e.clone()
+            }
+            .clamped(s.doc.frames))
+        });
     }
 
     /// Keeps the engine and the MIDI start frame in step with the selection each frame.
@@ -693,18 +816,20 @@ impl LimewaveApp {
         }
     }
 
-    /// Applies `effect` to the selected file as one undoable step. Until the waveform has a
-    /// selection, it always takes the effect's default range. Returns false when nothing was
-    /// applied.
+    /// Applies `effect` to the selected file as one undoable step, to the selection (inclusive
+    /// frames) if there is one. Returns false when nothing was applied.
     pub fn apply_effect(&mut self, effect: Effect) -> bool {
+        self.ui.message = None;
+        let selection = self.ui.selection;
         let engine = self.engine.as_ref();
         match self.selected.and_then(|i| self.files.get_mut(i)) {
-            Some(FileEntry::Loaded(s)) => s.apply_effect(effect, None, engine),
+            Some(FileEntry::Loaded(s)) => s.apply_effect(effect, selection, engine),
             _ => false,
         }
     }
 
     pub fn undo(&mut self) {
+        self.ui.message = None;
         let engine = self.engine.as_ref();
         if let Some(FileEntry::Loaded(s)) = self.selected.and_then(|i| self.files.get_mut(i)) {
             s.undo(engine);
@@ -712,6 +837,7 @@ impl LimewaveApp {
     }
 
     pub fn redo(&mut self) {
+        self.ui.message = None;
         let engine = self.engine.as_ref();
         if let Some(FileEntry::Loaded(s)) = self.selected.and_then(|i| self.files.get_mut(i)) {
             s.redo(engine);
@@ -788,6 +914,21 @@ impl LimewaveApp {
         } else if do_undo {
             self.undo();
         }
+        // Text fields keep Ctrl+A and Escape for themselves.
+        if self.focus_last_frame || ctx.egui_wants_keyboard_input() {
+            return;
+        }
+        let (select_all, clear) = ctx.input_mut(|i| {
+            (
+                i.consume_shortcut(&SELECT_ALL_SHORTCUT),
+                i.consume_key(Modifiers::NONE, Key::Escape),
+            )
+        });
+        if select_all {
+            self.select_all();
+        } else if clear {
+            self.clear_selection();
+        }
     }
 
     /// The playback cursors of the sounding voices; empty without an audio engine.
@@ -840,6 +981,7 @@ impl LimewaveApp {
             self.save_results = None;
         }
         self.flush_preview(&ctx);
+        self.focus_last_frame = ctx.egui_wants_keyboard_input();
     }
 
     /// Publishes the selected file's held-back drag preview, or asks for a repaint when
@@ -938,6 +1080,7 @@ impl LimewaveApp {
                 ui.separator();
                 undo = ui.button("Undo").clicked();
                 redo = ui.button("Redo").clicked();
+                edit_menu(ui, self);
                 ui.separator();
                 ui.toggle_value(&mut self.ui.snap, "Snap").on_hover_text(
                     "Snap loop markers to upward zero crossings (Shift disables while dragging)",
@@ -1042,6 +1185,9 @@ impl LimewaveApp {
         }
         if let Some(err) = &self.midi_error {
             ui.colored_label(colors::END, err);
+        }
+        if let Some(message) = &self.ui.message {
+            ui.colored_label(colors::LOOP, message);
         }
         if !self.single_file && !self.files.is_empty() {
             ui.weak(format!("{} files", self.files.len()));

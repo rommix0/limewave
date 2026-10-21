@@ -1,6 +1,7 @@
 //! Panels and widgets.
 
 pub mod coords;
+pub mod effects;
 pub mod filelist;
 pub mod inspector;
 pub mod keyboard;

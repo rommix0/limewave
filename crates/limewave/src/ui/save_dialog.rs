@@ -427,14 +427,17 @@ pub fn perform_save(app: &mut LimewaveApp, req: SaveRequest) -> Vec<SaveResult> 
         let source = s.doc.path.clone();
         let old_source = s.source;
         let result = save_session(s, &req.destination, req.trim_after_loop);
-        if result.is_ok()
-            && app.selected == Some(i)
-            && let Some(engine) = &mut app.engine
-        {
-            if s.source != old_source {
-                engine.send(Command::AllOff);
+        if result.is_ok() && app.selected == Some(i) {
+            // The saved file may have moved its frames, so what pointed into it is stale.
+            app.ui.selection = None;
+            app.ui.play_from = None;
+            app.ui.marker_entry = None;
+            if let Some(engine) = &mut app.engine {
+                if s.source != old_source {
+                    engine.send(Command::AllOff);
+                }
+                engine.set_buffer(s.play_buffer());
             }
-            engine.set_buffer(s.play_buffer());
         }
         results.push((source, result));
     }

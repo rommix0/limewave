@@ -37,6 +37,16 @@ struct Drag {
     grab_offset: f64,
 }
 
+/// What a drag on the waveform is doing, decided by where it was pressed.
+#[derive(Clone, Copy)]
+enum Gesture {
+    Marker(Drag),
+    /// Dragging out a selection from the (fractional) frame under the press.
+    Select {
+        anchor: f64,
+    },
+}
+
 fn with_alpha(c: Color32, alpha: u8) -> Color32 {
     Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), alpha)
 }
@@ -192,26 +202,66 @@ pub fn waveform_view(
     if response.drag_started_by(PointerButton::Primary)
         && let Some(press) = ui.input(|i| i.pointer.press_origin())
     {
+        ui_state.message = None;
         let e = s.shown_edit();
-        let drag = marker_at(e, &view, left, &flags, press).map(|marker| Drag {
-            marker,
-            grab_offset: marker_frame(e, marker) as f64 - view.x_to_frame(press.x, left),
-        });
-        ui.data_mut(|d| d.insert_temp(drag_id, drag));
+        let gesture = match marker_at(e, &view, left, &flags, press) {
+            Some(marker) => Gesture::Marker(Drag {
+                marker,
+                grab_offset: marker_frame(e, marker) as f64 - view.x_to_frame(press.x, left),
+            }),
+            None => Gesture::Select {
+                anchor: view.x_to_frame(press.x, left),
+            },
+        };
+        ui.data_mut(|d| d.insert_temp(drag_id, Some(gesture)));
     }
-    let drag: Option<Drag> = ui.data(|d| d.get_temp::<Option<Drag>>(drag_id)).flatten();
-    if let Some(drag) = drag {
-        if response.dragged_by(PointerButton::Primary)
-            && let Some(pos) = response.interact_pointer_pos()
-        {
-            let target = view.x_to_frame(pos.x, left) + drag.grab_offset;
-            let shift = ui.input(|i| i.modifiers.shift);
-            let moved = dragged_edit(s, ui_state, drag.marker, target, ui_state.snap && !shift);
-            s.set_preview(moved, engine);
+    let gesture: Option<Gesture> = ui
+        .data(|d| d.get_temp::<Option<Gesture>>(drag_id))
+        .flatten();
+    if let Some(gesture) = gesture {
+        let pointer = response
+            .dragged_by(PointerButton::Primary)
+            .then(|| response.interact_pointer_pos())
+            .flatten();
+        let shift = ui.input(|i| i.modifiers.shift);
+        match (gesture, pointer) {
+            (Gesture::Marker(drag), Some(pos)) => {
+                let target = view.x_to_frame(pos.x, left) + drag.grab_offset;
+                let moved = dragged_edit(s, ui_state, drag.marker, target, ui_state.snap && !shift);
+                s.set_preview(moved, engine);
+            }
+            (Gesture::Select { anchor }, Some(pos)) => {
+                let to = view.x_to_frame(pos.x, left);
+                ui_state.selection =
+                    Some(dragged_selection(s, anchor, to, ui_state.snap && !shift));
+            }
+            _ => {}
         }
         if response.drag_stopped() {
-            ui.data_mut(|d| d.insert_temp(drag_id, None::<Drag>));
-            s.commit_preview(engine);
+            ui.data_mut(|d| d.insert_temp(drag_id, None::<Gesture>));
+            if matches!(gesture, Gesture::Marker(_)) {
+                s.commit_preview(engine);
+            }
+        }
+    }
+
+    // A click on empty space sets the play-from point; Shift extends the selection instead.
+    if response.clicked_by(PointerButton::Primary)
+        && let Some(pos) = response.interact_pointer_pos()
+        && marker_at(s.shown_edit(), &view, left, &flags, pos).is_none()
+    {
+        ui_state.message = None;
+        let frame = frame_at(&view, pos.x, left, total);
+        let shift = ui.input(|i| i.modifiers.shift);
+        match (shift, ui_state.selection, ui_state.play_from) {
+            (true, Some((a, b)), _) => ui_state.selection = Some((a.min(frame), b.max(frame))),
+            (true, None, Some(from)) => {
+                ui_state.selection = Some((from.min(frame), from.max(frame)));
+            }
+            _ => {
+                ui_state.play_from = Some(frame);
+                ui_state.selection = None;
+            }
         }
     }
 
@@ -219,8 +269,9 @@ pub fn waveform_view(
 
     // The flags again: a drag may have moved their markers.
     let flags = marker_flags(&painter, rect, &view, s.shown_edit());
-    let hovered = match drag {
-        Some(drag) => Some(drag.marker),
+    let hovered = match gesture {
+        Some(Gesture::Marker(drag)) => Some(drag.marker),
+        Some(Gesture::Select { .. }) => None,
         None => response
             .hover_pos()
             .and_then(|p| marker_at(s.shown_edit(), &view, left, &flag_rects(&flags), p)),
@@ -231,6 +282,7 @@ pub fn waveform_view(
 
     let ruler_color = ui.visuals().weak_text_color();
     draw(&painter, rect, s, &view, hovered, ruler_color, &flags);
+    draw_selection(&painter, rect, &view, ui_state);
     for c in cursors {
         let x = view.frame_to_x(c.frame, left);
         if (left..=rect.right()).contains(&x) {
@@ -356,6 +408,58 @@ fn dragged_edit(
         }
     }
     move_marker(s.edit(), marker, to, ui_state.lock_length, s.doc.frames)
+}
+
+/// The frame under screen `x`, rounded and clamped to the file.
+fn frame_at(view: &ViewTransform, x: f32, left: f32, total: usize) -> usize {
+    view.x_to_frame(x, left)
+        .round()
+        .clamp(0.0, total.saturating_sub(1) as f64) as usize
+}
+
+/// The inclusive selection dragged out between the (fractional) frames `a` and `b`: ordered
+/// and clamped to the file, and with `snap` its first edge snapped like a loop start and its
+/// last like a loop end.
+fn dragged_selection(s: &Session, a: f64, b: f64, snap: bool) -> (usize, usize) {
+    let last_frame = s.doc.frames.saturating_sub(1) as f64;
+    let at = |f: f64| f.round().clamp(0.0, last_frame) as usize;
+    let (mut first, mut last) = (at(a.min(b)), at(a.max(b)));
+    if snap {
+        let window = snap_window(s.doc.format.sample_rate);
+        first = snap_loop_start(&s.mono, first, window);
+        last = snap_loop_end(&s.mono, last, window).max(first);
+    }
+    (first, last)
+}
+
+/// The selection as a light overlay across every lane, and the play-from point as a thin grey
+/// line with a small triangle at the top.
+fn draw_selection(painter: &egui::Painter, rect: Rect, view: &ViewTransform, ui_state: &UiState) {
+    let left = rect.left();
+    if let Some((first, last)) = ui_state.selection {
+        let x = |f: usize| view.frame_to_x(f as f64, left).clamp(left, rect.right());
+        let lanes = Rect::from_x_y_ranges(
+            x(first)..=x(last + 1),
+            (rect.top() + RULER_HEIGHT)..=rect.bottom(),
+        );
+        painter.rect_filled(lanes, 0.0, with_alpha(Color32::WHITE, 30));
+    }
+    if let Some(from) = ui_state.play_from {
+        let x = view.frame_to_x(from as f64, left);
+        if (left..=rect.right()).contains(&x) {
+            let grey = Color32::from_gray(190);
+            painter.vline(x, rect.y_range(), Stroke::new(1.0, grey));
+            painter.add(Shape::convex_polygon(
+                vec![
+                    pos2(x - 5.0, rect.top()),
+                    pos2(x + 5.0, rect.top()),
+                    pos2(x, rect.top() + 7.0),
+                ],
+                grey,
+                Stroke::NONE,
+            ));
+        }
+    }
 }
 
 fn draw(

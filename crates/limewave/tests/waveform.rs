@@ -195,6 +195,10 @@ fn dragging_empty_space_changes_nothing() {
     let s = session(&h);
     assert!(!s.history.is_dirty());
     assert!(s.preview.is_none());
+    assert!(
+        h.state().ui.selection.is_some(),
+        "the drag selected instead"
+    );
 }
 
 #[test]
