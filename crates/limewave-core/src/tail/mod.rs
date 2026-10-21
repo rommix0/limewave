@@ -143,6 +143,20 @@ pub struct TailAnalysis {
     pub suggested_method: TailMethod,
 }
 
+impl TailAnalysis {
+    /// The decay time used while the settings leave it unset: the fitted one, or 1.0 s when
+    /// the source is steady (v0.3 §3.1).
+    pub fn default_decay_t60(&self) -> f32 {
+        self.fit.t60.unwrap_or(STEADY_DECAY_T60)
+    }
+
+    /// The release time used while the settings leave it unset: the fitted decay time, or
+    /// 0.5 s when the source is steady (v0.3 §3.2).
+    pub fn default_release_t60(&self) -> f32 {
+        self.fit.t60.unwrap_or(STEADY_RELEASE_T60)
+    }
+}
+
 /// Why no tail can be made. The messages are shown in the dialog.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Error)]
 pub enum TailError {
@@ -359,11 +373,11 @@ fn resolve(s: &TailSettings, a: &TailAnalysis, rate: u32) -> Resolved {
     let decay_t60 = s
         .decay_t60
         .filter(|t| usable(t) && *t > 0.0)
-        .unwrap_or(a.fit.t60.unwrap_or(STEADY_DECAY_T60));
+        .unwrap_or(a.default_decay_t60());
     let release_t60 = s
         .release_t60
         .filter(usable)
-        .unwrap_or(a.fit.t60.unwrap_or(STEADY_RELEASE_T60));
+        .unwrap_or(a.default_release_t60());
     Resolved {
         mode: s.mode,
         decay_t60: decay_t60.max(MIN_T60),

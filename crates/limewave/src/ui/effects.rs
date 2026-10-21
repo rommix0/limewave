@@ -9,6 +9,7 @@ use limewave_core::wav::SampleFormat;
 
 use crate::app::{LimewaveApp, SELECT_ALL_SHORTCUT};
 use crate::theme::colors;
+use crate::ui::tail_dialog::TailDialogState;
 
 /// The toolbar's Edit menu. Selection items need a selection and loop items a loop; an item
 /// that cannot run is greyed out.
@@ -105,8 +106,9 @@ pub enum EffectDialog {
     AutoTrim,
 }
 
-/// The toolbar's Effects menu. Gain, Normalize, the fades, Stereo to mono and Auto-trim open
-/// a dialog; the rest apply at once. A channel tool that does not fit the file is greyed out.
+/// The toolbar's Effects menu. Gain, Normalize, the fades, Stereo to mono, Auto-trim and
+/// Generate tail open a dialog; the rest apply at once. A channel tool that does not fit the
+/// file is greyed out.
 pub fn effects_menu(ui: &mut egui::Ui, app: &mut LimewaveApp) {
     let loaded = app.selected_session().is_some();
     ui.menu_button("Effects", |ui| {
@@ -152,6 +154,14 @@ pub fn effects_menu(ui: &mut egui::Ui, app: &mut LimewaveApp) {
             .clicked()
         {
             app.ui.effect_dialog = Some(EffectDialog::AutoTrim);
+        }
+        ui.separator();
+        if ui
+            .add_enabled(loaded, Button::new("Generate tail…"))
+            .on_hover_text("Replace everything after End with new audio made from the sound")
+            .clicked()
+        {
+            app.ui.tail_dialog = Some(TailDialogState::default());
         }
     });
 }

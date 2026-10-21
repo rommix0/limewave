@@ -8,4 +8,5 @@ pub mod keyboard;
 pub mod overview;
 pub mod save_dialog;
 pub mod seam;
+pub mod tail_dialog;
 pub mod waveform;

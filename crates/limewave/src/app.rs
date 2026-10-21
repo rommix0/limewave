@@ -41,6 +41,7 @@ use crate::ui::save_dialog::{
     save_dialog, save_results_window,
 };
 use crate::ui::seam::{DEFAULT_HALF, SeamChannel, seam_view};
+use crate::ui::tail_dialog::{TailDialogState, tail_dialog};
 use crate::ui::waveform::waveform_view;
 
 /// Longest a drag preview waits before the audio engine buffer is refreshed.
@@ -457,13 +458,6 @@ impl FileEntry {
 /// The pause after the last settings change before a dialog renders again (v0.3 §7).
 const RENDER_DEBOUNCE: Duration = Duration::from_millis(200);
 
-/// The Generate tail… dialog's state (v0.3 §7.1). For now only its render; the settings,
-/// the analysis and the result type come with the dialog.
-#[derive(Default)]
-pub struct TailDialogState {
-    pub render: RenderSlot<()>,
-}
-
 /// The Make loop from spectrum… dialog's state (v0.3 §7.2). For now only its render; the
 /// settings, the analysis and the result type come with the dialog.
 #[derive(Default)]
@@ -850,6 +844,10 @@ impl LimewaveApp {
     /// Makes `i` the edited file and hands its sound to the audio engine. Notes still sounding
     /// from the previous file are released.
     pub fn select(&mut self, i: usize) {
+        // The tail dialog belongs to the file it was opened for.
+        if self.ui.tail_dialog.take().is_some() {
+            self.end_preview();
+        }
         self.selected = Some(i);
         self.ui.marker_entry = None;
         self.ui.selection = None;
@@ -1232,6 +1230,7 @@ impl LimewaveApp {
     /// render made for a file or edit that is no longer current is discarded.
     fn drain_renders(&mut self, block: bool) {
         if let Some(mut d) = self.ui.tail_dialog.take() {
+            self.drain_render(&mut d.analysis, block);
             self.drain_render(&mut d.render, block);
             self.ui.tail_dialog = Some(d);
         }
@@ -1268,6 +1267,24 @@ impl LimewaveApp {
     pub fn play_preview(&mut self, from: usize) {
         if let Some(note) = self.selected_session().map(|s| s.edit().root) {
             self.send(Command::PreviewOn { note, from });
+        }
+    }
+
+    /// Plays the selected file's own audio from `from` at the root key, as "Play original" in
+    /// a dialog does. A live dialog preview is ended first, so the note plays the session's
+    /// buffer and not the preview's.
+    pub fn play_original(&mut self, from: usize) {
+        self.end_preview();
+        if let Some(note) = self.selected_session().map(|s| s.edit().root) {
+            self.send(Command::NoteOn { note, from });
+        }
+    }
+
+    /// Releases the root key: a held dialog preview leaves its loop and plays the generated
+    /// release (v0.3 §7.1), and a "Play original" note releases as usual.
+    pub fn release_root(&mut self) {
+        if let Some(note) = self.selected_session().map(|s| s.edit().root) {
+            self.send(Command::NoteOff { note });
         }
     }
 
@@ -1431,6 +1448,7 @@ impl LimewaveApp {
         egui::CentralPanel::default().show(ui, |ui| self.central(ui, &cursors));
         self.unsaved_prompt(&ctx);
         effect_dialog(&ctx, self);
+        tail_dialog(&ctx, self);
         if let Some(req) = save_dialog(&ctx, &mut self.ui.save_dialog, &self.files) {
             self.save_results = Some(perform_save(self, req));
         }
@@ -1764,6 +1782,7 @@ mod tests {
     use limewave_core::document::load_wav_bytes;
     use limewave_core::edit::LoopMode;
     use limewave_core::effects::{FadeCurve, MonoSource, Splice, SpliceKind};
+    use limewave_core::tail::TailError;
     use limewave_core::testwav::{sine, wav_bytes};
     use limewave_core::wav::SampleFormat;
 
@@ -2484,6 +2503,7 @@ mod tests {
         let mut d = TailDialogState::default();
         d.render.start(spawn_render(key, ctx, move || {
             wait.recv().unwrap();
+            Err(TailError::NoAudio)
         }));
         app.ui.tail_dialog = Some(d);
         assert!(app.apply_effect(Effect::Gain { db: -6.0 }));
@@ -2493,17 +2513,21 @@ mod tests {
 
         let render = &app.ui.tail_dialog.as_ref().unwrap().render;
         assert!(!render.is_rendering(), "the job is drained");
-        assert_eq!(render.result(Some(key)), None, "and its result dropped");
-        assert_eq!(render.result(app.render_key(3)), None);
+        assert!(render.result(Some(key)).is_none(), "and its result dropped");
+        assert!(render.result(app.render_key(3)).is_none());
         assert_eq!(app.render_key(3), Some(history), "the history is unchanged");
 
         // A job for the current edit is kept.
         let ctx = app.ctx.clone();
         let d = app.ui.tail_dialog.as_mut().unwrap();
-        d.render.start(spawn_render(history, ctx, || ()));
+        d.render
+            .start(spawn_render(history, ctx, || Err(TailError::NoAudio)));
         app.wait_for_renders();
         let render = &app.ui.tail_dialog.as_ref().unwrap().render;
-        assert_eq!(render.result(app.render_key(3)), Some(&()));
+        assert!(matches!(
+            render.result(app.render_key(3)),
+            Some(Err(TailError::NoAudio))
+        ));
     }
 
     #[test]
@@ -2597,6 +2621,57 @@ mod tests {
         app.end_preview();
         out.render(16);
         assert_eq!(out.sources(), (session_source, preview_source));
+    }
+
+    #[test]
+    fn switching_files_closes_the_tail_dialog_and_ends_its_preview() {
+        let mut app = LimewaveApp::for_test();
+        app.files = vec![
+            FileEntry::Loaded(Box::new(short_session())),
+            FileEntry::Loaded(Box::new(short_session())),
+        ];
+        app.select(0);
+        app.ui.tail_dialog = Some(TailDialogState::default());
+        let step = tail(1, 1000, 900, 500);
+        let mut edit = app.selected_session().unwrap().edit().clone();
+        edit.effects.push(step.clone());
+        edit.end = 1499;
+        app.preview_step(&step, &edit);
+        app.select(1);
+        assert!(app.ui.tail_dialog.is_none(), "closed");
+        let FileEntry::Loaded(first) = &app.files[0] else {
+            unreachable!()
+        };
+        assert!(first.dialog_preview.is_none(), "the preview ended");
+    }
+
+    #[test]
+    fn play_original_ends_the_preview_and_plays_the_session_audio() {
+        let (engine, mut out) = crate::audio::engine::headless(48_000);
+        let mut app = LimewaveApp::build(egui::Context::default(), Some(engine), None);
+        app.files = vec![FileEntry::Loaded(Box::new(short_session()))];
+        app.select(0);
+        let session_source = app.selected_session().unwrap().source;
+        let step = tail(1, 1000, 900, 500);
+        let mut edit = app.selected_session().unwrap().edit().clone();
+        edit.effects.push(step.clone());
+        edit.end = 1499;
+        app.preview_step(&step, &edit);
+        app.play_preview(100);
+        out.render(64);
+        app.play_original(100);
+        assert!(app.selected_session().unwrap().dialog_preview.is_none());
+        out.render(480);
+        assert_eq!(
+            out.sources().0,
+            session_source,
+            "the session buffer is back"
+        );
+        assert_eq!(
+            out.voice_sources(),
+            [session_source],
+            "only the original plays once the preview has faded"
+        );
     }
 
     #[test]
