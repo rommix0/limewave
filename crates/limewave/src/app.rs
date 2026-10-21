@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Event, Key, KeyboardShortcut, Modifiers};
 use limewave_core::document::{WavDocument, load_wav};
 use limewave_core::dsp::{PeakPyramid, mono_sum};
-use limewave_core::edit::{EditState, History};
+use limewave_core::edit::{EditState, History, Marker};
 use limewave_core::effects::{
     AppliedEffect, Effect, Op, apply_effect, mirror_edit, plan_effect, process,
 };
@@ -311,6 +311,8 @@ pub struct UiState {
     pub seam_half: usize,
     pub seam_channel: SeamChannel,
     pub save_dialog: SaveDialogState,
+    /// The marker whose exact position is being typed, and the text typed so far.
+    pub marker_entry: Option<(Marker, String)>,
 }
 
 impl Default for UiState {
@@ -324,6 +326,7 @@ impl Default for UiState {
             seam_half: DEFAULT_HALF,
             seam_channel: SeamChannel::default(),
             save_dialog: SaveDialogState::default(),
+            marker_entry: None,
         }
     }
 }
@@ -559,6 +562,7 @@ impl LimewaveApp {
     /// from the previous file are released.
     pub fn select(&mut self, i: usize) {
         self.selected = Some(i);
+        self.ui.marker_entry = None;
         self.release_all();
         let loaded = matches!(self.files.get(i), Some(FileEntry::Loaded(_)));
         match (self.files.get(i), &mut self.engine) {

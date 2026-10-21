@@ -1,14 +1,18 @@
 //! The main waveform: time ruler, one lane per channel, markers, and the mouse handling for
 //! dragging markers, zooming and scrolling.
 
+use std::sync::Arc;
+
 use eframe::egui::{
-    self, Align2, Color32, CursorIcon, FontId, PointerButton, Pos2, Rect, Role, Sense, Shape,
-    Stroke, WidgetInfo, pos2, vec2,
+    self, Align2, Area, Color32, CursorIcon, FontId, Frame, Galley, Id, Key, Order, Painter,
+    PointerButton, Pos2, Rect, Response, Role, Sense, Shape, Stroke, TextEdit, WidgetInfo, pos2,
+    text::{CCursor, CCursorRange},
+    vec2,
 };
 use limewave_core::dsp::{PeakPyramid, snap_loop_end, snap_loop_start};
 use limewave_core::edit::{EditState, LoopMode, Marker, move_marker};
 
-use super::coords::{ViewTransform, hit_marker};
+use super::coords::{ViewTransform, flag_rect, hit_marker, pick_marker};
 use crate::app::{Session, UiState};
 use crate::audio::engine::{AudioEngine, Cursor};
 use crate::theme::colors;
@@ -39,6 +43,90 @@ fn with_alpha(c: Color32, alpha: u8) -> Color32 {
 /// The snap search window: 2 ms of frames, at least one.
 fn snap_window(rate: u32) -> usize {
     ((rate as f32 * 0.002).round() as usize).max(1)
+}
+
+/// A marker's flag: the coloured label at the top of its line, which is also a handle.
+struct Flag {
+    marker: Marker,
+    color: Color32,
+    galley: Arc<Galley>,
+    rect: Rect,
+}
+
+/// Height of a flag row in pixels.
+const FLAG_ROW: f32 = 15.0;
+
+/// End-side flags hang to the left of their line, start-side flags to the right.
+fn flag_hangs_left(m: Marker) -> bool {
+    matches!(m, Marker::End | Marker::LoopEnd)
+}
+
+/// Where a marker's flag is anchored: on its line, in a row below the ruler (Start and End on
+/// the first, the loop markers on the second).
+fn flag_anchor(rect: Rect, view: &ViewTransform, e: &EditState, m: Marker) -> Pos2 {
+    let row = match m {
+        Marker::Start | Marker::End => 0.0,
+        Marker::LoopStart | Marker::LoopEnd => 1.0,
+    };
+    pos2(
+        view.frame_to_x(marker_frame(e, m) as f64, rect.left()),
+        rect.top() + RULER_HEIGHT + 2.0 + row * FLAG_ROW,
+    )
+}
+
+/// A point inside marker `m`'s flag, for tests: a flag has at least 8 px of padding around its
+/// text, so 10 px from the line on the side the flag extends to, in the middle of its row, is
+/// on it.
+pub fn flag_hit_point(rect: Rect, view: &ViewTransform, e: &EditState, m: Marker) -> Pos2 {
+    let anchor = flag_anchor(rect, view, e, m);
+    let dx = if flag_hangs_left(m) { -10.0 } else { 10.0 };
+    anchor + vec2(dx, 6.0)
+}
+
+/// The flags of the markers that are shown and within the view, in drawing order.
+fn marker_flags(painter: &Painter, rect: Rect, view: &ViewTransform, e: &EditState) -> Vec<Flag> {
+    let mut markers = vec![
+        (Marker::Start, colors::START, "START"),
+        (Marker::End, colors::END, "END"),
+    ];
+    if e.loop_mode != LoopMode::Off {
+        markers.push((Marker::LoopStart, colors::LOOP, "LOOP"));
+        markers.push((Marker::LoopEnd, colors::LOOP, "LOOP"));
+    }
+    markers
+        .into_iter()
+        .filter_map(|(marker, color, label)| {
+            let anchor = flag_anchor(rect, view, e, marker);
+            if anchor.x < rect.left() - 1.0 || anchor.x > rect.right() + 1.0 {
+                return None;
+            }
+            let galley =
+                painter.layout_no_wrap(label.to_owned(), FontId::proportional(10.0), colors::PANEL);
+            let size = galley.size() + vec2(8.0, 2.0);
+            Some(Flag {
+                marker,
+                color,
+                galley,
+                rect: flag_rect(anchor, flag_hangs_left(marker), size),
+            })
+        })
+        .collect()
+}
+
+fn flag_rects(flags: &[Flag]) -> Vec<(Marker, Rect)> {
+    flags.iter().map(|f| (f.marker, f.rect)).collect()
+}
+
+/// The marker under the pointer at `pos`: a flag, else a line within the grab tolerance.
+fn marker_at(
+    e: &EditState,
+    view: &ViewTransform,
+    left: f32,
+    flags: &[(Marker, Rect)],
+    pos: Pos2,
+) -> Option<Marker> {
+    let line = hit_marker(e, view, left, pos.x, GRAB_TOLERANCE);
+    pick_marker(flags, line, pos)
 }
 
 fn marker_frame(e: &EditState, m: Marker) -> usize {
@@ -88,13 +176,22 @@ pub fn waveform_view(
         }
     }
 
-    // Markers: grab on press, follow the pointer, one history entry on release.
+    // Markers: grab a flag or line on press, follow the pointer, one history entry on release.
+    let flags = flag_rects(&marker_flags(&painter, rect, &view, s.shown_edit()));
+    if response.double_clicked_by(PointerButton::Primary)
+        && let Some(pos) = response.interact_pointer_pos()
+        && let Some(marker) = pick_marker(&flags, None, pos)
+    {
+        let text = marker_frame(s.shown_edit(), marker).to_string();
+        ui_state.marker_entry = Some((marker, text));
+        ui.memory_mut(|m| m.request_focus(entry_id()));
+    }
     let drag_id = response.id.with("drag");
     if response.drag_started_by(PointerButton::Primary)
         && let Some(press) = ui.input(|i| i.pointer.press_origin())
     {
         let e = s.shown_edit();
-        let drag = hit_marker(e, &view, left, press.x, GRAB_TOLERANCE).map(|marker| Drag {
+        let drag = marker_at(e, &view, left, &flags, press).map(|marker| Drag {
             marker,
             grab_offset: marker_frame(e, marker) as f64 - view.x_to_frame(press.x, left),
         });
@@ -118,24 +215,108 @@ pub fn waveform_view(
 
     s.view = Some(view);
 
+    // The flags again: a drag may have moved their markers.
+    let flags = marker_flags(&painter, rect, &view, s.shown_edit());
     let hovered = match drag {
         Some(drag) => Some(drag.marker),
         None => response
             .hover_pos()
-            .and_then(|p| hit_marker(s.shown_edit(), &view, left, p.x, GRAB_TOLERANCE)),
+            .and_then(|p| marker_at(s.shown_edit(), &view, left, &flag_rects(&flags), p)),
     };
     if hovered.is_some() {
         ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
     }
 
     let ruler_color = ui.visuals().weak_text_color();
-    draw(&painter, rect, s, &view, hovered, ruler_color);
+    draw(&painter, rect, s, &view, hovered, ruler_color, &flags);
     for c in cursors {
         let x = view.frame_to_x(c.frame, left);
         if (left..=rect.right()).contains(&x) {
             painter.vline(x, rect.y_range(), Stroke::new(1.0, cursor_color(c)));
         }
     }
+
+    marker_entry_field(ui, s, ui_state, engine, rect, &flags);
+}
+
+fn entry_id() -> Id {
+    Id::NULL.with("marker_entry")
+}
+
+/// The accessible name of the position field of `m`.
+fn entry_label(m: Marker) -> &'static str {
+    match m {
+        Marker::Start => "Start position",
+        Marker::LoopStart => "Loop start position",
+        Marker::LoopEnd => "Loop end position",
+        Marker::End => "End position",
+    }
+}
+
+/// The small floating field for typing a marker's exact frame. Enter applies a valid frame
+/// number as one history entry (unsnapped); Escape, invalid text or leaving the field closes
+/// it unchanged.
+fn marker_entry_field(
+    ui: &mut egui::Ui,
+    s: &mut Session,
+    ui_state: &mut UiState,
+    engine: Option<&AudioEngine>,
+    rect: Rect,
+    flags: &[Flag],
+) {
+    let Some((marker, mut text)) = ui_state.marker_entry.take() else {
+        return;
+    };
+    let loop_marker = matches!(marker, Marker::LoopStart | Marker::LoopEnd);
+    if loop_marker && s.shown_edit().loop_mode == LoopMode::Off {
+        return;
+    }
+    // Under its flag, or at the top-left when the marker is scrolled out of view.
+    let pos = flags
+        .iter()
+        .find(|f| f.marker == marker)
+        .map_or(rect.min + vec2(8.0, RULER_HEIGHT + 4.0), |f| {
+            pos2(f.rect.left(), f.rect.bottom() + 2.0)
+        });
+    let id = entry_id();
+    let first_frame = !ui.memory(|m| m.has_focus(id));
+    let mut response = None;
+    Area::new(id.with("area"))
+        .order(Order::Foreground)
+        .fixed_pos(pos)
+        .show(ui.ctx(), |ui| {
+            Frame::popup(ui.style()).show(ui, |ui| {
+                let mut out = TextEdit::singleline(&mut text)
+                    .id(id)
+                    .desired_width(72.0)
+                    .show(ui);
+                if first_frame {
+                    let all =
+                        CCursorRange::two(CCursor::new(0), CCursor::new(text.chars().count()));
+                    out.state.cursor.set_char_range(Some(all));
+                    out.state.store(ui.ctx(), id);
+                }
+                response =
+                    Some(Response::clone(&out.response).accessible_name(entry_label(marker)));
+            });
+        });
+    let Some(response) = response else {
+        return;
+    };
+    let (enter, escape) = ui.input(|i| (i.key_pressed(Key::Enter), i.key_pressed(Key::Escape)));
+    if escape || (response.lost_focus() && !first_frame) {
+        if enter
+            && !escape
+            && let Ok(frame) = text.trim().parse::<usize>()
+        {
+            let e = move_marker(s.edit(), marker, frame, ui_state.lock_length, s.doc.frames);
+            if e != *s.edit() {
+                s.apply(e, engine);
+            }
+        }
+        return;
+    }
+    ui_state.marker_entry = Some((marker, text));
 }
 
 /// The colour of a playback cursor: neon, as opaque as the voice's envelope level.
@@ -174,6 +355,7 @@ fn draw(
     view: &ViewTransform,
     hovered: Option<Marker>,
     ruler_color: Color32,
+    flags: &[Flag],
 ) {
     let left = rect.left();
     let width = rect.width();
@@ -221,40 +403,21 @@ fn draw(
     draw_ruler(painter, rect, view, s.doc.format.sample_rate, ruler_color);
 
     // Markers: loop markers only while the loop is on.
-    let mut markers = vec![
-        (Marker::Start, colors::START, "START", 0),
-        (Marker::End, colors::END, "END", 0),
-    ];
-    if loop_on {
-        markers.push((Marker::LoopStart, colors::LOOP, "LOOP", 1));
-        markers.push((Marker::LoopEnd, colors::LOOP, "LOOP", 1));
+    for flag in flags {
+        let x = x_of(marker_frame(e, flag.marker));
+        let width = if hovered == Some(flag.marker) {
+            2.5
+        } else {
+            1.5
+        };
+        painter.vline(x, rect.y_range(), Stroke::new(width, flag.color));
+        painter.rect_filled(flag.rect, 2.0, flag.color);
+        painter.galley(
+            flag.rect.min + vec2(4.0, 1.0),
+            flag.galley.clone(),
+            colors::PANEL,
+        );
     }
-    for (marker, color, label, row) in markers {
-        let x = x_of(marker_frame(e, marker));
-        if x < left - 1.0 || x > rect.right() + 1.0 {
-            continue;
-        }
-        let width = if hovered == Some(marker) { 2.5 } else { 1.5 };
-        painter.vline(x, rect.y_range(), Stroke::new(width, color));
-        // End-side flags hang to the left of their line, start-side flags to the right.
-        let flag_left = matches!(marker, Marker::End | Marker::LoopEnd);
-        let anchor = pos2(x, lanes_top + 2.0 + row as f32 * 15.0);
-        draw_flag(painter, anchor, flag_left, label, color);
-    }
-}
-
-fn draw_flag(painter: &egui::Painter, anchor: Pos2, flag_left: bool, label: &str, color: Color32) {
-    let galley =
-        painter.layout_no_wrap(label.to_owned(), FontId::proportional(10.0), colors::PANEL);
-    let size = galley.size() + vec2(8.0, 2.0);
-    let min = if flag_left {
-        pos2(anchor.x - size.x, anchor.y)
-    } else {
-        anchor
-    };
-    let flag = Rect::from_min_size(min, size);
-    painter.rect_filled(flag, 2.0, color);
-    painter.galley(flag.min + vec2(4.0, 1.0), galley, colors::PANEL);
 }
 
 /// The crossfade as a ramp over the frames it replaces, ending at the loop end.

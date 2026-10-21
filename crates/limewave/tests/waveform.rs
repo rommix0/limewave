@@ -4,14 +4,16 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use eframe::egui::{
-    Event, Modifiers, MouseWheelSource, MouseWheelUnit, Pos2, Rect, TouchPhase, pos2,
+    Event, Key, Modifiers, MouseWheelSource, MouseWheelUnit, PointerButton, Pos2, Rect, TouchPhase,
+    pos2,
 };
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
 use limewave::app::{FileEntry, LimewaveApp, Session};
+use limewave::ui::waveform::flag_hit_point;
 use limewave_core::document::load_wav_bytes;
 use limewave_core::dsp::is_upward;
-use limewave_core::edit::LoopMode;
+use limewave_core::edit::{LoopMode, Marker};
 use limewave_core::effects::Effect;
 use limewave_core::riff::Chunk;
 use limewave_core::smpl::{Smpl, SmplLoop};
@@ -54,6 +56,11 @@ fn looped_bytes() -> Vec<u8> {
 
 /// An app showing the looped file on its own (no file list), after one frame.
 fn looped_harness() -> Harness<'static, LimewaveApp> {
+    looped_harness_with_dt(0.25)
+}
+
+/// `looped_harness` with `step_dt` seconds between frames.
+fn looped_harness_with_dt(step_dt: f32) -> Harness<'static, LimewaveApp> {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("loop.wav");
     std::fs::write(&path, looped_bytes()).unwrap();
@@ -61,6 +68,7 @@ fn looped_harness() -> Harness<'static, LimewaveApp> {
     app.open_file(path);
     let mut harness = Harness::builder()
         .with_size(eframe::egui::vec2(1100.0, 700.0))
+        .with_step_dt(step_dt)
         // The seam readout uses an arrow that the test font set lacks.
         .allow_missing_glyphs()
         .build_ui_state(|ui, app: &mut LimewaveApp| app.show(ui), app);
@@ -98,6 +106,30 @@ fn drag(h: &mut Harness<'static, LimewaveApp>, from: Pos2, to: Pos2) {
     }
     h.drop_at(to);
     h.step();
+}
+
+/// Two clicks at `at`, a frame apart: build the harness with a `step_dt` of well under 0.3 s
+/// for them to count as a double-click.
+fn double_click(h: &mut Harness<'static, LimewaveApp>, at: Pos2) {
+    h.hover_at(at);
+    h.step();
+    for _ in 0..2 {
+        for pressed in [true, false] {
+            h.event(Event::PointerButton {
+                pos: at,
+                button: PointerButton::Primary,
+                pressed,
+                modifiers: Modifiers::NONE,
+            });
+        }
+        h.step();
+    }
+}
+
+/// Where the flag of `marker` is, in the current view.
+fn flag_pos(h: &Harness<'static, LimewaveApp>, marker: Marker) -> Pos2 {
+    let s = session(h);
+    flag_hit_point(waveform_rect(h), &s.view.unwrap(), s.edit(), marker)
 }
 
 #[test]
@@ -163,6 +195,95 @@ fn dragging_empty_space_changes_nothing() {
     let s = session(&h);
     assert!(!s.history.is_dirty());
     assert!(s.preview.is_none());
+}
+
+#[test]
+fn dragging_a_marker_by_its_label_is_one_undo_step() {
+    let mut h = looped_harness();
+    let before = session(&h).edit().clone();
+
+    let from = flag_pos(&h, Marker::LoopEnd);
+    drag(&mut h, from, from + eframe::egui::vec2(-60.0, 0.0));
+
+    let s = session(&h);
+    let moved = s.edit().loop_end;
+    assert!(
+        moved < LOOP_END as usize - 100,
+        "the flag dragged its marker"
+    );
+    assert!(
+        is_upward(&s.mono, moved + 1),
+        "loop end + 1 = {} is not an upward zero crossing",
+        moved + 1
+    );
+    assert_eq!(s.edit().loop_start, before.loop_start);
+    assert!(s.preview.is_none());
+
+    let FileEntry::Loaded(s) = &mut h.state_mut().files[0] else {
+        unreachable!()
+    };
+    s.undo(None);
+    assert_eq!(*s.edit(), before, "one undo restores the original");
+    assert!(!s.history.is_dirty());
+}
+
+#[test]
+fn double_clicking_a_label_types_an_exact_position() {
+    let mut h = looped_harness_with_dt(0.05);
+    let before = session(&h).edit().clone();
+
+    let at = flag_pos(&h, Marker::LoopEnd);
+    double_click(&mut h, at);
+    h.run();
+    h.get_by_label("Loop end position").focus();
+    h.run();
+    h.get_by_label("Loop end position").type_text("4000");
+    h.run();
+    h.key_press(Key::Enter);
+    h.run();
+
+    let s = session(&h);
+    assert_eq!(s.edit().loop_end, 4000, "no snapping on typed positions");
+    assert_eq!(s.edit().loop_start, before.loop_start);
+    assert!(h.state().ui.marker_entry.is_none(), "the field closed");
+    let FileEntry::Loaded(s) = &mut h.state_mut().files[0] else {
+        unreachable!()
+    };
+    s.undo(None);
+    assert_eq!(*s.edit(), before, "one undo restores the original");
+    assert!(!s.history.is_dirty());
+}
+
+#[test]
+fn escape_and_bad_text_leave_a_typed_position_unchanged() {
+    let mut h = looped_harness_with_dt(0.05);
+    let before = session(&h).edit().clone();
+
+    let at = flag_pos(&h, Marker::LoopEnd);
+    double_click(&mut h, at);
+    h.run();
+    h.get_by_label("Loop end position").focus();
+    h.run();
+    h.get_by_label("Loop end position").type_text("4000");
+    h.run();
+    h.key_press(Key::Escape);
+    h.run();
+    assert_eq!(*session(&h).edit(), before);
+    assert!(!session(&h).history.is_dirty());
+    assert!(h.state().ui.marker_entry.is_none(), "Escape closed it");
+
+    let at = flag_pos(&h, Marker::Start);
+    double_click(&mut h, at);
+    h.run();
+    h.get_by_label("Start position").focus();
+    h.run();
+    h.get_by_label("Start position").type_text("abc");
+    h.run();
+    h.key_press(Key::Enter);
+    h.run();
+    assert_eq!(*session(&h).edit(), before);
+    assert!(!session(&h).history.is_dirty());
+    assert!(h.state().ui.marker_entry.is_none(), "bad text closed it");
 }
 
 #[test]

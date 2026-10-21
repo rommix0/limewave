@@ -1,5 +1,6 @@
 //! Frame/pixel mapping for the waveform views, plus marker hit testing.
 
+use eframe::egui::{Pos2, Rect, Vec2, pos2};
 use limewave_core::edit::{EditState, LoopMode, Marker};
 
 /// The fewest frames per pixel (most zoomed in): 16 pixels per frame.
@@ -100,6 +101,28 @@ pub fn hit_marker(
         .map(|(m, _)| m)
 }
 
+/// The rectangle of a marker's flag: end-side flags hang left of `anchor`, start-side flags
+/// extend right from it.
+pub fn flag_rect(anchor: Pos2, flag_left: bool, size: Vec2) -> Rect {
+    let min = if flag_left {
+        pos2(anchor.x - size.x, anchor.y)
+    } else {
+        anchor
+    };
+    Rect::from_min_size(min, size)
+}
+
+/// The marker under `pos`: a flag containing it wins (the last drawn, topmost one among
+/// overlapping flags), otherwise the marker whose line is near (`line`).
+pub fn pick_marker(flags: &[(Marker, Rect)], line: Option<Marker>, pos: Pos2) -> Option<Marker> {
+    flags
+        .iter()
+        .rev()
+        .find(|(_, rect)| rect.contains(pos))
+        .map(|&(m, _)| m)
+        .or(line)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -166,6 +189,38 @@ mod tests {
             assert!(v.first.is_finite() && v.frames_per_px.is_finite());
             assert!(v.first >= 0.0 && v.frames_per_px >= MIN_FRAMES_PER_PX);
         }
+    }
+
+    #[test]
+    fn flag_rect_hangs_left_for_end_side_flags() {
+        let anchor = pos2(100.0, 30.0);
+        let size = Vec2::new(30.0, 14.0);
+        assert_eq!(flag_rect(anchor, false, size).min, anchor);
+        let left = flag_rect(anchor, true, size);
+        assert_eq!((left.min, left.max), (pos2(70.0, 30.0), pos2(100.0, 44.0)));
+    }
+
+    #[test]
+    fn label_wins_over_a_nearby_line() {
+        let start = Rect::from_min_size(pos2(10.0, 20.0), Vec2::new(30.0, 14.0));
+        let end = Rect::from_min_size(pos2(30.0, 20.0), Vec2::new(30.0, 14.0));
+        let flags = [(Marker::Start, start), (Marker::End, end)];
+        let inside = pos2(15.0, 25.0);
+        assert_eq!(
+            pick_marker(&flags, Some(Marker::LoopStart), inside),
+            Some(Marker::Start)
+        );
+        let outside = pos2(15.0, 60.0);
+        assert_eq!(
+            pick_marker(&flags, Some(Marker::LoopStart), outside),
+            Some(Marker::LoopStart)
+        );
+        assert_eq!(pick_marker(&flags, None, outside), None);
+        // Overlapping flags: the one drawn last is on top.
+        assert_eq!(
+            pick_marker(&flags, None, pos2(35.0, 25.0)),
+            Some(Marker::End)
+        );
     }
 
     fn edit(start: usize, loop_start: usize, loop_end: usize, end: usize) -> EditState {
