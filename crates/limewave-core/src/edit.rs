@@ -152,6 +152,60 @@ pub fn move_marker(
     s.clamped(frames)
 }
 
+/// Makes the selection the loop. A loop that is off becomes forward; other modes are kept.
+/// Start and End move outward to include the selection.
+pub fn set_loop_to_selection(e: &EditState, sel: (usize, usize), frames: usize) -> EditState {
+    let (lo, hi) = (sel.0.min(sel.1), sel.0.max(sel.1));
+    let loop_mode = match e.loop_mode {
+        LoopMode::Off => LoopMode::Forward,
+        mode => mode,
+    };
+    EditState {
+        start: e.start.min(lo),
+        end: e.end.max(hi),
+        loop_mode,
+        loop_start: lo,
+        loop_end: hi,
+        ..e.clone()
+    }
+    .clamped(frames)
+}
+
+/// Makes the selection the trim. Fails when the loop is on and does not lie inside it.
+pub fn set_trim_to_selection(e: &EditState, sel: (usize, usize)) -> Result<EditState, String> {
+    let (lo, hi) = (sel.0.min(sel.1), sel.0.max(sel.1));
+    if e.loop_mode != LoopMode::Off && (e.loop_start < lo || e.loop_end > hi) {
+        return Err("The loop lies outside the selection; move the loop or select more".into());
+    }
+    Ok(EditState {
+        start: lo,
+        end: hi,
+        ..e.clone()
+    })
+}
+
+/// Ends the sample `padding` frames after the loop end (at most the last frame). Unchanged
+/// when the loop is off.
+pub fn trim_after_loop(e: &EditState, padding: usize, frames: usize) -> EditState {
+    if e.loop_mode == LoopMode::Off {
+        return e.clone();
+    }
+    let end = e
+        .loop_end
+        .saturating_add(padding)
+        .min(frames.saturating_sub(1));
+    move_marker(e, Marker::End, end, false, frames)
+}
+
+/// As [`trim_after_loop`], and also starts the sample at the loop start.
+pub fn crop_to_loop(e: &EditState, padding: usize, frames: usize) -> EditState {
+    let t = trim_after_loop(e, padding, frames);
+    if t.loop_mode == LoopMode::Off {
+        return t;
+    }
+    move_marker(&t, Marker::Start, t.loop_start, false, frames)
+}
+
 /// Linear undo/redo history of edit states, tracking which one was last saved.
 pub struct History {
     entries: Vec<EditState>,
@@ -403,5 +457,66 @@ mod tests {
         h.push(init);
         assert!(!h.undo());
         assert!(!h.is_dirty());
+    }
+
+    #[test]
+    fn loop_to_selection_turns_the_loop_on_and_widens_the_trim() {
+        let base = EditState {
+            start: 100,
+            end: 800,
+            loop_start: 400,
+            loop_end: 500,
+            ..EditState::default_for(1000)
+        };
+        let e = set_loop_to_selection(&base, (50, 300), 1000);
+        assert_eq!(e.loop_mode, LoopMode::Forward);
+        assert_eq!((e.loop_start, e.loop_end), (50, 300));
+        assert_eq!((e.start, e.end), (50, 800));
+
+        for mode in [LoopMode::PingPong, LoopMode::Backward] {
+            let m = EditState {
+                loop_mode: mode,
+                ..base.clone()
+            };
+            assert_eq!(set_loop_to_selection(&m, (50, 300), 1000).loop_mode, mode);
+        }
+
+        let e = set_loop_to_selection(&base, (10, 10), 1000);
+        assert_eq!((e.loop_start, e.loop_end), (10, 11));
+    }
+
+    #[test]
+    fn trim_to_selection_refuses_to_strand_the_loop() {
+        let e = looped(1000, 999, 300, 500);
+        assert!(set_trim_to_selection(&e, (200, 400)).is_err());
+        assert_eq!(
+            set_trim_to_selection(&e, (200, 400)).unwrap_err(),
+            "The loop lies outside the selection; move the loop or select more"
+        );
+        let t = set_trim_to_selection(&e, (250, 600)).unwrap();
+        assert_eq!((t.start, t.end), (250, 600));
+
+        let off = EditState::default_for(1000);
+        let t = set_trim_to_selection(&off, (200, 400)).unwrap();
+        assert_eq!((t.start, t.end), (200, 400));
+    }
+
+    #[test]
+    fn trim_after_loop_and_crop_to_loop() {
+        let e = EditState {
+            start: 100,
+            ..looped(1000, 999, 300, 500)
+        };
+        let t = trim_after_loop(&e, 16, 1000);
+        assert_eq!((t.start, t.end), (100, 516));
+        let c = crop_to_loop(&e, 16, 1000);
+        assert_eq!((c.start, c.end), (300, 516));
+        assert_eq!(trim_after_loop(&e, 0, 1000).end, 500);
+        assert_eq!(trim_after_loop(&e, 900, 1000).end, 999);
+        assert_eq!(crop_to_loop(&e, 900, 1000).end, 999);
+
+        let off = EditState::default_for(1000);
+        assert_eq!(trim_after_loop(&off, 16, 1000), off);
+        assert_eq!(crop_to_loop(&off, 16, 1000), off);
     }
 }

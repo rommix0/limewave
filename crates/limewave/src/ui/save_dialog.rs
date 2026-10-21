@@ -6,7 +6,7 @@ use eframe::egui::{
     self, Button, DragValue, Grid, RadioButton, RichText, ScrollArea, TextEdit, Ui,
 };
 use limewave_core::document::load_wav;
-use limewave_core::edit::{EditState, LoopMode, Marker, move_marker};
+use limewave_core::edit::{self, EditState};
 use limewave_core::save::{Destination, SaveOutcome, default_folder, save_wav};
 use limewave_core::software_tag;
 
@@ -377,14 +377,8 @@ fn save_session(
 ) -> Result<SaveOutcome, String> {
     let frames = s.doc.frames;
     let mut e = s.edit().clone();
-    if let Some(padding) = trim_after_loop
-        && e.loop_mode != LoopMode::Off
-    {
-        let end = e
-            .loop_end
-            .saturating_add(padding)
-            .min(frames.saturating_sub(1));
-        e = move_marker(&e, Marker::End, end, false, frames);
+    if let Some(padding) = trim_after_loop {
+        e = edit::trim_after_loop(&e, padding, frames);
     }
     let crossfaded = mixes_crossfade(&e.clone().clamped(frames));
     let outcome =
@@ -474,6 +468,7 @@ mod tests {
     use std::path::Path;
 
     use limewave_core::document::load_wav;
+    use limewave_core::edit::LoopMode;
     use limewave_core::riff::Chunk;
     use limewave_core::smpl::{Smpl, SmplLoop};
     use limewave_core::testwav::{sine, wav_bytes};
