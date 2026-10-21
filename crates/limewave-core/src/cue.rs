@@ -81,11 +81,10 @@ pub fn cue_bytes(points: &[CuePoint]) -> Vec<u8> {
 fn parse_adtl(data: &[u8]) -> Result<Vec<Chunk>, String> {
     let body = data.get(4..).unwrap_or_default();
     let mut subs = Vec::new();
+    // Trailing zero bytes are padding, not entries; find where they start once.
+    let tail = body.iter().rposition(|b| *b != 0).map_or(0, |i| i + 1);
     let mut pos = 0;
-    while pos < body.len() {
-        if body[pos..].iter().all(|b| *b == 0) {
-            break;
-        }
+    while pos < tail {
         if pos + SUB_HEADER_LEN > body.len() {
             return Err(format!(
                 "LIST/adtl has {} stray bytes at its end",
@@ -152,8 +151,10 @@ pub fn check_markers(chunks: &[Chunk]) -> Result<(), String> {
 /// audio. `map` sends an original frame to where its sound lands (a reverse mirrors it);
 /// `start..=end` are the saved frames, and positions are counted from `start`.
 ///
-/// - A point cue is kept when `start <= map(position) <= end`. Its `position` and
-///   `sample_offset` become `map(old) - start`, each from its own old value.
+/// - A point cue is kept when `start <= map(position) <= end + 1`; `end + 1` is the exclusive
+///   end, where some editors put an end-of-file marker, and it becomes the saved length. Its
+///   `position` and `sample_offset` become `map(old) - start`, each from its own old value.
+///   (Ranges below are not given this extra frame.)
 /// - A cue with an `ltxt` range `[p, p + len - 1]` maps both ends, orders them, clips them to
 ///   `start..=end` and is kept when anything is left. Its position becomes the clipped low end
 ///   minus `start`, and the `ltxt` length the clipped length.
@@ -191,11 +192,13 @@ pub fn remap_markers(
         let moved = match range {
             None => {
                 let at = map(p.position as usize);
-                (start..=end).contains(&at).then_some(CuePoint {
-                    position: shift(at),
-                    sample_offset: shift(map(p.sample_offset as usize)),
-                    ..*p
-                })
+                (start..=end.saturating_add(1))
+                    .contains(&at)
+                    .then_some(CuePoint {
+                        position: shift(at),
+                        sample_offset: shift(map(p.sample_offset as usize)),
+                        ..*p
+                    })
             }
             Some(i) => {
                 let len = u32_at(&subs[i].data, 4);
@@ -333,9 +336,32 @@ mod tests {
         assert_eq!((c[0].id, c[0].position), (2, 400));
         assert_eq!(subs(&chunks), vec![labl(2, "b")]);
         // A cue after End goes too.
-        let mut chunks = vec![cue_chunk(&[point(1, 500), point(2, 900)])];
+        let mut chunks = vec![cue_chunk(&[point(1, 500), point(2, 901)])];
         remap_markers(&mut chunks, &|f| f, 0, 899).unwrap();
         assert_eq!(cues(&chunks), vec![point(1, 500)]);
+    }
+
+    #[test]
+    fn end_of_file_cue_is_kept_at_the_saved_length() {
+        // A point cue on the exclusive end (frame 1000 of 1000) survives; one frame later does not.
+        let mut chunks = vec![cue_chunk(&[point(1, 1000), point(2, 1001)])];
+        remap_markers(&mut chunks, &|f| f, 100, 999).unwrap();
+        assert_eq!(cues(&chunks), vec![point(1, 900)]);
+        // A range ending past the audio is still clipped, not extended.
+        let mut chunks = vec![cue_chunk(&[point(1, 990)]), adtl_chunk(&[ltxt(1, 20)])];
+        remap_markers(&mut chunks, &|f| f, 0, 999).unwrap();
+        assert_eq!(u32_at(&subs(&chunks)[0].data, 4), 10);
+    }
+
+    #[test]
+    fn huge_zero_filled_adtl_parses_in_linear_time() {
+        // Zero bytes then one nonzero byte used to cost quadratic time.
+        let mut data = b"adtl".to_vec();
+        data.resize(4 + (1 << 20), 0);
+        data.push(1);
+        let started = std::time::Instant::now();
+        let _ = parse_adtl(&data);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 
     #[test]

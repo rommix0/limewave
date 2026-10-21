@@ -251,12 +251,20 @@ pub fn build_wav_bytes(doc: &WavDocument, e: &EditState) -> Vec<u8> {
         .and_then(|bytes| parse_fmt(bytes).ok())
         .unwrap_or(doc.format);
     let mut data = Some(edited_data(doc, &e, audio, &format));
-    let saved_frames = if doc.frames == 0 {
-        0
-    } else {
-        e.end - e.start + 1
-    };
-    let fact_frames = u32::try_from(saved_frames)
+    // With no trim and no marker-mirroring reverse, no frame moves: cue and `fact` chunks are
+    // written back as they are, so a save with no edits stays byte for byte.
+    let frames_move = doc.frames != 0
+        && (e.start != 0
+            || e.end + 1 != doc.frames
+            || e.effects.iter().any(|a| {
+                matches!(
+                    a.op,
+                    Op::Reverse {
+                        mirror_markers: true
+                    }
+                )
+            }));
+    let fact_frames = u32::try_from(e.end - e.start + 1)
         .unwrap_or(u32::MAX)
         .to_le_bytes();
     let mut data_at = None;
@@ -273,7 +281,9 @@ pub fn build_wav_bytes(doc: &WavDocument, e: &EditState) -> Vec<u8> {
                 }
             }
             // The frame count follows the saved length.
-            b"fact" if c.data.len() >= 4 => c.data[..4].copy_from_slice(&fact_frames),
+            b"fact" if frames_move && c.data.len() >= 4 => {
+                c.data[..4].copy_from_slice(&fact_frames)
+            }
             // Only the first `data` chunk is the audio; later duplicates pass through.
             b"data" if data.is_some() => {
                 c.data = data.take().unwrap_or_default();
@@ -296,7 +306,9 @@ pub fn build_wav_bytes(doc: &WavDocument, e: &EditState) -> Vec<u8> {
     }
     // Cue positions follow the trim and the reverses. An unreadable chunk stays as it is;
     // loading has already warned.
-    let _ = remap_markers(&mut chunks, &|f| map_frame(&e.effects, f), e.start, e.end);
+    if frames_move {
+        let _ = remap_markers(&mut chunks, &|f| map_frame(&e.effects, f), e.start, e.end);
+    }
     if let Some(bytes) = smpl {
         let at = data_at.map_or(chunks.len(), |i| i + 1);
         chunks.insert(
@@ -703,15 +715,24 @@ mod tests {
         };
         let mut adtl = b"adtl".to_vec();
         adtl.extend_from_slice(b"labl\x06\0\0\0\x01\0\0\0a\0");
-        let mut ltxt = vec![1, 0, 0, 0, 50, 0, 0, 0];
+        // Cue 2 is a range that overruns the audio (3990..4040 of 4000 frames).
+        let mut ltxt = vec![2, 0, 0, 0, 50, 0, 0, 0];
         ltxt.extend_from_slice(b"rgn \0\0\0\0\0\0\0\0");
         adtl.extend_from_slice(&[b'l', b't', b'x', b't', 20, 0, 0, 0]);
         adtl.extend_from_slice(&ltxt);
+        let cues = [
+            cue_point(1, 600),
+            cue_point(2, 3990),
+            // An end-of-file marker, and one well past the audio.
+            cue_point(3, FRAMES as u32),
+            cue_point(4, 9000),
+        ];
         let bytes = file(
             vec![
-                chunk(b"fact", (FRAMES as u32).to_le_bytes().to_vec()),
+                // The count disagrees with the real length: a no-edit save leaves it.
+                chunk(b"fact", 1234u32.to_le_bytes().to_vec()),
                 chunk(b"smpl", smpl.to_bytes()),
-                chunk(b"cue ", cue_bytes(&[cue_point(1, 600)])),
+                chunk(b"cue ", cue_bytes(&cues)),
                 chunk(b"LIST", adtl),
                 chunk(b"abcd", vec![1, 2, 3]),
                 info(&[(b"INAM", "Lead"), (b"ISFT", &tag)]),
@@ -720,6 +741,44 @@ mod tests {
         );
         let d = doc(&bytes);
         assert_eq!(build_wav_bytes(&d, &d.initial_edit()), bytes);
+    }
+
+    #[test]
+    fn end_of_file_cue_follows_a_trim() {
+        let eof = FRAMES as u32;
+        let bytes = file(
+            vec![chunk(
+                b"cue ",
+                cue_bytes(&[cue_point(1, 500), cue_point(2, eof)]),
+            )],
+            vec![],
+        );
+        let d = doc(&bytes);
+        let positions = |e: &EditState| {
+            let c = chunks(&build_wav_bytes(&d, e));
+            let cues = parse_cue(&c[find(&c, b"cue ").unwrap()].data).unwrap();
+            cues.iter().map(|p| (p.id, p.position)).collect::<Vec<_>>()
+        };
+        // A head trim moves the end-of-file cue to the new length.
+        let head = EditState {
+            start: 100,
+            ..d.initial_edit()
+        };
+        assert_eq!(positions(&head), vec![(1, 400), (2, eof - 100)]);
+        // A tail trim ending just before a cue keeps it as the new end-of-file marker.
+        let tail = EditState {
+            end: 2999,
+            ..d.initial_edit()
+        };
+        assert_eq!(positions(&tail), vec![(1, 500)]);
+        let cue_at_end = file(
+            vec![chunk(b"cue ", cue_bytes(&[cue_point(1, 3000)]))],
+            vec![],
+        );
+        let d2 = doc(&cue_at_end);
+        let c = chunks(&build_wav_bytes(&d2, &tail));
+        let cues = parse_cue(&c[find(&c, b"cue ").unwrap()].data).unwrap();
+        assert_eq!(cues[0].position, 3000);
     }
 
     #[test]
