@@ -309,6 +309,20 @@ impl Voice {
         }
     }
 
+    /// Fades the voice out from its current level over `ms`, whatever stage it is in. Used when
+    /// the voice is stolen, so it ends quickly without a jump.
+    pub fn fade_out(&mut self, ms: f32) {
+        self.stage = Stage::Release;
+        self.stage_pos = 0;
+        self.release_from = self.level;
+        self.adsr.release_ms = ms;
+    }
+
+    /// Whether the voice is in its release.
+    pub fn is_releasing(&self) -> bool {
+        self.stage == Stage::Release
+    }
+
     pub fn note(&self) -> u8 {
         self.note
     }

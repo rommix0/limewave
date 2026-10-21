@@ -101,9 +101,16 @@ impl Default for Cursors {
     }
 }
 
+/// How long a stolen voice takes to fade out.
+const STEAL_FADE_MS: f32 = 5.0;
+/// Spare slots where stolen voices fade out.
+const DYING_VOICES: usize = 4;
+
 /// Voice slots owned by the audio callback.
 pub struct MixerState {
     voices: [Option<Voice>; MAX_VOICES],
+    /// Stolen voices finishing their short fade. They are not cursors and take no commands.
+    dying: [Option<Voice>; DYING_VOICES],
     age: [u64; MAX_VOICES],
     counter: u64,
     /// The envelope new voices start with.
@@ -114,6 +121,7 @@ impl MixerState {
     pub fn new() -> MixerState {
         MixerState {
             voices: [const { None }; MAX_VOICES],
+            dying: [const { None }; DYING_VOICES],
             age: [0; MAX_VOICES],
             counter: 0,
             adsr: Adsr::DEFAULT,
@@ -143,7 +151,9 @@ impl MixerState {
     }
 
     /// Releases any voice already playing `note`, then starts a new one in a free slot. With no
-    /// free slot the sounding voice is restarted in place, or else the oldest voice is stolen.
+    /// free slot a voice is stolen: the one that was playing `note`, else the oldest releasing
+    /// voice, else the oldest. The stolen voice fades out over [`STEAL_FADE_MS`] in a spare
+    /// slot rather than being cut.
     fn note_on(
         &mut self,
         note: u8,
@@ -159,19 +169,46 @@ impl MixerState {
                 existing = Some(i);
             }
         }
-        let slot = self
-            .voices
-            .iter()
-            .position(Option::is_none)
-            .or(existing)
-            .unwrap_or_else(|| self.oldest());
+        let slot = match self.voices.iter().position(Option::is_none) {
+            Some(free) => free,
+            None => {
+                let victim = existing.unwrap_or_else(|| self.victim());
+                self.retire(victim);
+                victim
+            }
+        };
         self.voices[slot] = Some(Voice::new(note, from, buf, device_rate, self.adsr, stop_at));
         self.age[slot] = self.counter;
         self.counter += 1;
     }
 
-    fn oldest(&self) -> usize {
-        (0..MAX_VOICES).min_by_key(|&i| self.age[i]).unwrap_or(0)
+    /// The slot to steal: the oldest releasing voice, else the oldest voice.
+    fn victim(&self) -> usize {
+        let held = |i: usize| !self.voices[i].as_ref().is_some_and(Voice::is_releasing);
+        (0..MAX_VOICES)
+            .min_by_key(|&i| (held(i), self.age[i]))
+            .unwrap_or(0)
+    }
+
+    /// Moves the voice in `slot` to a spare slot to fade out. With every spare slot busy, the
+    /// quietest dying voice there makes way.
+    fn retire(&mut self, slot: usize) {
+        let Some(mut v) = self.voices[slot].take() else {
+            return;
+        };
+        v.fade_out(STEAL_FADE_MS);
+        let spare = self
+            .dying
+            .iter()
+            .position(Option::is_none)
+            .or_else(|| {
+                (0..DYING_VOICES).min_by(|&a, &b| {
+                    let level = |i: usize| self.dying[i].as_ref().map_or(0.0, Voice::level);
+                    level(a).total_cmp(&level(b))
+                })
+            })
+            .unwrap_or(0);
+        self.dying[spare] = Some(v);
     }
 }
 
@@ -182,7 +219,8 @@ impl Default for MixerState {
 }
 
 /// The body of the audio callback: applies pending commands (new notes play `current`), then
-/// fills interleaved `out` (cleared first) with the mixed voices, clamped to [-1, 1]. Each
+/// fills interleaved `out` (cleared first) with the mixed voices, stolen ones still fading
+/// included, clamped to [-1, 1]. Each
 /// voice plays whichever of `current` and `previous` has its source; a voice whose source is
 /// in neither is dropped. Afterwards the voices' positions are published to `cursors`. Does not
 /// allocate.
@@ -202,7 +240,7 @@ pub fn process(
     }
     out.fill(0.0);
     if channels > 0 {
-        for slot in &mut state.voices {
+        for slot in state.voices.iter_mut().chain(&mut state.dying) {
             let Some(v) = slot else { continue };
             let buf = [current, previous]
                 .into_iter()
@@ -665,6 +703,66 @@ mod tests {
         let mut notes = active(&state);
         notes.sort_unstable();
         assert_eq!(notes, (60..68).collect::<Vec<u8>>());
+    }
+
+    #[test]
+    fn a_stolen_voice_fades_out_instead_of_cutting() {
+        // Eight voices of 0.1 stay below the output clamp, so every step shows.
+        let b = constant(1, 0.1);
+        let (mut tx, mut rx) = rtrb::RingBuffer::new(256);
+        let mut state = MixerState::new();
+        // A 5 ms (240 frame) attack, so the new note itself rises slowly too.
+        let slow = Adsr {
+            attack_ms: 5.0,
+            decay_ms: 0.0,
+            sustain: 1.0,
+            release_ms: 1000.0,
+        };
+        tx.push(Command::SetEnvelope(slow)).unwrap();
+        for note in 60..68 {
+            tx.push(Command::NoteOn { note, from: 0 }).unwrap();
+        }
+        let mut out = left(&block(&mut state, &b, &mut rx, 400));
+        tx.push(Command::NoteOn { note: 68, from: 0 }).unwrap();
+        out.extend(left(&block(&mut state, &b, &mut rx, 600)));
+        assert!(
+            (out[399] - 0.8).abs() < 1e-5,
+            "eight held voices: {}",
+            out[399]
+        );
+
+        let worst = out[300..]
+            .windows(2)
+            .map(|w| (w[1] - w[0]).abs())
+            .fold(0.0f32, f32::max);
+        assert!(worst <= 2.0 * 0.1 / 240.0 + 1e-6, "a step of {worst}");
+        let mut notes = active(&state);
+        notes.sort_unstable();
+        assert_eq!(notes, (61..69).collect::<Vec<u8>>());
+        assert!((out[999] - 0.8).abs() < 1e-5, "the stolen voice is gone");
+    }
+
+    #[test]
+    fn a_releasing_voice_is_stolen_before_a_held_one() {
+        let b = constant(1, 0.1);
+        let (mut tx, mut rx) = rtrb::RingBuffer::new(256);
+        let mut state = MixerState::new();
+        tx.push(Command::SetEnvelope(Adsr {
+            release_ms: 1000.0,
+            ..FLAT
+        }))
+        .unwrap();
+        // 60 is the oldest and still held; 67 is the newest and releasing.
+        for note in 60..68 {
+            tx.push(Command::NoteOn { note, from: 0 }).unwrap();
+        }
+        tx.push(Command::NoteOff { note: 67 }).unwrap();
+        block(&mut state, &b, &mut rx, 64);
+        tx.push(Command::NoteOn { note: 68, from: 0 }).unwrap();
+        block(&mut state, &b, &mut rx, 1);
+        let mut notes = active(&state);
+        notes.sort_unstable();
+        assert_eq!(notes, [60, 61, 62, 63, 64, 65, 66, 68]);
     }
 
     #[test]
