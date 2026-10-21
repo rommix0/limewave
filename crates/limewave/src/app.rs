@@ -1417,6 +1417,7 @@ mod tests {
     #[test]
     fn session_shows_the_acid_root_of_a_file_without_smpl() {
         let mut acid = vec![0; 24];
+        acid[0] = 0x02; // root note set
         acid[4..6].copy_from_slice(&57u16.to_le_bytes());
         let bytes = wav_bytes(
             &[sine(220.0, 44100, 100, 0.5)],
