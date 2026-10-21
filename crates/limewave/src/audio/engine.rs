@@ -658,6 +658,49 @@ mod tests {
     }
 
     #[test]
+    fn repeating_the_same_envelope_does_not_delay_a_release() {
+        let b = looping();
+        let (mut tx, mut rx) = rtrb::RingBuffer::new(256);
+        let mut state = MixerState::new();
+        tx.push(Command::SetEnvelope(FLAT)).unwrap();
+        tx.push(Command::NoteOn { note: 60, from: 0 }).unwrap();
+        block(&mut state, &b, &mut rx, 64);
+        tx.push(Command::NoteOff { note: 60 }).unwrap();
+        // As while a slider is dragged: the same envelope arrives every block.
+        for _ in 0..48 {
+            tx.push(Command::SetEnvelope(FLAT)).unwrap();
+            block(&mut state, &b, &mut rx, 10);
+        }
+        assert!(
+            active(&state).is_empty(),
+            "died after its 480-frame release"
+        );
+    }
+
+    #[test]
+    fn saves_that_move_the_audio_release_held_voices_without_a_step() {
+        // As `perform_save` does when a save gives the file a new source: `AllOff`, then the
+        // new buffer. Two such saves in a row.
+        let (mut cb, swap, mut tx) = callback(empty_buffer(RATE));
+        let mut retired = vec![swap.swap(Arc::new(constant(2, 0.25)))];
+        tx.push(Command::SetEnvelope(FLAT)).unwrap();
+        tx.push(Command::NoteOn { note: 60, from: 0 }).unwrap();
+        let mut out = left(&render(&mut cb, 64));
+        for source in [3, 4] {
+            tx.push(Command::AllOff).unwrap();
+            retired.push(swap.swap(Arc::new(constant(source, 0.25))));
+            out.extend(left(&render(&mut cb, 600)));
+        }
+        assert!((out[0] - 0.25).abs() < 1e-6, "the note sounded");
+        let worst = out
+            .windows(2)
+            .map(|w| (w[1] - w[0]).abs())
+            .fold(0.0f32, f32::max);
+        assert!(worst <= 0.25 / 480.0 + 1e-6, "a step of {worst}");
+        assert!(out.ends_with(&[0.0]), "the voice has finished");
+    }
+
+    #[test]
     fn engine_zero_channels_does_not_panic() {
         let b = looping();
         let (mut tx, mut rx) = rtrb::RingBuffer::new(256);

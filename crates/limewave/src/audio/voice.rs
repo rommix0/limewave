@@ -274,8 +274,12 @@ impl Voice {
     }
 
     /// Changes the release time. A voice already releasing carries on from the level it has
-    /// reached, taking the new time to reach 0, so there is no jump.
+    /// reached, taking the new time to reach 0, so there is no jump. The same time again
+    /// changes nothing, so a repeated envelope never holds a release back.
     pub fn set_release_ms(&mut self, ms: f32) {
+        if ms == self.adsr.release_ms {
+            return;
+        }
         self.adsr.release_ms = ms;
         if self.stage == Stage::Release {
             self.stage_pos = 0;

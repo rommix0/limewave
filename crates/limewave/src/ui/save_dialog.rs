@@ -11,6 +11,7 @@ use limewave_core::save::{Destination, SaveOutcome, default_folder, save_wav};
 use limewave_core::software_tag;
 
 use crate::app::{FileEntry, LimewaveApp, Session};
+use crate::audio::engine::Command;
 use crate::theme::colors;
 
 /// One file's save result: the source path and what was written, or why not.
@@ -363,12 +364,17 @@ fn effective_destination(s: &Session, dest: &Destination) -> Destination {
 /// Saves `s` to `dest` and rebases it on the written file. A failed save leaves `s` as it
 /// was. If the file was written but cannot be reopened, `s` is kept, marked saved, and the
 /// reload error is returned.
+///
+/// The rebased session keeps `s.source` when the save moved no frame (Start at 0, same frame
+/// and channel counts), so voices still sounding keep following the file's edits. Otherwise
+/// it gets a new source.
 fn save_session(
     s: &mut Session,
     dest: &Destination,
     trim_after_loop: Option<usize>,
 ) -> Result<SaveOutcome, String> {
     let frames = s.doc.frames;
+    let channels = s.doc.audio.len();
     let mut e = s.edit().clone();
     if let Some(padding) = trim_after_loop {
         e = edit::trim_after_loop(&e, padding, frames);
@@ -378,9 +384,13 @@ fn save_session(
         save_wav(&s.doc, &e, &effective_destination(s, dest)).map_err(|err| err.to_string())?;
     match load_wav(&outcome.written) {
         Ok(doc) => {
+            let unmoved = e.start == 0 && doc.frames == frames && doc.audio.len() == channels;
             let mut rebased = Session::new(doc);
             if rebased.doc.frames == frames {
                 rebased.view = s.view;
+            }
+            if unmoved {
+                rebased.source = s.source;
             }
             rebased.destination = Some(dest.clone());
             rebased.just_saved = crossfaded;
@@ -401,6 +411,9 @@ fn save_session(
 
 /// Saves the files of `req` one by one, rebasing each saved session on its new file, and
 /// hands the selected file's new sound to the audio engine. Only `save_wav` writes.
+///
+/// When a save gives the selected file a new source (its frames moved), every note is
+/// released first: the voices fade out on the old audio instead of freezing on it.
 pub fn perform_save(app: &mut LimewaveApp, req: SaveRequest) -> Vec<SaveResult> {
     let mut results = Vec::with_capacity(req.indices.len());
     for &i in &req.indices {
@@ -412,11 +425,15 @@ pub fn perform_save(app: &mut LimewaveApp, req: SaveRequest) -> Vec<SaveResult> 
             continue;
         };
         let source = s.doc.path.clone();
+        let old_source = s.source;
         let result = save_session(s, &req.destination, req.trim_after_loop);
         if result.is_ok()
             && app.selected == Some(i)
-            && let Some(engine) = &app.engine
+            && let Some(engine) = &mut app.engine
         {
+            if s.source != old_source {
+                engine.send(Command::AllOff);
+            }
             engine.set_buffer(s.play_buffer());
         }
         results.push((source, result));
@@ -727,6 +744,37 @@ mod tests {
         assert!(!s.history.is_dirty());
         assert_eq!(s.destination, Some(Destination::Folder(out.clone())));
         assert_eq!(std::fs::read(&source).unwrap(), original);
+    }
+
+    #[test]
+    fn a_save_keeps_the_audio_source_unless_frames_move() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = write_looped(dir.path(), "tone.wav");
+        let out = dir.path().join("out");
+        let mut app = app_with(std::slice::from_ref(&source));
+        let s = session(&mut app, 0);
+        let id = s.source;
+        let e = edit_with(s, |e| {
+            e.root = 62;
+            e.crossfade = 50;
+        });
+        s.apply(e, None);
+        let results = perform_save(&mut app, folder_request(vec![0], &out));
+        assert!(results[0].1.is_ok(), "{:?}", results[0].1);
+        assert_eq!(
+            session(&mut app, 0).source,
+            id,
+            "no frame moved: voices keep following the file"
+        );
+
+        let s = session(&mut app, 0);
+        let e = edit_with(s, |e| e.start = 100);
+        s.apply(e, None);
+        let results = perform_save(&mut app, folder_request(vec![0], &out));
+        assert!(results[0].1.is_ok(), "{:?}", results[0].1);
+        let s = session(&mut app, 0);
+        assert_eq!(s.doc.frames, 8000 - 100, "the head was trimmed");
+        assert_ne!(s.source, id, "the frames moved: a new source");
     }
 
     #[test]
