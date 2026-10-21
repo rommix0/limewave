@@ -15,11 +15,13 @@ use limewave_core::edit::{
     trim_after_loop,
 };
 use limewave_core::effects::{
-    AppliedEffect, Effect, Op, apply_effect, mirror_edit, plan_effect, process, silence_bounds,
+    AppliedEffect, Effect, Op, apply_effect, mirror_edit, peak, plan_effect, process,
+    silence_bounds,
 };
 use limewave_core::notes::note_name;
 use limewave_core::render::render;
 use limewave_core::save::{Destination, default_folder};
+use limewave_core::wav::SampleFormat;
 
 use crate::audio::engine::{AudioEngine, Command, Cursor};
 use crate::audio::keys::{octave_shift, qwerty_note};
@@ -28,7 +30,7 @@ use crate::audio::voice::{PlayBuffer, play_buffer};
 use crate::folder;
 use crate::theme::{self, colors};
 use crate::ui::coords::ViewTransform;
-use crate::ui::effects::edit_menu;
+use crate::ui::effects::{EffectDialog, EffectParams, edit_menu, effect_dialog, effects_menu};
 use crate::ui::filelist;
 use crate::ui::inspector::inspector;
 use crate::ui::keyboard::keyboard_strip;
@@ -117,6 +119,14 @@ impl Session {
 
     pub fn edit(&self) -> &EditState {
         self.history.current()
+    }
+
+    /// True when the processed audio peaks above full scale between Start and End and the
+    /// file is an integer format, so saving would clip.
+    pub fn will_clip(&self) -> bool {
+        let e = self.edit();
+        matches!(self.doc.format.format, SampleFormat::Int { .. })
+            && peak(&self.processed, e.start.min(e.end), e.start.max(e.end)) > 1.0
     }
 
     /// The edit the views draw: the drag preview if there is one, else the current edit.
@@ -323,6 +333,10 @@ pub struct UiState {
     pub selection: Option<(usize, usize)>,
     /// Where Play starts instead of Start, set by clicking on the waveform.
     pub play_from: Option<usize>,
+    /// The remembered values of the Effects dialogs.
+    pub effect_params: EffectParams,
+    /// The Effects dialog that is open.
+    pub effect_dialog: Option<EffectDialog>,
     /// Why the last action did nothing, shown in the toolbar until the next action.
     pub message: Option<String>,
 }
@@ -341,6 +355,8 @@ impl Default for UiState {
             marker_entry: None,
             selection: None,
             play_from: None,
+            effect_params: EffectParams::default(),
+            effect_dialog: None,
             message: None,
         }
     }
@@ -558,9 +574,12 @@ impl LimewaveApp {
         }
     }
 
-    /// True while a modal (unsaved prompt, save dialog, save results) is up.
+    /// True while a modal (unsaved prompt, save dialog, save results, effect dialog) is up.
     fn modal_open(&self) -> bool {
-        self.pending.is_some() || self.ui.save_dialog.open || self.save_results.is_some()
+        self.pending.is_some()
+            || self.ui.save_dialog.open
+            || self.save_results.is_some()
+            || self.ui.effect_dialog.is_some()
     }
 
     fn perform(&mut self, action: PendingAction) {
@@ -828,6 +847,14 @@ impl LimewaveApp {
         }
     }
 
+    /// Whether `effect` would do anything to the selected file (a channel tool needs the
+    /// right channel count, a Normalize needs sound).
+    pub fn can_apply(&self, effect: Effect) -> bool {
+        self.selected_session().is_some_and(|s| {
+            plan_effect(effect, &s.processed, s.edit(), self.ui.selection).is_some()
+        })
+    }
+
     pub fn undo(&mut self) {
         self.ui.message = None;
         let engine = self.engine.as_ref();
@@ -972,6 +999,7 @@ impl LimewaveApp {
         }
         egui::CentralPanel::default().show(ui, |ui| self.central(ui, &cursors));
         self.unsaved_prompt(&ctx);
+        effect_dialog(&ctx, self);
         if let Some(req) = save_dialog(&ctx, &mut self.ui.save_dialog, &self.files) {
             self.save_results = Some(perform_save(self, req));
         }
@@ -1081,6 +1109,7 @@ impl LimewaveApp {
                 undo = ui.button("Undo").clicked();
                 redo = ui.button("Redo").clicked();
                 edit_menu(ui, self);
+                effects_menu(ui, self);
                 ui.separator();
                 ui.toggle_value(&mut self.ui.snap, "Snap").on_hover_text(
                     "Snap loop markers to upward zero crossings (Shift disables while dragging)",

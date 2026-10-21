@@ -1,9 +1,14 @@
-//! The Edit menu: selection and trim actions.
+//! The Edit and Effects menus, and the effect dialogs.
+
+use std::ops::RangeInclusive;
 
 use eframe::egui::{self, Button, DragValue};
 use limewave_core::edit::LoopMode;
+use limewave_core::effects::{Effect, FadeCurve, Op, peak, plan_effect};
+use limewave_core::wav::SampleFormat;
 
-use crate::app::{LimewaveApp, SELECT_ALL_SHORTCUT};
+use crate::app::{LimewaveApp, SELECT_ALL_SHORTCUT, Session};
+use crate::theme::colors;
 
 /// The toolbar's Edit menu. Selection items need a selection and loop items a loop; an item
 /// that cannot run is greyed out.
@@ -64,5 +69,203 @@ pub fn edit_menu(ui: &mut egui::Ui, app: &mut LimewaveApp) {
             .labelled_by(label.id)
             .on_hover_text("Frames kept after the loop end (also used by Save as…)");
         });
+    });
+}
+
+/// The dialog's value controls, remembered for the session.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EffectParams {
+    pub gain_db: f32,
+    pub normalize_db: f32,
+    pub fade_curve: FadeCurve,
+    pub silence_db: f32,
+}
+
+impl Default for EffectParams {
+    fn default() -> Self {
+        EffectParams {
+            gain_db: 0.0,
+            normalize_db: -0.1,
+            fade_curve: FadeCurve::Linear,
+            silence_db: -60.0,
+        }
+    }
+}
+
+/// The effects that ask for a value first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EffectDialog {
+    Gain,
+    Normalize,
+    FadeIn,
+    FadeOut,
+    AutoTrim,
+}
+
+/// The toolbar's Effects menu. Gain, Normalize, the fades and Auto-trim open a dialog; the
+/// rest apply at once. A channel tool that does not fit the file is greyed out.
+pub fn effects_menu(ui: &mut egui::Ui, app: &mut LimewaveApp) {
+    let loaded = app.selected_session().is_some();
+    ui.menu_button("Effects", |ui| {
+        for (label, dialog) in [
+            ("Gain…", EffectDialog::Gain),
+            ("Normalize…", EffectDialog::Normalize),
+            ("Fade in…", EffectDialog::FadeIn),
+            ("Fade out…", EffectDialog::FadeOut),
+        ] {
+            if ui.add_enabled(loaded, Button::new(label)).clicked() {
+                app.ui.effect_dialog = Some(dialog);
+            }
+        }
+        for (label, effect) in [
+            ("Invert polarity", Effect::Invert),
+            ("Remove DC offset", Effect::RemoveDc),
+            ("Reverse", Effect::Reverse),
+        ] {
+            if ui.add_enabled(loaded, Button::new(label)).clicked() {
+                app.apply_effect(effect);
+            }
+        }
+        ui.separator();
+        for (label, effect) in [
+            ("Stereo to mono", Effect::StereoToMono),
+            ("Swap left and right", Effect::SwapChannels),
+            ("Mono to stereo", Effect::MonoToStereo),
+        ] {
+            let enabled = app.can_apply(effect.clone());
+            if ui.add_enabled(enabled, Button::new(label)).clicked() {
+                app.apply_effect(effect);
+            }
+        }
+        ui.separator();
+        if ui
+            .add_enabled(loaded, Button::new("Auto-trim silence…"))
+            .clicked()
+        {
+            app.ui.effect_dialog = Some(EffectDialog::AutoTrim);
+        }
+    });
+}
+
+/// The peak over Start...End once `effect` (a Gain or Normalize) is applied to `selection`,
+/// or `None` when the effect would not scale anything.
+fn predicted_peak(s: &Session, effect: Effect, selection: Option<(usize, usize)>) -> Option<f32> {
+    let e = s.edit();
+    let a = plan_effect(effect, &s.processed, e, selection)?;
+    let Op::Scale(k) = a.op else { return None };
+    let (t0, t1) = (e.start.min(e.end), e.start.max(e.end));
+    let audio = &s.processed;
+    let mut p = 0.0f32;
+    // Start...End before, after and inside the scaled range.
+    if a.first > t0 {
+        p = p.max(peak(audio, t0, (a.first - 1).min(t1)));
+    }
+    if a.last < t1 {
+        p = p.max(peak(audio, (a.last + 1).max(t0), t1));
+    }
+    let (lo, hi) = (a.first.max(t0), a.last.min(t1));
+    if lo <= hi {
+        p = p.max(k * peak(audio, lo, hi));
+    }
+    Some(p)
+}
+
+/// The effect the open dialog applies with the remembered values; `None` for Auto-trim,
+/// which is not an effect.
+fn dialog_effect(dialog: EffectDialog, p: &EffectParams) -> Option<Effect> {
+    match dialog {
+        EffectDialog::Gain => Some(Effect::Gain { db: p.gain_db }),
+        EffectDialog::Normalize => Some(Effect::Normalize {
+            target_db: p.normalize_db,
+        }),
+        EffectDialog::FadeIn => Some(Effect::FadeIn(p.fade_curve)),
+        EffectDialog::FadeOut => Some(Effect::FadeOut(p.fade_curve)),
+        EffectDialog::AutoTrim => None,
+    }
+}
+
+/// The modal that asks for the value of the effect in `app.ui.effect_dialog`. Apply runs it
+/// and closes; Cancel, Escape and a click outside close it.
+pub fn effect_dialog(ctx: &egui::Context, app: &mut LimewaveApp) {
+    let Some(dialog) = app.ui.effect_dialog else {
+        return;
+    };
+    // Gain and Normalize can push an integer file's peak past full scale.
+    let clips = app.selected_session().is_some_and(|s| {
+        let integer = matches!(s.doc.format.format, SampleFormat::Int { .. });
+        let scaling = matches!(dialog, EffectDialog::Gain | EffectDialog::Normalize);
+        integer
+            && scaling
+            && dialog_effect(dialog, &app.ui.effect_params)
+                .and_then(|e| predicted_peak(s, e, app.ui.selection))
+                .is_some_and(|p| p > 1.0)
+    });
+    let mut apply = false;
+    let mut cancel = false;
+    let p = &mut app.ui.effect_params;
+    let modal = egui::Modal::new(egui::Id::unique("effect_dialog")).show(ctx, |ui| {
+        ui.set_width(300.0);
+        match dialog {
+            EffectDialog::Gain => {
+                ui.heading("Gain");
+                value_row(ui, "Gain (dB)", &mut p.gain_db, -48.0..=48.0);
+            }
+            EffectDialog::Normalize => {
+                ui.heading("Normalize");
+                value_row(ui, "Target peak (dBFS)", &mut p.normalize_db, -48.0..=0.0);
+            }
+            EffectDialog::FadeIn | EffectDialog::FadeOut => {
+                ui.heading(if dialog == EffectDialog::FadeIn {
+                    "Fade in"
+                } else {
+                    "Fade out"
+                });
+                ui.horizontal(|ui| {
+                    for (curve, name) in [
+                        (FadeCurve::Linear, "Linear"),
+                        (FadeCurve::Exponential, "Exponential"),
+                        (FadeCurve::SCurve, "S-curve"),
+                    ] {
+                        ui.selectable_value(&mut p.fade_curve, curve, name);
+                    }
+                });
+            }
+            EffectDialog::AutoTrim => {
+                ui.heading("Auto-trim silence");
+                value_row(ui, "Threshold (dBFS)", &mut p.silence_db, -96.0..=0.0);
+            }
+        }
+        if clips {
+            ui.colored_label(colors::END, "Will clip when saved");
+        }
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            apply = ui.button("Apply").clicked();
+            cancel = ui.button("Cancel").clicked();
+        });
+    });
+    if apply {
+        let p = app.ui.effect_params.clone();
+        match dialog_effect(dialog, &p) {
+            Some(effect) => {
+                let normalize = matches!(effect, Effect::Normalize { .. });
+                if !app.apply_effect(effect) && normalize {
+                    app.ui.message = Some("Nothing to normalize: the audio is silent".to_owned());
+                }
+            }
+            None => app.auto_trim_silence(p.silence_db),
+        }
+    }
+    if apply || cancel || modal.should_close() {
+        app.ui.effect_dialog = None;
+    }
+}
+
+/// A labelled decibel value.
+fn value_row(ui: &mut egui::Ui, label: &str, value: &mut f32, range: RangeInclusive<f32>) {
+    ui.horizontal(|ui| {
+        let label = ui.label(label);
+        ui.add(DragValue::new(value).range(range).speed(0.1).suffix(" dB"))
+            .labelled_by(label.id);
     });
 }

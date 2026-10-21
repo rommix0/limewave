@@ -166,6 +166,9 @@ fn file_section(ui: &mut Ui, s: &Session) {
     for warning in &s.doc.warnings {
         ui.colored_label(colors::LOOP, warning);
     }
+    if s.will_clip() {
+        ui.colored_label(colors::END, "Will clip when saved");
+    }
 }
 
 /// The root key as editable text. Enter or leaving the field applies a valid note name;
