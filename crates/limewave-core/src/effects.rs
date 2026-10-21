@@ -102,10 +102,12 @@ pub fn plan_effect(
             if !(p > 0.0 && p.is_finite() && target_db.is_finite()) {
                 return None;
             }
-            (
-                Op::Scale(db_to_gain(target_db) / p),
-                selected.unwrap_or(whole),
-            )
+            // A denormal peak can overflow the scale to infinity.
+            let k = db_to_gain(target_db) / p;
+            if !k.is_finite() {
+                return None;
+            }
+            (Op::Scale(k), selected.unwrap_or(whole))
         }
         Effect::FadeIn(c) => (Op::FadeIn(c), selected.unwrap_or(trim)),
         Effect::FadeOut(c) => (Op::FadeOut(c), selected.unwrap_or(trim)),
@@ -568,6 +570,17 @@ mod tests {
             },
         );
         assert_eq!(y, x);
+    }
+
+    #[test]
+    fn normalize_of_a_denormal_peak_is_not_applied() {
+        let x = vec![vec![f32::from_bits(1), 0.0, 0.0]];
+        assert!(x[0][0] > 0.0 && x[0][0].is_subnormal());
+        let e = EditState::default_for(3);
+        assert_eq!(
+            plan_effect(Effect::Normalize { target_db: -0.1 }, &x, &e, None),
+            None
+        );
     }
 
     #[test]
