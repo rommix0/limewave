@@ -14,6 +14,7 @@
 
 mod granular;
 pub mod measure;
+mod smooth;
 
 use std::sync::Arc;
 
@@ -80,6 +81,9 @@ pub enum TailMode {
 pub enum TailMethod {
     /// Stitches short patches of the source together (v0.3 §4.3).
     Granular,
+    /// Freezes the spectrum at the cut and lets each frequency fade at its own rate (v0.3
+    /// §4.4).
+    Smooth,
 }
 
 /// What the user asks for. `None` means "use the fitted default".
@@ -130,7 +134,8 @@ pub struct TailAnalysis {
     pub level_at_cut_db: f32,
     /// Decay for a decaying source, Sustain for a steady one.
     pub suggested_mode: TailMode,
-    /// The method the dialog marks as suggested.
+    /// The method the dialog marks as suggested: Smooth for a tonal source, Granular for a
+    /// noisy one.
     pub suggested_method: TailMethod,
 }
 
@@ -193,6 +198,9 @@ pub(crate) struct Generated {
 pub(crate) struct Resolved {
     mode: TailMode,
     decay_t60: f32,
+    /// The body length asked for, in seconds, for methods that round it to their own hop.
+    body_s: f32,
+    /// The body length in frames.
     body: usize,
     release_t60: f32,
     darken: f32,
@@ -280,7 +288,11 @@ pub fn analyse(
         } else {
             TailMode::Decay
         },
-        suggested_method: TailMethod::Granular,
+        suggested_method: if character.period.is_some() {
+            TailMethod::Smooth
+        } else {
+            TailMethod::Granular
+        },
     })
 }
 
@@ -299,6 +311,7 @@ pub fn render_tail(
     let resolved = resolve(s, &analysis, rate);
     let g = match s.method {
         TailMethod::Granular => granular::render(audio, cut, &analysis, &resolved, e, rate)?,
+        TailMethod::Smooth => smooth::render(audio, cut, &analysis, &resolved, e, rate)?,
     };
     let first = cut - g.overlap;
     let len = frame_count(&g.audio);
@@ -349,6 +362,7 @@ fn resolve(s: &TailSettings, a: &TailAnalysis, rate: u32) -> Resolved {
     Resolved {
         mode: s.mode,
         decay_t60: decay_t60.max(MIN_T60),
+        body_s: s.body_s,
         body: sustain_lengths(s.body_s, rate, 1),
         release_t60: release_t60.max(0.0),
         darken: if s.darken.is_finite() {
@@ -429,8 +443,10 @@ pub(crate) mod test_signals {
 
     use std::f32::consts::TAU;
 
+    use super::{TailRender, TailSettings, render_tail};
     use crate::dsp::rng::SplitMix64;
     use crate::edit::EditState;
+    use crate::effects::apply_effect;
 
     /// The rate of every test signal: low, so the debug-build tests stay quick.
     pub const RATE: u32 = 22_050;
@@ -526,6 +542,27 @@ pub(crate) mod test_signals {
         let mut e = EditState::default_for(audio[0].len());
         e.end = cut - 1;
         e
+    }
+
+    /// Renders with `s` and returns the result and the audio after the step, checking that
+    /// the returned edit is valid, ends on the new last frame and holds the step.
+    pub fn run(x: &[Vec<f32>], e: &EditState, s: &TailSettings) -> (TailRender, Vec<Vec<f32>>) {
+        let r = render_tail(x, e, None, RATE, s).expect("renders");
+        let mut out = x.to_vec();
+        apply_effect(&mut out, &r.step);
+        assert_eq!(out[0].len(), r.edit.end + 1, "End is the new last frame");
+        assert_eq!(
+            r.edit.clone().clamped(x[0].len()),
+            r.edit,
+            "the edit is valid"
+        );
+        assert_eq!(r.edit.effects.last(), Some(&r.step));
+        (r, out)
+    }
+
+    /// The decay rate the tail is meant to have, in dB per second.
+    pub fn tail_rate(r: &TailRender) -> f32 {
+        60.0 / r.analysis.fit.t60.unwrap_or(1.0)
     }
 }
 
@@ -636,9 +673,17 @@ mod tests {
             darken: f32::NAN,
             ..TailSettings::default()
         };
-        for mode in [TailMode::Decay, TailMode::Sustain] {
+        for (mode, method) in [TailMode::Decay, TailMode::Sustain]
+            .into_iter()
+            .flat_map(|m| [TailMethod::Granular, TailMethod::Smooth].map(|k| (m, k)))
+        {
             for audio in [&x, &quiet] {
-                let r = render_tail(audio, &e, None, RATE, &TailSettings { mode, ..odd }).unwrap();
+                let s = TailSettings {
+                    mode,
+                    method,
+                    ..odd
+                };
+                let r = render_tail(audio, &e, None, RATE, &s).unwrap();
                 let Op::Splice(sp) = &r.step.op else {
                     panic!("not a splice")
                 };

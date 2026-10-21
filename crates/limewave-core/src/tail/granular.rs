@@ -608,21 +608,6 @@ mod tests {
     use super::super::*;
     use crate::effects::apply_effect;
 
-    /// Renders with `s` (Granular) and returns the result and the audio after the step.
-    fn run(x: &[Vec<f32>], e: &EditState, s: &TailSettings) -> (TailRender, Vec<Vec<f32>>) {
-        let r = render_tail(x, e, None, RATE, s).expect("renders");
-        let mut out = x.to_vec();
-        apply_effect(&mut out, &r.step);
-        assert_eq!(out[0].len(), r.edit.end + 1, "End is the new last frame");
-        assert_eq!(
-            r.edit.clone().clamped(x[0].len()),
-            r.edit,
-            "the edit is valid"
-        );
-        assert_eq!(r.edit.effects.last(), Some(&r.step));
-        (r, out)
-    }
-
     fn decay() -> TailSettings {
         TailSettings::default()
     }
@@ -633,11 +618,6 @@ mod tests {
             body_s: 1.0,
             ..TailSettings::default()
         }
-    }
-
-    /// The decay rate the tail is meant to have, in dB per second.
-    fn tail_rate(r: &TailRender) -> f32 {
-        60.0 / r.analysis.fit.t60.unwrap_or(1.0)
     }
 
     #[test]
