@@ -9,7 +9,19 @@
 //! cut) always come from the *input*, the audio before the tail step: the rendered audio
 //! already has its join overlap replaced, so a faulty join could inflate its own reference.
 
+use std::fmt::Write as _;
+use std::path::Path;
+use std::time::Instant;
+
+use super::{TailMethod, TailMode, TailSettings, render_tail};
+use crate::document::{WavDocument, load_wav};
 use crate::dsp::envelope::{level_db, rms_db_frames};
+use crate::edit::LoopMode;
+use crate::effects::process;
+use crate::render::render;
+use crate::riff::{Chunk, RiffFile, find, write_riff};
+use crate::save::build_wav_bytes;
+use crate::wav::encode_frames;
 
 /// Steps within this many seconds either side of a join are checked.
 const JOIN_WINDOW_S: f64 = 0.002;
@@ -207,9 +219,228 @@ pub fn channel_correlation(audio: &[Vec<f32>], first: usize, last: usize) -> f32
     if den > 0.0 { (lr / den) as f32 } else { 0.0 }
 }
 
+/// How many extra times the sustain loop plays in a `heard` file.
+const HEARD_REPEATS: usize = 3;
+
+/// What the `tail_lab` bench is asked to do (v0.3 §8.3).
+#[derive(Clone, Debug)]
+pub struct LabArgs {
+    /// Where the sample is cut, in seconds. The first new frame is at this time.
+    pub cut_s: f32,
+    /// Decay or Sustain; it overrides `settings.mode`.
+    pub mode: TailMode,
+    /// The methods to render, in table order; each overrides `settings.method`.
+    pub methods: Vec<TailMethod>,
+    /// The other settings: body, decay, release, darken and seed.
+    pub settings: TailSettings,
+}
+
+/// The lower-case name of a method, as the bench's file names and table use it.
+pub fn method_name(m: TailMethod) -> &'static str {
+    match m {
+        TailMethod::Granular => "granular",
+        TailMethod::Smooth => "smooth",
+        TailMethod::Harmonic => "harmonic",
+    }
+}
+
+/// A plain WAV file of `audio` in the document's own format: no `smpl`, no other chunks.
+fn plain_wav(doc: &WavDocument, audio: &[Vec<f32>]) -> Result<Vec<u8>, String> {
+    let fmt = find(&doc.riff.chunks, b"fmt ")
+        .map(|i| doc.riff.chunks[i].data.clone())
+        .ok_or("the file has no fmt chunk")?;
+    Ok(write_riff(&RiffFile {
+        chunks: vec![
+            Chunk {
+                id: *b"fmt ",
+                data: fmt,
+            },
+            Chunk {
+                id: *b"data",
+                data: encode_frames(audio, &doc.format),
+            },
+        ],
+        warnings: Vec::new(),
+    }))
+}
+
+/// What a sampler plays for a loop in `audio`: everything up to the loop end, the loop
+/// [`HEARD_REPEATS`] more times, then the rest (the release). `audio` already holds the loop
+/// crossfade, as a sampler reads it.
+fn unroll_loop(audio: &[Vec<f32>], (start, end): (usize, usize)) -> Vec<Vec<f32>> {
+    audio
+        .iter()
+        .map(|ch| {
+            let end = end.min(ch.len().saturating_sub(1));
+            let start = start.min(end);
+            let mut out = ch[..=end].to_vec();
+            for _ in 0..HEARD_REPEATS {
+                out.extend_from_slice(&ch[start..=end]);
+            }
+            out.extend_from_slice(&ch[end + 1..]);
+            out
+        })
+        .collect()
+}
+
+fn write(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    std::fs::write(path, bytes).map_err(|e| format!("could not write {}: {e}", path.display()))
+}
+
+fn dash(v: Option<f32>, prec: usize) -> String {
+    v.map_or_else(|| "-".into(), |v| format!("{v:.prec$}"))
+}
+
+/// Runs the `tail_lab` bench: cuts the WAV file `input` at `args.cut_s`, renders a tail with
+/// each method, writes the files into `out_dir` and returns the table of measurements.
+///
+/// Files: `original.wav` (a copy of the input), `cut.wav` (the input trimmed to the cut),
+/// `tail_<method>.wav` (written through the normal save path, so a sustain loop is in its
+/// `smpl` chunk) and, for a Sustain tail with a loop, `tail_<method>_heard.wav`: a plain file
+/// with the loop played [`HEARD_REPEATS`] extra times and then the release.
+///
+/// Any loop in the input is switched off for the cut, so the tail joins at the cut. The
+/// numbers are those of v0.3 §8.1, measured against the input. The envelope error compares the
+/// tail with the real ending, when the input goes on past the cut. In Sustain that is the body
+/// against the real ending, which only agrees for a steady sound. The render time covers
+/// `render_tail` alone.
+pub fn lab_run(input: &Path, args: &LabArgs, out_dir: &Path) -> Result<String, String> {
+    let doc = load_wav(input).map_err(|e| format!("could not load {}: {e}", input.display()))?;
+    let rate = doc.format.sample_rate;
+    let cut = (f64::from(args.cut_s) * f64::from(rate)).round();
+    if !args.cut_s.is_finite() || cut < 1.0 || cut > doc.frames as f64 {
+        return Err(format!(
+            "the cut ({} s) must be inside the file ({:.3} s)",
+            args.cut_s,
+            doc.frames as f64 / f64::from(rate.max(1))
+        ));
+    }
+    let cut = cut as usize;
+    let mut cut_edit = doc.initial_edit();
+    cut_edit.loop_mode = LoopMode::Off;
+    cut_edit.start = cut_edit.start.min(cut - 1);
+    cut_edit.end = cut - 1;
+
+    std::fs::create_dir_all(out_dir)
+        .map_err(|e| format!("could not create {}: {e}", out_dir.display()))?;
+    std::fs::copy(input, out_dir.join("original.wav"))
+        .map_err(|e| format!("could not copy the input: {e}"))?;
+    write(&out_dir.join("cut.wav"), &build_wav_bytes(&doc, &cut_edit))?;
+
+    let real_ending = doc.frames > cut;
+    let mut table = String::new();
+    let mut notes = String::new();
+    let mut header = false;
+    for &method in &args.methods {
+        let name = method_name(method);
+        let settings = TailSettings {
+            mode: args.mode,
+            method,
+            ..args.settings
+        };
+        let started = Instant::now();
+        let r = render_tail(&doc.audio, &cut_edit, None, rate, &settings)
+            .map_err(|e| format!("{name}: {e}"))?;
+        let render_ms = started.elapsed().as_secs_f64() * 1000.0;
+
+        let out = process(&doc.audio, &r.edit.effects);
+        let a = &r.analysis;
+        if !header {
+            header = true;
+            let kind = a.character.period.map_or_else(
+                || "noisy".to_string(),
+                |p| format!("tonal, period {p:.1} frames ({:.1} Hz)", rate as f32 / p),
+            );
+            let _ = writeln!(
+                table,
+                "{}: {rate} Hz, {} ch, {:.3} s, cut at {:.3} s (frame {cut}), {:?}",
+                input.file_name().map_or_else(
+                    || input.display().to_string(),
+                    |n| n.to_string_lossy().into_owned()
+                ),
+                doc.format.channels,
+                doc.frames as f64 / f64::from(rate),
+                cut as f64 / f64::from(rate),
+                args.mode,
+            );
+            let _ = writeln!(
+                table,
+                "source {:.3}-{:.3} s, {} ({:.1} dB/s), {kind}, level at the cut {:.1} dBFS",
+                a.source.0 as f64 / f64::from(rate),
+                a.source.1 as f64 / f64::from(rate),
+                if a.fit.steady { "steady" } else { "decaying" },
+                a.fit.rate_db_s,
+                a.level_at_cut_db,
+            );
+            let _ = writeln!(
+                table,
+                "{:<9} {:>9} {:>7} {:>6} {:>10} {:>13} {:>6} {:>9} {:>10}",
+                "method",
+                "render ms",
+                "tail s",
+                "join",
+                "join@start",
+                "level step dB",
+                "wrap",
+                "spread dB",
+                "env err dB"
+            );
+        }
+
+        // The tail's own fall, which the level step allows for.
+        let fall = match args.mode {
+            TailMode::Decay => {
+                let t60 = settings
+                    .decay_t60
+                    .filter(|t| t.is_finite() && *t > 0.0)
+                    .unwrap_or(a.fit.t60.unwrap_or(1.0))
+                    .max(0.01);
+                60.0 / t60
+            }
+            TailMode::Sustain => 0.0,
+        };
+        let join = join_score(&out, cut, &doc.audio, a.source, rate);
+        let join_start = join_score(&out, r.step.first, &doc.audio, a.source, rate);
+        let step_db = level_step_db(&out, cut, a.level_at_cut_db, rate, fall);
+        let looped = (args.mode == TailMode::Sustain && r.edit.loop_mode != LoopMode::Off)
+            .then_some((r.edit.loop_start, r.edit.loop_end));
+        let wrap = looped.map(|l| wrap_score(&out, l, &doc.audio, a.source, rate));
+        let spread = looped.map(|(s, e)| body_spread_db(&out, s, e, rate));
+        let env = (real_ending && frames(&out) > cut)
+            .then(|| envelope_error_db(&out, cut, &doc.audio, cut, rate));
+        let _ = writeln!(
+            table,
+            "{name:<9} {render_ms:>9.1} {:>7.2} {join:>6.2} {join_start:>10.2} {step_db:>+13.2} {:>6} {:>9} {:>10}",
+            (frames(&out) - cut) as f64 / f64::from(rate),
+            dash(wrap, 2),
+            dash(spread, 2),
+            dash(env, 2),
+        );
+        for w in &r.warnings {
+            let _ = writeln!(notes, "{name}: {w:?}");
+        }
+
+        write(
+            &out_dir.join(format!("tail_{name}.wav")),
+            &build_wav_bytes(&doc, &r.edit),
+        )?;
+        if let Some(l) = looped {
+            let heard = unroll_loop(&render(&out, &r.edit), l);
+            write(
+                &out_dir.join(format!("tail_{name}_heard.wav")),
+                &plain_wav(&doc, &heard)?,
+            )?;
+        }
+    }
+    table.push_str(&notes);
+    let _ = writeln!(table, "files in {}", out_dir.display());
+    Ok(table)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::document::load_wav;
 
     #[test]
     fn measures_known_signals() {
@@ -254,6 +485,90 @@ mod tests {
         assert!(level_deviation_db(&audio, 0, 7999, -9.03, rate) < 0.1);
         assert!(envelope_error_db(&audio, 0, &audio, 0, rate) < 1e-6);
         assert!(wrap_score(&audio, (0, 7999), &audio, (0, 7999), rate).is_finite());
+    }
+
+    /// A steady 220 Hz tone at 22.05 kHz, written to `dir` as `tone.wav`.
+    fn write_tone(dir: &std::path::Path, secs: f32) -> std::path::PathBuf {
+        let rate = 22_050;
+        let tone = crate::testwav::sine(220.0, rate, (secs * rate as f32) as usize, 0.5);
+        let path = dir.join("tone.wav");
+        let bytes = crate::testwav::wav_bytes(
+            &[tone],
+            rate,
+            crate::wav::SampleFormat::Int { bits: 16 },
+            Vec::new(),
+        );
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    fn lab_args(mode: TailMode) -> LabArgs {
+        LabArgs {
+            cut_s: 0.6,
+            mode,
+            methods: vec![
+                TailMethod::Granular,
+                TailMethod::Smooth,
+                TailMethod::Harmonic,
+            ],
+            settings: TailSettings {
+                body_s: 0.5,
+                ..TailSettings::default()
+            },
+        }
+    }
+
+    #[test]
+    fn tail_lab_writes_its_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = write_tone(dir.path(), 1.0);
+
+        let out = dir.path().join("sustain");
+        let table = lab_run(&input, &lab_args(TailMode::Sustain), &out).unwrap();
+        for name in ["original", "cut"] {
+            load_wav(&out.join(format!("{name}.wav"))).unwrap();
+        }
+        for m in ["granular", "smooth", "harmonic"] {
+            assert!(table.contains(m), "{table}");
+            load_wav(&out.join(format!("tail_{m}.wav"))).unwrap();
+            let heard = load_wav(&out.join(format!("tail_{m}_heard.wav"))).unwrap();
+            assert!(heard.smpl.is_none(), "{m}: heard is a plain file");
+        }
+        // The cut file stops at the cut; the tail runs on past it with its loop in `smpl`.
+        let cut = load_wav(&out.join("cut.wav")).unwrap();
+        assert_eq!(cut.frames, (0.6 * 22_050.0f32).round() as usize);
+        let tail = load_wav(&out.join("tail_smooth.wav")).unwrap();
+        assert!(tail.frames > cut.frames);
+        let smpl = tail.smpl.as_ref().expect("smpl chunk");
+        assert_eq!(smpl.loops.len(), 1);
+        assert_eq!(smpl.loops[0].start as usize, cut.frames);
+        let heard = load_wav(&out.join("tail_smooth_heard.wav")).unwrap();
+        let body = smpl.loops[0].end as usize + 1 - cut.frames;
+        assert!(heard.frames >= tail.frames + 3 * body);
+
+        // Decay writes no loop and no heard file.
+        let out = dir.path().join("decay");
+        let table = lab_run(&input, &lab_args(TailMode::Decay), &out).unwrap();
+        assert!(table.contains("render ms"), "{table}");
+        let tail = load_wav(&out.join("tail_smooth.wav")).unwrap();
+        assert!(tail.smpl.is_none());
+        assert!(!out.join("tail_smooth_heard.wav").exists());
+    }
+
+    #[test]
+    fn tail_lab_rejects_bad_cuts() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = write_tone(dir.path(), 1.0);
+        let out = dir.path().join("out");
+        for cut_s in [0.0, -1.0, f32::NAN, 5.0] {
+            let args = LabArgs {
+                cut_s,
+                ..lab_args(TailMode::Decay)
+            };
+            assert!(lab_run(&input, &args, &out).is_err(), "cut {cut_s}");
+        }
+        let missing = dir.path().join("none.wav");
+        assert!(lab_run(&missing, &lab_args(TailMode::Decay), &out).is_err());
     }
 
     #[test]
