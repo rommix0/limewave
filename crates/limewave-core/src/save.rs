@@ -4,13 +4,14 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use crate::cue::remap_markers;
 use crate::document::WavDocument;
 use crate::edit::{EditState, LoopMode};
 use crate::effects::{AppliedEffect, Op, map_frame, process};
 use crate::error::SaveError;
 use crate::meta::{info_set, sync_acid, sync_inst};
 use crate::render::crossfade_region;
-use crate::riff::{Chunk, RiffFile, find, list_type, write_riff};
+use crate::riff::{Chunk, RiffFile, find, write_riff};
 use crate::smpl::{Smpl, SmplLoop, sample_period, tuning_to_smpl};
 use crate::software_tag;
 use crate::wav::{WavFormat, encode_frames, fmt_with_channels, frame_stride, parse_fmt};
@@ -250,6 +251,14 @@ pub fn build_wav_bytes(doc: &WavDocument, e: &EditState) -> Vec<u8> {
         .and_then(|bytes| parse_fmt(bytes).ok())
         .unwrap_or(doc.format);
     let mut data = Some(edited_data(doc, &e, audio, &format));
+    let saved_frames = if doc.frames == 0 {
+        0
+    } else {
+        e.end - e.start + 1
+    };
+    let fact_frames = u32::try_from(saved_frames)
+        .unwrap_or(u32::MAX)
+        .to_le_bytes();
     let mut data_at = None;
     let mut smpl_seen = false;
 
@@ -263,8 +272,8 @@ pub fn build_wav_bytes(doc: &WavDocument, e: &EditState) -> Vec<u8> {
                     c.data = bytes;
                 }
             }
-            b"cue " => continue,
-            b"LIST" if list_type(&c) == Some(*b"adtl") => continue,
+            // The frame count follows the saved length.
+            b"fact" if c.data.len() >= 4 => c.data[..4].copy_from_slice(&fact_frames),
             // Only the first `data` chunk is the audio; later duplicates pass through.
             b"data" if data.is_some() => {
                 c.data = data.take().unwrap_or_default();
@@ -285,6 +294,9 @@ pub fn build_wav_bytes(doc: &WavDocument, e: &EditState) -> Vec<u8> {
         }
         chunks.push(c);
     }
+    // Cue positions follow the trim and the reverses. An unreadable chunk stays as it is;
+    // loading has already warned.
+    let _ = remap_markers(&mut chunks, &|f| map_frame(&e.effects, f), e.start, e.end);
     if let Some(bytes) = smpl {
         let at = data_at.map_or(chunks.len(), |i| i + 1);
         chunks.insert(
@@ -453,12 +465,13 @@ pub fn default_folder(source: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cue::{CuePoint, cue_bytes, parse_cue};
     use crate::document::{load_wav, load_wav_bytes};
     use crate::edit::FadeShape;
     use crate::effects::{AppliedEffect, Effect, Op, mirror_edit, plan_effect, process};
     use crate::meta::info_get;
     use crate::render::render;
-    use crate::riff::{find, parse_riff};
+    use crate::riff::{list_type, parse_riff};
     use crate::testwav::{sine, wav_bytes};
     use crate::wav::{SampleFormat, decode, parse_fmt};
 
@@ -468,6 +481,17 @@ mod tests {
 
     fn chunk(id: &[u8; 4], data: Vec<u8>) -> Chunk {
         Chunk { id: *id, data }
+    }
+
+    fn cue_point(id: u32, at: u32) -> CuePoint {
+        CuePoint {
+            id,
+            position: at,
+            chunk_id: *b"data",
+            chunk_start: 0,
+            block_start: 0,
+            sample_offset: at,
+        }
     }
 
     /// A mono 16-bit file: `fmt `, `before`, `data`, `after`.
@@ -582,24 +606,120 @@ mod tests {
     }
 
     #[test]
-    fn cue_and_adtl_dropped() {
+    fn cue_and_adtl_kept() {
         let mut adtl = b"adtl".to_vec();
         adtl.extend_from_slice(b"labl\x06\0\0\0\x01\0\0\0a\0");
+        let cue = cue_bytes(&[cue_point(1, 500)]);
         let bytes = file(
             vec![
-                chunk(b"cue ", vec![0; 4]),
-                chunk(b"LIST", adtl),
+                chunk(b"cue ", cue.clone()),
+                chunk(b"LIST", adtl.clone()),
                 info(&[(b"INAM", "Lead")]),
             ],
             vec![],
         );
         let d = doc(&bytes);
-        assert!(d.has_markers);
         let out = build_wav_bytes(&d, &d.initial_edit());
         let c = chunks(&out);
-        assert_eq!(find(&c, b"cue "), None);
-        assert!(c.iter().all(|c| list_type(c) != Some(*b"adtl")));
+        assert_eq!(c[find(&c, b"cue ").unwrap()].data, cue);
+        let list = c.iter().find(|c| list_type(c) == Some(*b"adtl")).unwrap();
+        assert_eq!(list.data, adtl);
         assert_eq!(info_get(&c, b"INAM").as_deref(), Some("Lead"));
+
+        // A head trim moves the cue; a reverse of the whole range mirrors it.
+        let trimmed = EditState {
+            start: 100,
+            ..d.initial_edit()
+        };
+        let c = chunks(&build_wav_bytes(&d, &trimmed));
+        let cues = parse_cue(&c[find(&c, b"cue ").unwrap()].data).unwrap();
+        assert_eq!(cues[0].position, 400);
+
+        let e = d.initial_edit();
+        let a = plan_effect(Effect::Reverse, &d.audio, &e, None).unwrap();
+        let mut e = mirror_edit(&e, a.first, a.last);
+        e.effects.push(a);
+        let c = chunks(&build_wav_bytes(&d, &e));
+        let cues = parse_cue(&c[find(&c, b"cue ").unwrap()].data).unwrap();
+        assert_eq!(cues[0].position, (FRAMES - 1 - 500) as u32);
+    }
+
+    #[test]
+    fn unreadable_cue_chunk_is_saved_unchanged() {
+        let bad = vec![9, 0, 0, 0, 1, 2, 3];
+        let d = doc(&file(vec![chunk(b"cue ", bad.clone())], vec![]));
+        let e = EditState {
+            start: 100,
+            ..d.initial_edit()
+        };
+        let c = chunks(&build_wav_bytes(&d, &e));
+        assert_eq!(c[find(&c, b"cue ").unwrap()].data, bad);
+    }
+
+    #[test]
+    fn fact_follows_the_trim() {
+        let fact = chunk(b"fact", 1000u32.to_le_bytes().to_vec());
+        let audio = vec![sine(441.0, RATE, 1000, 0.8)];
+        let d = doc(&wav_bytes(&audio, RATE, I16, vec![fact]));
+        let fact_of = |e: &EditState| {
+            let c = chunks(&build_wav_bytes(&d, e));
+            u32_at(&c[find(&c, b"fact").unwrap()].data, 0)
+        };
+        assert_eq!(fact_of(&d.initial_edit()), 1000);
+        let e = EditState {
+            start: 100,
+            end: 899,
+            ..d.initial_edit()
+        };
+        assert_eq!(fact_of(&e), 800);
+
+        // A fact chunk too short to hold a count is left alone.
+        let short = doc(&wav_bytes(
+            &audio,
+            RATE,
+            I16,
+            vec![chunk(b"fact", vec![1, 2])],
+        ));
+        let c = chunks(&build_wav_bytes(&short, &e));
+        assert_eq!(c[find(&c, b"fact").unwrap()].data, vec![1, 2]);
+    }
+
+    #[test]
+    fn no_edit_round_trip_is_byte_identical() {
+        let tag = software_tag();
+        let smpl = Smpl {
+            manufacturer: 0x47,
+            product: 7,
+            sample_period: 12345,
+            unity_note: 60,
+            pitch_fraction: 0,
+            smpte_format: 0,
+            smpte_offset: 0,
+            loops: vec![SmplLoop {
+                cue_id: 7,
+                ..fwd(1000, 1999)
+            }],
+            sampler_data: vec![1, 2, 3, 4],
+        };
+        let mut adtl = b"adtl".to_vec();
+        adtl.extend_from_slice(b"labl\x06\0\0\0\x01\0\0\0a\0");
+        let mut ltxt = vec![1, 0, 0, 0, 50, 0, 0, 0];
+        ltxt.extend_from_slice(b"rgn \0\0\0\0\0\0\0\0");
+        adtl.extend_from_slice(&[b'l', b't', b'x', b't', 20, 0, 0, 0]);
+        adtl.extend_from_slice(&ltxt);
+        let bytes = file(
+            vec![
+                chunk(b"fact", (FRAMES as u32).to_le_bytes().to_vec()),
+                chunk(b"smpl", smpl.to_bytes()),
+                chunk(b"cue ", cue_bytes(&[cue_point(1, 600)])),
+                chunk(b"LIST", adtl),
+                chunk(b"abcd", vec![1, 2, 3]),
+                info(&[(b"INAM", "Lead"), (b"ISFT", &tag)]),
+            ],
+            vec![],
+        );
+        let d = doc(&bytes);
+        assert_eq!(build_wav_bytes(&d, &d.initial_edit()), bytes);
     }
 
     #[test]

@@ -292,13 +292,6 @@ fn dialog_body(ui: &mut Ui, st: &mut SaveDialogState, files: &[FileEntry]) {
     group(ui, "Metadata");
     ui.label("smpl chunk: root key, fine tune, loop points");
     ui.label(format!("Software tag: {}", software_tag()));
-    let markers = chosen.iter().filter(|s| s.doc.has_markers).count();
-    if markers > 0 {
-        ui.colored_label(
-            colors::END,
-            format!("Cue markers in {markers} files will be removed."),
-        );
-    }
 
     group(ui, "Audio changes");
     if chosen.iter().any(|s| mixes_crossfade(s.edit())) {

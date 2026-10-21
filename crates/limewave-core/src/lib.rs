@@ -1,5 +1,6 @@
 //! Limewave core library: WAV/RIFF handling and loop analysis.
 
+pub mod cue;
 pub mod document;
 pub mod dsp;
 pub mod edit;

@@ -166,9 +166,6 @@ fn file_section(ui: &mut Ui, s: &Session) {
     for warning in &s.doc.warnings {
         ui.colored_label(colors::LOOP, warning);
     }
-    if s.doc.has_markers {
-        ui.colored_label(colors::END, "Markers in this file will be removed on save");
-    }
 }
 
 /// The root key as editable text. Enter or leaving the field applies a valid note name;

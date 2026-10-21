@@ -199,7 +199,7 @@ fn mode_selector_turns_the_loop_off_and_on() {
 }
 
 #[test]
-fn file_metadata_warns_about_markers() {
+fn markers_are_no_longer_reported_as_removed() {
     let cue = Chunk {
         id: *b"cue ",
         data: vec![0, 0, 0, 0],
@@ -211,7 +211,10 @@ fn file_metadata_warns_about_markers() {
         vec![cue],
     );
     let h = harness(&bytes);
-    h.get_by_label("Markers in this file will be removed on save");
+    assert!(
+        h.query_by_label("Markers in this file will be removed on save")
+            .is_none()
+    );
 }
 
 #[test]

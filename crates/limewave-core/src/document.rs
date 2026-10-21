@@ -2,10 +2,11 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::cue::check_markers;
 use crate::edit::{EditState, LoopMode};
 use crate::error::{LoadError, WavError};
 use crate::meta::{info_get, info_warnings};
-use crate::riff::{RiffFile, find, list_type, parse_riff};
+use crate::riff::{RiffFile, find, parse_riff};
 use crate::smpl::{Smpl, smpl_to_tuning};
 use crate::wav::{WavFormat, decode, parse_fmt};
 
@@ -22,8 +23,6 @@ pub struct WavDocument {
     pub smpl: Option<Smpl>,
     pub name: Option<String>,
     pub software: Option<String>,
-    /// True when the file has a `cue ` chunk or a `LIST/adtl`.
-    pub has_markers: bool,
     pub warnings: Vec<String>,
 }
 
@@ -74,8 +73,9 @@ pub fn load_wav_bytes(path: PathBuf, bytes: &[u8]) -> Result<WavDocument, LoadEr
     warnings.extend(info_warnings(&riff.chunks));
     let name = info_get(&riff.chunks, b"INAM");
     let software = info_get(&riff.chunks, b"ISFT");
-    let has_markers = find(&riff.chunks, b"cue ").is_some()
-        || riff.chunks.iter().any(|c| list_type(c) == Some(*b"adtl"));
+    if check_markers(&riff.chunks).is_err() {
+        warnings.push("cue markers could not be read; they will be saved unchanged".into());
+    }
 
     Ok(WavDocument {
         path,
@@ -86,7 +86,6 @@ pub fn load_wav_bytes(path: PathBuf, bytes: &[u8]) -> Result<WavDocument, LoadEr
         smpl,
         name,
         software,
-        has_markers,
         warnings,
     })
 }
@@ -253,8 +252,7 @@ mod tests {
         let doc = load(100, extra).unwrap();
         assert_eq!(doc.name.as_deref(), Some("Pad"));
         assert_eq!(doc.software.as_deref(), Some("Tool 1.0"));
-        assert!(doc.has_markers);
-        assert!(!load(100, vec![]).unwrap().has_markers);
+        assert!(doc.warnings.is_empty(), "{:?}", doc.warnings);
     }
 
     #[test]
@@ -273,12 +271,36 @@ mod tests {
     }
 
     #[test]
-    fn adtl_list_counts_as_markers() {
-        let extra = vec![Chunk {
+    fn unreadable_cue_warns_and_loads() {
+        const WARNING: &str = "cue markers could not be read; they will be saved unchanged";
+        // A count of 5 with no records behind it.
+        let bad = Chunk {
+            id: *b"cue ",
+            data: vec![5, 0, 0, 0],
+        };
+        let doc = load(100, vec![bad]).unwrap();
+        assert_eq!(doc.frames, 100);
+        assert_eq!(doc.warnings, vec![WARNING]);
+
+        // An `adtl` entry that runs past its list.
+        let broken = Chunk {
             id: *b"LIST",
-            data: b"adtl".to_vec(),
-        }];
-        assert!(load(100, extra).unwrap().has_markers);
+            data: b"adtllabl\xff\0\0\0\x01\0\0\0".to_vec(),
+        };
+        assert_eq!(load(100, vec![broken]).unwrap().warnings, vec![WARNING]);
+
+        // Readable markers raise nothing.
+        let good = vec![
+            Chunk {
+                id: *b"cue ",
+                data: vec![0; 4],
+            },
+            Chunk {
+                id: *b"LIST",
+                data: b"adtl".to_vec(),
+            },
+        ];
+        assert!(load(100, good).unwrap().warnings.is_empty());
     }
 
     #[test]
