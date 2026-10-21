@@ -1219,14 +1219,14 @@ impl LimewaveApp {
                     if !live {
                         ui.multiply_opacity(0.5);
                     }
-                    key = keyboard_strip(ui, root, &self.ui.held);
+                    key = keyboard_strip(ui, root, &self.ui.held, live);
                 });
             });
         match key {
-            Some(KeyEvent::Press(note)) if live => self.note_on(note),
+            Some(KeyEvent::Press(note)) => self.note_on(note),
             Some(KeyEvent::Release(note)) => self.note_off(note),
             Some(KeyEvent::SetRoot(note)) => self.set_root(note),
-            Some(KeyEvent::Press(_)) | None => {}
+            None => {}
         }
     }
 

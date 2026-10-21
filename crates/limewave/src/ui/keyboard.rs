@@ -76,15 +76,22 @@ pub enum KeyEvent {
 /// Draws the strip over the available area. The root key is `LOOP` coloured and held keys
 /// `START` green. A left press on a key is [`KeyEvent::Press`], and the key is released when
 /// the button goes up or the pointer slides off it. A right click gives [`KeyEvent::SetRoot`]
-/// and never plays; dragging with the right button does nothing.
-pub fn keyboard_strip(ui: &mut Ui, root: u8, held: &BTreeSet<u8>) -> Option<KeyEvent> {
+/// and never plays; dragging with the right button does nothing. Unless `can_play`, a left
+/// press does nothing either, so no key lights up silently.
+pub fn keyboard_strip(
+    ui: &mut Ui,
+    root: u8,
+    held: &BTreeSet<u8>,
+    can_play: bool,
+) -> Option<KeyEvent> {
     let (rect, response) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
     response.widget_info(|| WidgetInfo::labeled(Role::Canvas, true, "Piano keyboard"));
     let id = response.id.with("pressed_note");
     let mut active: Option<u8> = ui.data(|d| d.get_temp(id)).flatten();
 
     // Only the left button plays: a right press must not start a note.
-    let under_pointer = (response.is_pointer_button_down_on()
+    let under_pointer = (can_play
+        && response.is_pointer_button_down_on()
         && ui.input(|i| i.pointer.primary_down()))
     .then(|| ui.input(|i| i.pointer.interact_pos()))
     .flatten()
@@ -184,14 +191,14 @@ mod tests {
 
     /// A harness around the strip (root C4) collecting its events, and a point on the lower
     /// part of the C4 key, which is clear of the black keys.
-    fn strip_harness() -> (Harness<'static, (Vec<KeyEvent>, Rect)>, Pos2) {
+    fn strip_harness(can_play: bool) -> (Harness<'static, (Vec<KeyEvent>, Rect)>, Pos2) {
         // State: the events returned so far and the strip's rectangle.
         let mut harness = Harness::builder()
             .with_size(vec2(900.0, 120.0))
             .build_ui_state(
-                |ui, (events, strip): &mut (Vec<KeyEvent>, Rect)| {
+                move |ui, (events, strip): &mut (Vec<KeyEvent>, Rect)| {
                     *strip = Rect::from_min_size(ui.cursor().min, ui.available_size());
-                    events.extend(keyboard_strip(ui, 60, &BTreeSet::new()));
+                    events.extend(keyboard_strip(ui, 60, &BTreeSet::new(), can_play));
                 },
                 (Vec::new(), Rect::NOTHING),
             );
@@ -205,7 +212,7 @@ mod tests {
 
     #[test]
     fn keyboard_strip_click_returns_note() {
-        let (mut harness, pos) = strip_harness();
+        let (mut harness, pos) = strip_harness(true);
         harness.event(button(pos, PointerButton::Primary, true));
         harness.run();
         assert_eq!(harness.state().0, vec![KeyEvent::Press(60)]);
@@ -219,7 +226,22 @@ mod tests {
 
     #[test]
     fn right_click_sets_root_without_playing() {
-        let (mut harness, pos) = strip_harness();
+        let (mut harness, pos) = strip_harness(true);
+        harness.event(button(pos, PointerButton::Secondary, true));
+        harness.run();
+        harness.event(button(pos, PointerButton::Secondary, false));
+        harness.run();
+        assert_eq!(harness.state().0, vec![KeyEvent::SetRoot(60)]);
+    }
+
+    #[test]
+    fn a_strip_that_cannot_play_ignores_left_presses_but_sets_the_root() {
+        let (mut harness, pos) = strip_harness(false);
+        harness.event(button(pos, PointerButton::Primary, true));
+        harness.run();
+        harness.event(button(pos, PointerButton::Primary, false));
+        harness.run();
+        assert_eq!(harness.state().0, vec![], "no key pressed or lit");
         harness.event(button(pos, PointerButton::Secondary, true));
         harness.run();
         harness.event(button(pos, PointerButton::Secondary, false));
