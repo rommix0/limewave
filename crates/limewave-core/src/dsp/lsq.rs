@@ -1,6 +1,9 @@
 //! Least-squares fits.
 
 use std::f64::consts::TAU;
+use std::sync::Arc;
+
+use realfft::{ComplexToReal, RealFftPlanner, RealToComplex};
 
 use super::spectrum::Complex64;
 
@@ -100,75 +103,209 @@ fn cholesky_substitute(l: &[f64], b: &[f64], m: usize) -> Option<Vec<f64>> {
     y.iter().all(|v| v.is_finite()).then_some(y)
 }
 
+/// The most harmonics one direct joint fit solves for (256 unknowns). With more, the band
+/// solves precondition an iterative solution of the whole system.
+const BAND_HARMONICS: usize = 128;
+
+/// The conjugate-gradient iterations stop when the residual is this small relative to the
+/// right-hand side, or after [`MAX_ITERATIONS`].
+const TOLERANCE: f64 = 1e-12;
+const MAX_ITERATIONS: usize = 200;
+
 /// The same joint least-squares fit as [`harmonic_fit`], for many harmonics of one fundamental
 /// over many windows of one length, at a fraction of the cost.
 ///
 /// The frequencies are `h·f0` for whole harmonic numbers `h`, so every entry of the normal
-/// matrix is a sum of `cos(n·ω0·t)` or `sin(n·ω0·t)` over the window for a whole number `n`.
-/// Those `2·(max h) + 1` sums are computed once, the matrix is built from them and factorized
-/// once (with the same 1e-9 ridge), and each fit then costs one pass over its window plus a
-/// substitution. The fit is joint over all the harmonics, exactly as in [`harmonic_fit`].
+/// matrix is `½(C[h − h'] ± C[h + h'])` or `−½(S[h + h'] ± S[h' − h])`, where `C[n]` and `S[n]`
+/// are the sums of `cos(n·ω0·t)` and `sin(n·ω0·t)` over the window. Those `2·(max h) + 1` sums
+/// are computed once.
+///
+/// - Up to 128 harmonics: the matrix is built from the sums and factorized once (with the same
+///   1e-9 ridge), and each fit is one substitution, exactly as in [`harmonic_fit`].
+/// - More: the harmonics are split into bands of at most 128 adjacent ones (in harmonic-number
+///   order), and each band's own block of the matrix is factorized. The whole system is then
+///   solved by conjugate gradients, preconditioned by those band solves, to a relative
+///   residual of 1e-12. The matrix is never stored: it is a Toeplitz plus Hankel operator in
+///   the harmonic number, applied with two FFTs of about `4·(max h)` points. Memory and time
+///   grow about linearly with the number of harmonics, and the result is the joint fit, not an
+///   approximation of it. (Fitting the bands separately would not do: on a window that is not
+///   a whole number of periods, harmonics far apart still interact at the percent level.)
 pub struct HarmonicFitter {
     len: usize,
     w0: f64,
     harmonics: Vec<usize>,
-    /// The Cholesky factor of the normal matrix; `None` when it is singular or empty.
+    /// The bands, in harmonic-number order; empty when the fitter cannot fit.
+    bands: Vec<Band>,
+    /// The whole matrix as an FFT operator, when there is more than one band.
+    operator: Option<Operator>,
+}
+
+/// One band of adjacent harmonics.
+struct Band {
+    /// Indices into the fitter's harmonics, in harmonic-number order.
+    members: Vec<usize>,
+    /// The Cholesky factor of the band's block of the normal matrix; `None` when singular.
     factor: Option<Vec<f64>>,
+}
+
+/// The normal matrix as a circular convolution: with `p[h] = a[h]`, `p[−h] = a[h]` and
+/// `q[h] = b[h]`, `q[−h] = −b[h]` for the cosine and sine coefficients `a` and `b` (indexed by
+/// harmonic number, negative indices wrapped), the products are `½(C ⊛ p + S ⊛ q)` for the
+/// cosine rows and `½(C ⊛ q − S ⊛ p)` for the sine rows, read at `0..=max h`.
+struct Operator {
+    size: usize,
+    forward: Arc<dyn RealToComplex<f64>>,
+    inverse: Arc<dyn ComplexToReal<f64>>,
+    /// The spectra of the wrapped `C` (even) and `S` (odd) sums, scaled by `1 / (2·size)`.
+    c_hat: Vec<Complex64>,
+    s_hat: Vec<Complex64>,
+}
+
+impl Operator {
+    /// The operator for the window sums `c[n]`, `s[n]`, `n = 0..=2·top`.
+    fn new(c: &[f64], s: &[f64], top: usize) -> Operator {
+        // Kernel indices run over −2·top..=2·top, and the vectors over −top..=top, so a
+        // circle longer than 4·top keeps every product that is read free of wrap-around.
+        let size = (4 * top + 2).next_power_of_two();
+        let mut planner = RealFftPlanner::<f64>::new();
+        let forward = planner.plan_fft_forward(size);
+        let inverse = planner.plan_fft_inverse(size);
+        let spectrum = |odd: bool, k: &[f64]| {
+            let mut buf = forward.make_input_vec();
+            buf[0] = k[0];
+            for n in 1..=2 * top {
+                buf[n] = k[n];
+                buf[size - n] = if odd { -k[n] } else { k[n] };
+            }
+            let mut out = forward.make_output_vec();
+            let _ = forward.process(&mut buf, &mut out);
+            let scale = 0.5 / size as f64;
+            out.iter().map(|v| v * scale).collect::<Vec<_>>()
+        };
+        Operator {
+            size,
+            c_hat: spectrum(false, c),
+            s_hat: spectrum(true, s),
+            forward,
+            inverse,
+        }
+    }
+
+    /// The normal matrix times the coefficients `y` (cosine parts then sine parts, in the
+    /// order of `harmonics`), plus the ridge.
+    fn apply(&self, harmonics: &[usize], y: &[f64]) -> Vec<f64> {
+        let k = harmonics.len();
+        let (mut p, mut q) = (self.forward.make_input_vec(), self.forward.make_input_vec());
+        for (j, &h) in harmonics.iter().enumerate() {
+            p[h] += y[j];
+            p[(self.size - h) % self.size] += y[j];
+            q[h] += y[k + j];
+            q[(self.size - h) % self.size] -= y[k + j];
+        }
+        let (mut ph, mut qh) = (
+            self.forward.make_output_vec(),
+            self.forward.make_output_vec(),
+        );
+        let _ = self.forward.process(&mut p, &mut ph);
+        let _ = self.forward.process(&mut q, &mut qh);
+        let mut cos_rows: Vec<Complex64> = (0..ph.len())
+            .map(|i| self.c_hat[i] * ph[i] + self.s_hat[i] * qh[i])
+            .collect();
+        let mut sin_rows: Vec<Complex64> = (0..ph.len())
+            .map(|i| self.c_hat[i] * qh[i] - self.s_hat[i] * ph[i])
+            .collect();
+        let last = ph.len() - 1;
+        for spec in [&mut cos_rows, &mut sin_rows] {
+            spec[0].im = 0.0;
+            spec[last].im = 0.0;
+        }
+        let (mut cos_out, mut sin_out) = (
+            self.inverse.make_output_vec(),
+            self.inverse.make_output_vec(),
+        );
+        let _ = self.inverse.process(&mut cos_rows, &mut cos_out);
+        let _ = self.inverse.process(&mut sin_rows, &mut sin_out);
+        let mut out = vec![0.0; 2 * k];
+        for (j, &h) in harmonics.iter().enumerate() {
+            out[j] = cos_out[h] + RIDGE * y[j];
+            out[k + j] = sin_out[h] + RIDGE * y[k + j];
+        }
+        out
+    }
 }
 
 impl HarmonicFitter {
     /// A fitter for windows of `len` samples and the harmonic numbers `harmonics` (each ≥ 1,
     /// no repeats) of `f0_hz`, at `rate`.
     pub fn new(len: usize, f0_hz: f64, harmonics: &[usize], rate: u32) -> HarmonicFitter {
+        HarmonicFitter::with_band_size(len, f0_hz, harmonics, rate, BAND_HARMONICS)
+    }
+
+    /// [`HarmonicFitter::new`] with at most `band` harmonics in one band.
+    fn with_band_size(
+        len: usize,
+        f0_hz: f64,
+        harmonics: &[usize],
+        rate: u32,
+        band: usize,
+    ) -> HarmonicFitter {
         let w0 = if rate == 0 {
             0.0
         } else {
             TAU * f0_hz / f64::from(rate)
         };
         let k = harmonics.len();
-        let m = 2 * k;
         let top = harmonics.iter().copied().max().unwrap_or(0);
-        let usable = len > 0 && k > 0 && rate > 0 && w0.is_finite() && top < (1 << 20);
-        let factor = if usable {
-            // c[n] = Σ cos(n·ω0·t) and s[n] = Σ sin(n·ω0·t) over the window.
-            let (mut c, mut s) = (vec![0.0f64; 2 * top + 1], vec![0.0f64; 2 * top + 1]);
-            for t in 0..len {
-                let (si, co) = (w0 * t as f64).sin_cos();
-                let step = Complex64::new(co, si);
-                let mut z = Complex64::new(1.0, 0.0);
-                for (cn, sn) in c.iter_mut().zip(&mut s) {
-                    *cn += z.re;
-                    *sn += z.im;
-                    z *= step;
-                }
-            }
-            let mut a = vec![0.0f64; m * m];
-            for (i, &hi) in harmonics.iter().enumerate() {
-                for (j, &hj) in harmonics.iter().enumerate() {
-                    let (diff, sum) = (hi.abs_diff(hj), hi + hj);
-                    // cos·cos, and (−sin)·(−sin).
-                    a[i * m + j] = 0.5 * (c[diff] + c[sum]);
-                    a[(k + i) * m + k + j] = 0.5 * (c[diff] - c[sum]);
-                    // cos(hi·ω0·t)·(−sin(hj·ω0·t)) = −½(sin((hi + hj)·ω0·t) + sin((hj − hi)·ω0·t)).
-                    let odd = if hj >= hi { s[diff] } else { -s[diff] };
-                    let v = -0.5 * (s[sum] + odd);
-                    a[i * m + k + j] = v;
-                    a[(k + j) * m + i] = v;
-                }
-            }
-            for i in 0..m {
-                a[i * m + i] += RIDGE;
-            }
-            cholesky_factor(&mut a, m).then_some(a)
-        } else {
-            None
+        let distinct = {
+            let mut sorted = harmonics.to_vec();
+            sorted.sort_unstable();
+            sorted.windows(2).all(|w| w[0] != w[1])
         };
-        HarmonicFitter {
+        let usable = len > 0
+            && k > 0
+            && rate > 0
+            && w0.is_finite()
+            && top < (1 << 20)
+            && distinct
+            && !harmonics.contains(&0);
+        let mut fitter = HarmonicFitter {
             len,
             w0,
             harmonics: harmonics.to_vec(),
-            factor,
+            bands: Vec::new(),
+            operator: None,
+        };
+        if !usable {
+            return fitter;
         }
+        // c[n] = Σ cos(n·ω0·t) and s[n] = Σ sin(n·ω0·t) over the window.
+        let (mut c, mut s) = (vec![0.0f64; 2 * top + 1], vec![0.0f64; 2 * top + 1]);
+        for t in 0..len {
+            let (si, co) = (w0 * t as f64).sin_cos();
+            let step = Complex64::new(co, si);
+            let mut z = Complex64::new(1.0, 0.0);
+            for (cn, sn) in c.iter_mut().zip(&mut s) {
+                *cn += z.re;
+                *sn += z.im;
+                z *= step;
+            }
+        }
+        let mut order: Vec<usize> = (0..k).collect();
+        order.sort_by_key(|&i| harmonics[i]);
+        fitter.bands = order
+            .chunks(band.max(1))
+            .map(|members| {
+                let hs: Vec<usize> = members.iter().map(|&i| harmonics[i]).collect();
+                Band {
+                    members: members.to_vec(),
+                    factor: normal_factor(&hs, &c, &s),
+                }
+            })
+            .collect();
+        if fitter.bands.len() > 1 {
+            fitter.operator = Some(Operator::new(&c, &s, top));
+        }
+        fitter
     }
 
     /// The complex amplitude of each harmonic for each window, as [`harmonic_fit`] gives it:
@@ -177,9 +314,10 @@ impl HarmonicFitter {
     /// singular system gives all zeros.
     pub fn fit(&self, windows: &[&[f32]]) -> Vec<Vec<Complex64>> {
         let k = self.harmonics.len();
-        let Some(factor) = &self.factor else {
-            return vec![vec![Complex64::default(); k]; windows.len()];
-        };
+        let zeros = vec![Complex64::default(); k];
+        if self.bands.is_empty() {
+            return vec![zeros; windows.len()];
+        }
         let top = self.harmonics.iter().copied().max().unwrap_or(0);
         // rhs[w][h] = Σ x_w[t]·e^{−i·h·ω0·t}, for every harmonic number up to the highest.
         let mut rhs = vec![vec![Complex64::default(); top + 1]; windows.len()];
@@ -199,23 +337,103 @@ impl HarmonicFitter {
                 }
             }
         }
-        let m = 2 * k;
         rhs.iter()
             .map(|r| {
                 // Column j is cos(h·ω0·t), so b = Σ x·cos = Re; column k + j is −sin, so
                 // b = −Σ x·sin = Im of Σ x·e^{−i·h·ω0·t}.
-                let mut b = vec![0.0f64; m];
+                let mut b = vec![0.0f64; 2 * k];
                 for (j, &h) in self.harmonics.iter().enumerate() {
                     b[j] = r[h].re;
                     b[k + j] = r[h].im;
                 }
-                match cholesky_substitute(factor, &b, m) {
+                match self.solve(&b) {
                     Some(y) => (0..k).map(|j| Complex64::new(y[j], y[k + j])).collect(),
-                    None => vec![Complex64::default(); k],
+                    None => zeros.clone(),
                 }
             })
             .collect()
     }
+
+    /// The band solves: each band's block of the matrix inverted on its own part of `r`.
+    /// `None` when a band is singular.
+    fn precondition(&self, r: &[f64]) -> Option<Vec<f64>> {
+        let k = self.harmonics.len();
+        let mut z = vec![0.0; 2 * k];
+        for band in &self.bands {
+            let n = band.members.len();
+            let mut b = vec![0.0; 2 * n];
+            for (j, &i) in band.members.iter().enumerate() {
+                b[j] = r[i];
+                b[n + j] = r[k + i];
+            }
+            let y = cholesky_substitute(band.factor.as_ref()?, &b, 2 * n)?;
+            for (j, &i) in band.members.iter().enumerate() {
+                z[i] = y[j];
+                z[k + i] = y[n + j];
+            }
+        }
+        Some(z)
+    }
+
+    /// Solves the normal equations for the right-hand side `b`: directly with one band, by
+    /// preconditioned conjugate gradients with more. `None` when it cannot be solved.
+    fn solve(&self, b: &[f64]) -> Option<Vec<f64>> {
+        let mut y = self.precondition(b)?;
+        let Some(op) = &self.operator else {
+            return Some(y);
+        };
+        let dot = |u: &[f64], v: &[f64]| u.iter().zip(v).map(|(a, b)| a * b).sum::<f64>();
+        let limit = TOLERANCE * dot(b, b).sqrt();
+        let gy = op.apply(&self.harmonics, &y);
+        let mut r: Vec<f64> = b.iter().zip(&gy).map(|(b, g)| b - g).collect();
+        let mut z = self.precondition(&r)?;
+        let mut p = z.clone();
+        let mut rz = dot(&r, &z);
+        for _ in 0..MAX_ITERATIONS {
+            if dot(&r, &r).sqrt() <= limit {
+                break;
+            }
+            let gp = op.apply(&self.harmonics, &p);
+            let curve = dot(&p, &gp);
+            if curve.is_nan() || curve <= 0.0 {
+                break;
+            }
+            let alpha = rz / curve;
+            y.iter_mut().zip(&p).for_each(|(y, p)| *y += alpha * p);
+            r.iter_mut().zip(&gp).for_each(|(r, g)| *r -= alpha * g);
+            z = self.precondition(&r)?;
+            let next = dot(&r, &z);
+            let beta = next / rz;
+            rz = next;
+            p.iter_mut().zip(&z).for_each(|(p, z)| *p = z + beta * *p);
+        }
+        y.iter().all(|v| v.is_finite()).then_some(y)
+    }
+}
+
+/// The Cholesky factor of the normal matrix for the harmonic numbers `hs`, built from the
+/// window sums `c[n] = Σ cos(n·ω0·t)` and `s[n] = Σ sin(n·ω0·t)`. `None` when it is singular.
+fn normal_factor(hs: &[usize], c: &[f64], s: &[f64]) -> Option<Vec<f64>> {
+    let k = hs.len();
+    let m = 2 * k;
+    let mut a = vec![0.0f64; m * m];
+    for (i, &hi) in hs.iter().enumerate() {
+        for (j, &hj) in hs.iter().enumerate() {
+            let (diff, sum) = (hi.abs_diff(hj), hi + hj);
+            // cos·cos, and (−sin)·(−sin).
+            a[i * m + j] = 0.5 * (c[diff] + c[sum]);
+            a[(k + i) * m + k + j] = 0.5 * (c[diff] - c[sum]);
+            // cos(hi·ω0·t)·(−sin(hj·ω0·t)) = −½(sin((hi + hj)·ω0·t) + sin((hj − hi)·ω0·t)).
+            let odd = if hj >= hi { s[diff] } else { -s[diff] };
+            let v = -0.5 * (s[sum] + odd);
+            a[i * m + k + j] = v;
+            a[(k + j) * m + i] = v;
+        }
+    }
+    for i in 0..m {
+        a[i * m + i] += RIDGE;
+    }
+    cholesky_factor(&mut a, m).then_some(a)
 }
 
 #[cfg(test)]
@@ -308,5 +526,58 @@ mod tests {
         assert!(all_zero(HarmonicFitter::new(n, f0, &hs, 0)));
         assert!(all_zero(HarmonicFitter::new(n, f64::NAN, &hs, rate)));
         assert!(HarmonicFitter::new(n, f0, &[], rate).fit(&[&x])[0].is_empty());
+    }
+
+    /// Harmonics `1..=count` of `f0` with amplitude `1/√h` and scattered phases, plus noise.
+    fn bright(f0: f64, count: usize, n: usize, rate: u32) -> Vec<f32> {
+        let mut r = crate::dsp::rng::SplitMix64::new(8);
+        (0..n)
+            .map(|t| {
+                let tone: f64 = (1..=count)
+                    .map(|h| {
+                        let w = TAU * f0 * h as f64 * t as f64 / f64::from(rate);
+                        (w + 0.37 * (h * h) as f64).cos() / (h as f64).sqrt()
+                    })
+                    .sum();
+                (0.05 * tone) as f32 + 0.01 * (r.next_f32() - 0.5)
+            })
+            .collect()
+    }
+
+    /// The largest error of `band` against `joint`, relative to each joint amplitude.
+    fn worst_relative(joint: &[Complex64], band: &[Complex64]) -> f64 {
+        joint
+            .iter()
+            .zip(band)
+            .map(|(j, b)| (j - b).norm() / j.norm())
+            .fold(0.0, f64::max)
+    }
+
+    #[test]
+    fn harmonic_fitter_bands_agree_with_the_joint_fit() {
+        let rate = 22_050;
+        // 299 harmonics of 36.75 Hz up to 10.99 kHz, over 4.3 periods (not a whole number):
+        // three default bands.
+        let (f0, count, n) = (36.75, 299, 2600);
+        let x = bright(f0, count, n, rate);
+        let hs: Vec<usize> = (1..=count).collect();
+        let joint = HarmonicFitter::with_band_size(n, f0, &hs, rate, usize::MAX).fit(&[&x]);
+        let banded = HarmonicFitter::new(n, f0, &hs, rate);
+        assert_eq!(banded.bands.len(), 3);
+        let banded = banded.fit(&[&x]);
+        let worst = worst_relative(&joint[0], &banded[0]);
+        assert!(worst < 1e-6, "default bands: worst relative error {worst}");
+
+        // Small bands, so most harmonics sit near a band edge, and harmonics listed out of
+        // order with gaps.
+        let hs: Vec<usize> = (1..=100).rev().filter(|h| h % 9 != 0).collect();
+        let joint = HarmonicFitter::with_band_size(n, f0, &hs, rate, usize::MAX).fit(&[&x]);
+        let small = HarmonicFitter::with_band_size(n, f0, &hs, rate, 32);
+        assert_eq!(small.bands.len(), 3);
+        let worst = worst_relative(&joint[0], &small.fit(&[&x])[0]);
+        assert!(
+            worst < 1e-6,
+            "32-harmonic bands: worst relative error {worst}"
+        );
     }
 }

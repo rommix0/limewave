@@ -23,6 +23,7 @@
 //!
 //! This code is separate from the tail engine; it shares only the `dsp` building blocks.
 
+use std::cell::OnceCell;
 use std::f64::consts::{FRAC_PI_2, PI, TAU};
 use std::sync::Arc;
 
@@ -320,7 +321,8 @@ fn refine_pitch(total: &[f64], n: usize, rate: f64, f0: f64) -> f64 {
 
 /// The harmonics of `f0` found in the averaged spectrum, as `(h, peak bin)`, from the
 /// fundamental up to half a fundamental below the Nyquist frequency, at most `max` of them,
-/// keeping only those within 70 dB of the loudest.
+/// keeping only those within 70 dB of the loudest. A harmonic with no peak to read is skipped,
+/// and the search goes on above it.
 fn harmonic_peaks(total: &[f64], n: usize, rate: f64, f0: f64, max: usize) -> Vec<(usize, usize)> {
     let per = f0 * n as f64 / rate;
     let span = search_span(per);
@@ -329,9 +331,8 @@ fn harmonic_peaks(total: &[f64], n: usize, rate: f64, f0: f64, max: usize) -> Ve
         if h as f64 * f0 >= rate / 2.0 - f0 / 2.0 {
             break;
         }
-        match peak_near(total, h as f64 * per, span) {
-            Some((k, _)) => found.push((h, k)),
-            None => break,
+        if let Some((k, _)) = peak_near(total, h as f64 * per, span) {
+            found.push((h, k));
         }
     }
     let loudest = found.iter().map(|&(_, k)| total[k]).fold(0.0, f64::max);
@@ -453,8 +454,16 @@ fn steady(job: &Job, f0: f64, m: usize, hs: &[usize]) -> Result<Parts, SpectrumL
             .collect()
     };
     let window_fit = fitter(wl);
-    let full_fit = if wl == w { None } else { Some(fitter(w)) };
-    let full_fit = full_fit.as_ref().unwrap_or(&window_fit);
+    // The full-window fitter for the entry and exit fits: the same one unless the range is
+    // shorter than a fit window, and then built only if a fit needs it.
+    let full_cell = OnceCell::new();
+    let full_fit = || {
+        if wl == w {
+            &window_fit
+        } else {
+            full_cell.get_or_init(|| fitter(w))
+        }
+    };
     let mut amps: Vec<Vec<f64>> = audio
         .iter()
         .map(|ch| {
@@ -478,7 +487,7 @@ fn steady(job: &Job, f0: f64, m: usize, hs: &[usize]) -> Result<Parts, SpectrumL
         .map(|ch| {
             let x = &ch[a..a + w.min(frames - a)];
             if x.len() == w {
-                full_fit.fit(&[x]).remove(0)
+                full_fit().fit(&[x]).remove(0)
             } else {
                 fitter(x.len()).fit(&[x]).remove(0)
             }
@@ -522,7 +531,15 @@ fn steady(job: &Job, f0: f64, m: usize, hs: &[usize]) -> Result<Parts, SpectrumL
     let unit = build(&amps);
     let gain = job.level_gain(&unit).ok_or(SpectrumLoopError::Silent)?;
     amps.iter_mut().flatten().for_each(|v| *v *= gain);
-    let looped = build(&amps);
+    // The inverse FFT is linear, so scaling its output is the same loop built from `amps`.
+    let looped: Vec<Vec<f32>> = unit
+        .into_iter()
+        .map(|ch| {
+            ch.into_iter()
+                .map(|v| (f64::from(v) * gain) as f32)
+                .collect()
+        })
+        .collect();
 
     // Sums of many harmonics are evaluated with powers of one rotation per frame, not one
     // cosine per harmonic: `powers(θ)[h] = e^{i·h·θ}`.
@@ -539,12 +556,16 @@ fn steady(job: &Job, f0: f64, m: usize, hs: &[usize]) -> Result<Parts, SpectrumL
     };
     let w0 = TAU * f0 / rate;
 
-    // The original's phase at `a` of each harmonic, as a unit rotation.
-    let units_in: Vec<Vec<Complex64>> = fit_in
+    // Each harmonic at the loop's amplitude with the original's phase at `a`. The glide's
+    // amplitude moves from |c| to the loop's, so its term is
+    // `(1 − g)·Re(c·e^{i·h·φ}) + g·Re(targets·e^{i·h·φ})`.
+    let targets: Vec<Vec<Complex64>> = fit_in
         .iter()
-        .map(|c| {
+        .zip(&amps)
+        .map(|(c, amp)| {
             c.iter()
-                .map(|c| Complex64::from_polar(1.0, c.arg()))
+                .zip(amp)
+                .map(|(c, &a)| Complex64::from_polar(a, c.arg()))
                 .collect()
         })
         .collect();
@@ -553,18 +574,16 @@ fn steady(job: &Job, f0: f64, m: usize, hs: &[usize]) -> Result<Parts, SpectrumL
         // The original's model runs at f0; the glide at the gliding fundamental.
         powers(&mut pa, w0 * i as f64);
         powers(&mut pb, phi[i]);
-        for (((out, x), (c_in, units)), amp) in entry
-            .iter_mut()
-            .zip(audio)
-            .zip(fit_in.iter().zip(&units_in))
-            .zip(&amps)
+        for ((out, x), (c_in, target)) in
+            entry.iter_mut().zip(audio).zip(fit_in.iter().zip(&targets))
         {
-            let (mut model, mut glide) = (0.0, 0.0);
-            for (((c, unit), &h), &target) in c_in.iter().zip(units).zip(hs).zip(amp) {
+            let (mut model, mut from, mut to) = (0.0, 0.0, 0.0);
+            for ((c, tg), &h) in c_in.iter().zip(target).zip(hs) {
                 model += (c * pa[h]).re;
-                let level = (1.0 - g[i]) * c.norm() + g[i] * target;
-                glide += level * (unit * pb[h]).re;
+                from += (c * pb[h]).re;
+                to += (tg * pb[h]).re;
             }
+            let glide = (1.0 - g[i]) * from + g[i] * to;
             let resid = f64::from(x[a + i]) - model;
             out.push((glide + (1.0 - g[i]) * resid) as f32);
         }
@@ -582,7 +601,7 @@ fn steady(job: &Job, f0: f64, m: usize, hs: &[usize]) -> Result<Parts, SpectrumL
         }
         let fit_out: Vec<Vec<Complex64>> = audio
             .iter()
-            .map(|x| full_fit.fit(&[&x[b..b + w]]).remove(0))
+            .map(|x| full_fit().fit(&[&x[b..b + w]]).remove(0))
             .collect();
         // The shortest-way correction that lands each harmonic on the original's phase at
         // the last exit frame.
@@ -602,23 +621,64 @@ fn steady(job: &Job, f0: f64, m: usize, hs: &[usize]) -> Result<Parts, SpectrumL
                     .collect()
             })
             .collect();
+        let norms_out: Vec<Vec<f64>> = fit_out
+            .iter()
+            .map(|c| c.iter().map(|c| c.norm()).collect())
+            .collect();
+        // Each harmonic's own part of the phase, `e^{i(start + gx·δ)}`, as a rotation that is
+        // stepped from frame to frame (a 4th-order Taylor step of the small angle `Δgx·δ`) and
+        // set exactly every RESYNC frames and on the last frame, instead of a sine and cosine
+        // per harmonic and frame.
+        const RESYNC: usize = 32;
+        let exact = |j: usize| -> Vec<Vec<Complex64>> {
+            start_phase
+                .iter()
+                .zip(&delta)
+                .map(|(start, d)| {
+                    start
+                        .iter()
+                        .zip(d)
+                        .map(|(&s, &d)| Complex64::from_polar(1.0, s + gx[j] * d))
+                        .collect()
+                })
+                .collect()
+        };
+        let mut rot = exact(0);
         let mut exit = vec![Vec::with_capacity(tx); audio.len()];
         for j in 0..tx {
+            if j > 0 {
+                if j % RESYNC == 0 || j == tx - 1 {
+                    rot = exact(j);
+                } else {
+                    let dg = gx[j] - gx[j - 1];
+                    for (r, d) in rot.iter_mut().zip(&delta) {
+                        for (r, &d) in r.iter_mut().zip(d) {
+                            let th = dg * d;
+                            let th2 = th * th;
+                            let step = Complex64::new(
+                                1.0 - th2 / 2.0 + th2 * th2 / 24.0,
+                                th * (1.0 - th2 / 6.0),
+                            );
+                            *r *= step;
+                        }
+                    }
+                }
+            }
             powers(&mut pa, w0 * j as f64);
             powers(&mut pb, psi[j]);
-            for ((((out, x), c_out), (start, d)), amp) in exit
+            for (((((out, x), c_out), norms), r), amp) in exit
                 .iter_mut()
                 .zip(audio)
                 .zip(&fit_out)
-                .zip(start_phase.iter().zip(&delta))
+                .zip(&norms_out)
+                .zip(&rot)
                 .zip(&amps)
             {
                 let (mut model, mut glide) = (0.0, 0.0);
-                for ((((c, &h), &s), &d), &from) in c_out.iter().zip(hs).zip(start).zip(d).zip(amp)
-                {
+                for ((((c, &n), &h), r), &from) in c_out.iter().zip(norms).zip(hs).zip(r).zip(amp) {
                     model += (c * pa[h]).re;
-                    let level = (1.0 - gx[j]) * from + gx[j] * c.norm();
-                    glide += level * (Complex64::from_polar(1.0, s + gx[j] * d) * pb[h]).re;
+                    let level = (1.0 - gx[j]) * from + gx[j] * n;
+                    glide += level * (r * pb[h]).re;
                 }
                 let resid = f64::from(x[b + j]) - model;
                 out.push((glide + gx[j] * resid) as f32);
@@ -1492,6 +1552,49 @@ mod tests {
         // The whole spectrum keeps its level too.
         let d = db(rms(&looped[0]) / rms(&x[0][a..=last]));
         assert!(d.abs() <= 0.5, "level {d} dB");
+    }
+
+    #[test]
+    fn a_missing_harmonic_does_not_hide_the_ones_above_it() {
+        // 220.5 Hz with harmonics 1–12 except the 5th.
+        let x = vec![
+            (0..at(1.5))
+                .map(|i| {
+                    let t = i as f64 / f64::from(RATE);
+                    (1..=12)
+                        .filter(|&h| h != 5)
+                        .map(|h| (TAU64 * 220.5 * f64::from(h) * t).cos() as f32 / h as f32)
+                        .sum::<f32>()
+                        * 0.2
+                })
+                .collect::<Vec<f32>>(),
+        ];
+        let e = EditState::default_for(x[0].len());
+        let an = analyse(&x, &e, Some(sel()), RATE, None).expect("analyses");
+        let f0 = f64::from(an.summary.pitch_hz.expect("pitched"));
+        let hs: Vec<usize> = harmonic_peaks(
+            &an.total,
+            an.summary.fft_size,
+            f64::from(RATE),
+            f0,
+            usize::MAX,
+        )
+        .into_iter()
+        .map(|(h, _)| h)
+        .collect();
+        assert_eq!(hs, vec![1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12]);
+
+        // The Steady loop carries every harmonic above the gap, at its own level, and nothing
+        // in the gap. With a 2 s loop, harmonic h is on bin 441·h.
+        let (_, looped, _) = run_sel(&x, &steady(2.0));
+        let spec = Fft::new(looped[0].len()).forward(&looped[0]);
+        let amp = |h: usize| spec[441 * h].norm() * 2.0 / looped[0].len() as f32;
+        let a1 = amp(1);
+        for h in [6, 7, 8, 9, 10, 11, 12] {
+            let d = db(amp(h) * h as f32 / a1);
+            assert!(d.abs() < 0.5, "harmonic {h}: {d} dB from 1/h");
+        }
+        assert!(amp(5) < 1e-4 * a1, "nothing in the gap");
     }
 
     #[test]
