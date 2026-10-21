@@ -18,3 +18,7 @@ testwav = []
 [[example]]
 name = "check_pack"
 required-features = ["testwav"]
+
+[[test]]
+name = "flow"
+required-features = ["testwav"]
