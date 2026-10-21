@@ -235,8 +235,10 @@ fn double_clicking_a_label_types_an_exact_position() {
     let at = flag_pos(&h, Marker::LoopEnd);
     double_click(&mut h, at);
     h.run();
-    h.get_by_label("Loop end position").focus();
-    h.run();
+    assert!(
+        h.get_by_label("Loop end position").is_focused(),
+        "the field takes the focus when it opens"
+    );
     h.get_by_label("Loop end position").type_text("4000");
     h.run();
     h.key_press(Key::Enter);
@@ -262,8 +264,6 @@ fn escape_and_bad_text_leave_a_typed_position_unchanged() {
     let at = flag_pos(&h, Marker::LoopEnd);
     double_click(&mut h, at);
     h.run();
-    h.get_by_label("Loop end position").focus();
-    h.run();
     h.get_by_label("Loop end position").type_text("4000");
     h.run();
     h.key_press(Key::Escape);
@@ -274,8 +274,6 @@ fn escape_and_bad_text_leave_a_typed_position_unchanged() {
 
     let at = flag_pos(&h, Marker::Start);
     double_click(&mut h, at);
-    h.run();
-    h.get_by_label("Start position").focus();
     h.run();
     h.get_by_label("Start position").type_text("abc");
     h.run();

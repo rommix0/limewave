@@ -7,6 +7,7 @@ use eframe::egui::{
     self, Align2, Area, Color32, CursorIcon, FontId, Frame, Galley, Id, Key, Order, Painter,
     PointerButton, Pos2, Rect, Response, Role, Sense, Shape, Stroke, TextEdit, WidgetInfo, pos2,
     text::{CCursor, CCursorRange},
+    text_edit::TextEditState,
     vec2,
 };
 use limewave_core::dsp::{PeakPyramid, snap_loop_end, snap_loop_start};
@@ -184,7 +185,8 @@ pub fn waveform_view(
     {
         let text = marker_frame(s.shown_edit(), marker).to_string();
         ui_state.marker_entry = Some((marker, text));
-        ui.memory_mut(|m| m.request_focus(entry_id()));
+        // The field takes the focus and selects its text in the frame it first appears.
+        ui.data_mut(|d| d.insert_temp(entry_id(), true));
     }
     let drag_id = response.id.with("drag");
     if response.drag_started_by(PointerButton::Primary)
@@ -279,23 +281,31 @@ fn marker_entry_field(
             pos2(f.rect.left(), f.rect.bottom() + 2.0)
         });
     let id = entry_id();
-    let first_frame = !ui.memory(|m| m.has_focus(id));
+    // A new `Area` skips its first frame, which drops a focus request made in it, so keep
+    // asking (and selecting the text) until the focus has survived a frame.
+    let pending = ui.data(|d| d.get_temp::<bool>(id)).unwrap_or(false);
+    let just_opened = pending && !ui.memory(|m| m.has_focus(id));
+    if pending && !just_opened {
+        ui.data_mut(|d| d.remove_temp::<bool>(id));
+    }
     let mut response = None;
     Area::new(id.with("area"))
         .order(Order::Foreground)
         .fixed_pos(pos)
         .show(ui.ctx(), |ui| {
             Frame::popup(ui.style()).show(ui, |ui| {
-                let mut out = TextEdit::singleline(&mut text)
+                if just_opened {
+                    ui.memory_mut(|m| m.request_focus(id));
+                    let all =
+                        CCursorRange::two(CCursor::new(0), CCursor::new(text.chars().count()));
+                    let mut state = TextEditState::load(ui.ctx(), id).unwrap_or_default();
+                    state.cursor.set_char_range(Some(all));
+                    state.store(ui.ctx(), id);
+                }
+                let out = TextEdit::singleline(&mut text)
                     .id(id)
                     .desired_width(72.0)
                     .show(ui);
-                if first_frame {
-                    let all =
-                        CCursorRange::two(CCursor::new(0), CCursor::new(text.chars().count()));
-                    out.state.cursor.set_char_range(Some(all));
-                    out.state.store(ui.ctx(), id);
-                }
                 response =
                     Some(Response::clone(&out.response).accessible_name(entry_label(marker)));
             });
@@ -304,7 +314,7 @@ fn marker_entry_field(
         return;
     };
     let (enter, escape) = ui.input(|i| (i.key_pressed(Key::Enter), i.key_pressed(Key::Escape)));
-    if escape || (response.lost_focus() && !first_frame) {
+    if escape || (response.lost_focus() && !just_opened) {
         if enter
             && !escape
             && let Ok(frame) = text.trim().parse::<usize>()
