@@ -18,7 +18,7 @@ pub mod wav;
 
 pub use error::{LoadError, SaveError, WavError};
 
-/// The software tag written into exported WAV files, e.g. `Limewave 0.1.0`.
+/// The software tag written into exported WAV files, e.g. `Limewave 0.2.0`.
 pub fn software_tag() -> String {
     format!("Limewave {}", env!("CARGO_PKG_VERSION"))
 }
