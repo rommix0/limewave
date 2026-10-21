@@ -366,15 +366,15 @@ fn effective_destination(s: &Session, dest: &Destination) -> Destination {
 /// reload error is returned.
 ///
 /// The rebased session keeps `s.source` when the save moved no frame (Start at 0, same frame
-/// and channel counts), so voices still sounding keep following the file's edits. Otherwise
-/// it gets a new source.
+/// count, and the same channel count as the processed audio), so voices still sounding keep
+/// following the file's edits. Otherwise it gets a new source.
 fn save_session(
     s: &mut Session,
     dest: &Destination,
     trim_after_loop: Option<usize>,
 ) -> Result<SaveOutcome, String> {
     let frames = s.doc.frames;
-    let channels = s.doc.audio.len();
+    let channels = s.processed.len();
     let mut e = s.edit().clone();
     if let Some(padding) = trim_after_loop {
         e = edit::trim_after_loop(&e, padding, frames);
@@ -479,6 +479,7 @@ mod tests {
 
     use limewave_core::document::load_wav;
     use limewave_core::edit::LoopMode;
+    use limewave_core::effects::Effect;
     use limewave_core::riff::Chunk;
     use limewave_core::smpl::{Smpl, SmplLoop};
     use limewave_core::testwav::{sine, wav_bytes};
@@ -775,6 +776,35 @@ mod tests {
         let s = session(&mut app, 0);
         assert_eq!(s.doc.frames, 8000 - 100, "the head was trimmed");
         assert_ne!(s.source, id, "the frames moved: a new source");
+    }
+
+    #[test]
+    fn a_save_after_a_channel_tool_keeps_the_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("stereo.wav");
+        let bytes = wav_bytes(
+            &[
+                sine(440.0, 44100, 8000, 0.5),
+                sine(660.0, 44100, 8000, 0.25),
+            ],
+            44100,
+            SampleFormat::Int { bits: 16 },
+            Vec::new(),
+        );
+        std::fs::write(&source, bytes).unwrap();
+        let out = dir.path().join("out");
+        let mut app = app_with(std::slice::from_ref(&source));
+        let s = session(&mut app, 0);
+        let id = s.source;
+        assert!(s.apply_effect(Effect::StereoToMono, None, None));
+        let results = perform_save(&mut app, folder_request(vec![0], &out));
+        assert!(results[0].1.is_ok(), "{:?}", results[0].1);
+        let s = session(&mut app, 0);
+        assert_eq!((s.doc.audio.len(), s.processed.len()), (1, 1));
+        assert_eq!(
+            s.source, id,
+            "same frames and channels as the processed audio"
+        );
     }
 
     #[test]

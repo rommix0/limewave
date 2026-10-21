@@ -12,6 +12,7 @@ use limewave::app::{FileEntry, LimewaveApp, Session};
 use limewave_core::document::load_wav_bytes;
 use limewave_core::dsp::is_upward;
 use limewave_core::edit::LoopMode;
+use limewave_core::effects::Effect;
 use limewave_core::riff::Chunk;
 use limewave_core::smpl::{Smpl, SmplLoop};
 use limewave_core::testwav::{sine, wav_bytes};
@@ -268,6 +269,27 @@ fn opening_a_long_stereo_file_renders_quickly() {
         first_frame.as_secs_f64() < 2.0,
         "first frame took {first_frame:?}"
     );
+}
+
+#[test]
+fn applying_an_effect_to_a_long_file_is_quick() {
+    let frames = 60 * 48_000;
+    let bytes = wav_bytes(
+        &[
+            sine(220.0, 48_000, frames, 0.6),
+            sine(331.0, 48_000, frames, 0.4),
+        ],
+        48_000,
+        SampleFormat::Int { bits: 24 },
+        Vec::new(),
+    );
+    let mut session = Session::new(load_wav_bytes(PathBuf::from("long.wav"), &bytes).unwrap());
+
+    let t = Instant::now();
+    assert!(session.apply_effect(Effect::Gain { db: -6.0 }, None, None));
+    let applied = t.elapsed();
+    eprintln!("60 s 48 kHz stereo 24-bit: apply gain {applied:?}");
+    assert!(applied.as_secs_f64() < 2.0, "applying took {applied:?}");
 }
 
 fn session_frames(h: &Harness<'static, LimewaveApp>) -> usize {

@@ -85,7 +85,7 @@ pub fn overview(ui: &mut egui::Ui, s: &mut Session, cursors: &[Cursor]) {
         let (lo, hi) = s
             .peaks
             .iter()
-            .zip(&s.doc.audio)
+            .zip(&s.processed)
             .map(|(p, c)| p.min_max(c, from, to))
             .fold((0.0f32, 0.0f32), |(lo, hi), (a, b)| (lo.min(a), hi.max(b)));
         let x = left + col as f32 + 0.5;

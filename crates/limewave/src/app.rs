@@ -11,6 +11,9 @@ use eframe::egui::{self, Event, Key, KeyboardShortcut, Modifiers};
 use limewave_core::document::{WavDocument, load_wav};
 use limewave_core::dsp::{PeakPyramid, mono_sum};
 use limewave_core::edit::{EditState, History};
+use limewave_core::effects::{
+    AppliedEffect, Effect, Op, apply_effect, mirror_edit, plan_effect, process,
+};
 use limewave_core::notes::note_name;
 use limewave_core::render::render;
 use limewave_core::save::{Destination, default_folder};
@@ -52,11 +55,17 @@ static NEXT_SOURCE: AtomicU64 = AtomicU64::new(1);
 pub struct Session {
     pub doc: WavDocument,
     pub history: History,
-    /// One peak pyramid per channel of `doc.audio`.
+    /// `doc.audio` after the current edit's effects: what the views draw and the engine plays
+    /// (apart from the crossfade). Same frame count as `doc.audio`, but the channel count may
+    /// differ after a channel tool.
+    pub processed: Vec<Vec<f32>>,
+    /// The effects `processed` was made with.
+    processed_for: Vec<AppliedEffect>,
+    /// One peak pyramid per channel of `processed`.
     pub peaks: Vec<PeakPyramid>,
-    /// Channel average of `doc.audio`, for analysis and drawing.
+    /// Channel average of `processed`, for analysis and drawing.
     pub mono: Vec<f32>,
-    /// `doc.audio` with the current crossfade applied.
+    /// `processed` with the current crossfade applied.
     pub rendered: Vec<Vec<f32>>,
     pub destination: Option<Destination>,
     /// Set by a save that mixed a crossfade into the file (the inspector says so); cleared
@@ -78,11 +87,14 @@ pub struct Session {
 impl Session {
     pub fn new(doc: WavDocument) -> Session {
         let initial = doc.initial_edit();
-        let peaks = doc.audio.iter().map(|c| PeakPyramid::build(c)).collect();
-        let mono = mono_sum(&doc.audio);
-        let rendered = render(&doc.audio, &initial);
+        let processed = process(&doc.audio, &initial.effects);
+        let peaks = processed.iter().map(|c| PeakPyramid::build(c)).collect();
+        let mono = mono_sum(&processed);
+        let rendered = render(&processed, &initial);
         Session {
             doc,
+            processed_for: initial.effects.clone(),
+            processed,
             history: History::new(initial),
             peaks,
             mono,
@@ -109,7 +121,7 @@ impl Session {
     /// The buffer the audio engine plays for the current edit.
     pub fn play_buffer(&self) -> PlayBuffer {
         play_buffer(
-            &self.doc.audio,
+            &self.processed,
             self.doc.format.sample_rate,
             self.edit(),
             self.source,
@@ -122,6 +134,31 @@ impl Session {
         self.preview = None;
         self.history.push(e.clamped(self.doc.frames));
         self.refresh(engine);
+    }
+
+    /// Applies `effect` as one history entry: planned on the processed audio, to `selection`
+    /// (inclusive frames) or to the range the effect defaults to. A Reverse that works on
+    /// Start...End mirrors the loop points with it. Returns false, changing nothing, when
+    /// the effect has nothing to do.
+    pub fn apply_effect(
+        &mut self,
+        effect: Effect,
+        selection: Option<(usize, usize)>,
+        engine: Option<&AudioEngine>,
+    ) -> bool {
+        let e = self.edit();
+        let Some(a) = plan_effect(effect, &self.processed, e, selection) else {
+            return false;
+        };
+        let mut next = match a.op {
+            Op::Reverse {
+                mirror_markers: true,
+            } => mirror_edit(e, a.first, a.last),
+            _ => e.clone(),
+        };
+        next.effects.push(a);
+        self.apply(next, engine);
+        true
     }
 
     pub fn undo(&mut self, engine: Option<&AudioEngine>) {
@@ -191,8 +228,34 @@ impl Session {
         }
     }
 
-    /// Recomputes `rendered` for the current edit and publishes it to the engine.
+    /// Brings `processed`, `peaks` and `mono` up to date with the current edit's effects:
+    /// only the new effects are applied when they extend the ones already applied, else the
+    /// audio is processed afresh. Does nothing when the effects are unchanged.
+    fn sync_processed(&mut self) {
+        let effects = &self.history.current().effects;
+        if *effects == self.processed_for {
+            return;
+        }
+        if effects.starts_with(&self.processed_for) {
+            for a in &effects[self.processed_for.len()..] {
+                apply_effect(&mut self.processed, a);
+            }
+        } else {
+            self.processed = process(&self.doc.audio, effects);
+        }
+        self.processed_for.clone_from(effects);
+        self.peaks = self
+            .processed
+            .iter()
+            .map(|c| PeakPyramid::build(c))
+            .collect();
+        self.mono = mono_sum(&self.processed);
+    }
+
+    /// Recomputes `processed` and `rendered` for the current edit and publishes it to the
+    /// engine.
     fn refresh(&mut self, engine: Option<&AudioEngine>) {
+        self.sync_processed();
         let e = self.history.current().clone();
         self.publish(&e, engine);
     }
@@ -202,11 +265,11 @@ impl Session {
         match engine {
             Some(engine) => {
                 let buffer =
-                    play_buffer(&self.doc.audio, self.doc.format.sample_rate, e, self.source);
+                    play_buffer(&self.processed, self.doc.format.sample_rate, e, self.source);
                 self.rendered.clone_from(&buffer.audio);
                 engine.set_buffer(buffer);
             }
-            None => self.rendered = render(&self.doc.audio, e),
+            None => self.rendered = render(&self.processed, e),
         }
     }
 }
@@ -623,6 +686,17 @@ impl LimewaveApp {
                 self.midi_spare = Some(tx);
                 self.midi_error = Some(message);
             }
+        }
+    }
+
+    /// Applies `effect` to the selected file as one undoable step. Until the waveform has a
+    /// selection, it always takes the effect's default range. Returns false when nothing was
+    /// applied.
+    pub fn apply_effect(&mut self, effect: Effect) -> bool {
+        let engine = self.engine.as_ref();
+        match self.selected.and_then(|i| self.files.get_mut(i)) {
+            Some(FileEntry::Loaded(s)) => s.apply_effect(effect, None, engine),
+            _ => false,
         }
     }
 
@@ -1045,6 +1119,7 @@ mod tests {
     use super::*;
     use limewave_core::document::load_wav_bytes;
     use limewave_core::edit::LoopMode;
+    use limewave_core::effects::FadeCurve;
     use limewave_core::testwav::{sine, wav_bytes};
     use limewave_core::wav::SampleFormat;
 
@@ -1178,6 +1253,138 @@ mod tests {
         assert_eq!(s.flush_preview(None), None);
         assert_eq!(s.rendered, s.doc.audio, "the held preview is published");
         assert_eq!(s.flush_preview(None), None, "nothing left to publish");
+    }
+
+    fn stereo_session() -> Session {
+        let bytes = wav_bytes(
+            &[
+                sine(220.0, 44100, 8000, 0.25),
+                sine(330.0, 44100, 8000, 0.125),
+            ],
+            44100,
+            SampleFormat::Int { bits: 16 },
+            Vec::new(),
+        );
+        Session::new(load_wav_bytes(PathBuf::from("st.wav"), &bytes).unwrap())
+    }
+
+    const GAIN_6: Effect = Effect::Gain { db: 6.0206 };
+
+    #[test]
+    fn effect_updates_processed_peaks_and_undo_restores() {
+        let mut s = session();
+        assert!(s.apply_effect(GAIN_6, None, None));
+        assert!(s.history.is_dirty());
+        for (p, d) in s.processed[0].iter().zip(&s.doc.audio[0]) {
+            assert!((p - 2.0 * d).abs() < 1e-3);
+        }
+        let (lo, hi) = s.peaks[0].min_max(&s.processed[0], 0, s.doc.frames);
+        let (lo0, hi0) = PeakPyramid::build(&s.doc.audio[0]).min_max(&s.doc.audio[0], 0, 8000);
+        assert!((hi - 2.0 * hi0).abs() < 1e-3 && (lo - 2.0 * lo0).abs() < 1e-3);
+        assert_eq!(s.mono, mono_sum(&s.processed));
+        assert_eq!(s.rendered, s.processed, "no crossfade: rendered follows");
+
+        s.undo(None);
+        assert_eq!(s.processed, s.doc.audio);
+        assert_eq!(s.mono, mono_sum(&s.doc.audio));
+        assert!(!s.history.is_dirty());
+    }
+
+    #[test]
+    fn nothing_to_do_adds_no_history_entry() {
+        let mut s = session();
+        // Mono-to-stereo on a stereo file does not apply; neither does stereo-to-mono on mono.
+        assert!(!s.apply_effect(Effect::StereoToMono, None, None));
+        assert!(!s.history.is_dirty());
+    }
+
+    #[test]
+    fn reverse_whole_and_undo_restore_markers_crossfade_and_audio() {
+        let mut s = session();
+        let e = EditState {
+            loop_mode: LoopMode::Forward,
+            loop_start: 2000,
+            loop_end: 6000,
+            crossfade: 10,
+            ..s.edit().clone()
+        };
+        s.apply(e, None);
+        assert!(s.apply_effect(Effect::Reverse, None, None));
+        let r = s.edit();
+        assert_eq!((r.loop_start, r.loop_end, r.crossfade), (1999, 5999, 10));
+        let mut want = s.doc.audio[0].clone();
+        want.reverse();
+        assert_eq!(s.processed[0], want);
+
+        s.undo(None);
+        let r = s.edit();
+        assert_eq!((r.loop_start, r.loop_end, r.crossfade), (2000, 6000, 10));
+        assert_eq!(s.processed, s.doc.audio);
+    }
+
+    #[test]
+    fn incremental_processing_matches_full_replay() {
+        let mut s = session();
+        assert!(s.apply_effect(GAIN_6, Some((100, 4000)), None));
+        assert!(s.apply_effect(Effect::FadeOut(FadeCurve::Linear), None, None));
+        assert!(s.apply_effect(Effect::Invert, Some((10, 20)), None));
+        let full = |s: &Session| process(&s.doc.audio, &s.edit().effects);
+        assert_eq!(s.edit().effects.len(), 3);
+        assert_eq!(s.processed, full(&s));
+        assert_eq!(s.processed_for, s.edit().effects);
+
+        s.undo(None);
+        assert_eq!(s.processed, full(&s));
+        s.redo(None);
+        assert_eq!(s.processed, full(&s));
+        assert_eq!(s.mono, mono_sum(&s.processed));
+
+        // A different effect after an undo is not an extension: the cache is rebuilt.
+        s.undo(None);
+        s.undo(None);
+        assert!(s.apply_effect(Effect::Invert, None, None));
+        assert_eq!(s.processed, full(&s));
+    }
+
+    #[test]
+    fn drag_previews_never_reprocess() {
+        let mut s = session();
+        assert!(s.apply_effect(GAIN_6, None, None));
+        // Corrupt the cache: a re-process would repair it.
+        s.processed[0][0] = 9.0;
+        let e = EditState {
+            start: 5,
+            ..s.edit().clone()
+        };
+        s.set_preview(e, None);
+        assert_eq!(s.processed[0][0], 9.0);
+    }
+
+    #[test]
+    fn channel_tool_changes_the_lane_count() {
+        let mut s = stereo_session();
+        assert_eq!((s.processed.len(), s.peaks.len()), (2, 2));
+        assert!(s.apply_effect(Effect::StereoToMono, None, None));
+        assert_eq!((s.processed.len(), s.peaks.len()), (1, 1));
+        assert_eq!(s.rendered.len(), 1);
+        assert_eq!(s.doc.audio.len(), 2, "the original is untouched");
+
+        let mut app = LimewaveApp::for_test();
+        app.files = vec![FileEntry::Loaded(Box::new(s))];
+        app.select(0);
+        let mut h = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1100.0, 700.0))
+            // The seam readout uses an arrow that the test font set lacks.
+            .allow_missing_glyphs()
+            .build_ui_state(|ui, app: &mut LimewaveApp| app.show(ui), app);
+        h.step();
+
+        let FileEntry::Loaded(s) = &mut h.state_mut().files[0] else {
+            unreachable!()
+        };
+        s.undo(None);
+        assert_eq!((s.processed.len(), s.peaks.len()), (2, 2));
+        h.step();
     }
 
     #[test]

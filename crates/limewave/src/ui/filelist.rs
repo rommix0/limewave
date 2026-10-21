@@ -123,7 +123,7 @@ fn thumbnail(ui: &mut Ui, s: &Session) {
         let (lo, hi) = s
             .peaks
             .iter()
-            .zip(&s.doc.audio)
+            .zip(&s.processed)
             .map(|(p, ch)| p.min_max(ch, from, to))
             .fold((0.0f32, 0.0f32), |(lo, hi), (a, b)| (lo.min(a), hi.max(b)));
         let px = rect.left() + x as f32 + 0.5;

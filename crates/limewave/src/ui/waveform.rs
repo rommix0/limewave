@@ -185,9 +185,9 @@ fn draw(
     let visible_x = |f: usize| x_of(f).clamp(left, rect.right());
 
     // Lanes, one per channel.
-    let channels = s.doc.audio.len().max(1);
+    let channels = s.processed.len().max(1);
     let lane_height = lanes.height() / channels as f32;
-    for (i, (channel, peaks)) in s.doc.audio.iter().zip(&s.peaks).enumerate() {
+    for (i, (channel, peaks)) in s.processed.iter().zip(&s.peaks).enumerate() {
         let lane = Rect::from_min_size(
             pos2(left, lanes_top + i as f32 * lane_height),
             vec2(width, lane_height),
