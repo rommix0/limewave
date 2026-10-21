@@ -447,14 +447,26 @@ fn envelope_section(ui: &mut Ui, envelope: &mut Adsr, release_after_loop: &mut b
     });
     time(ui, "Release", &mut envelope.release_ms);
     ui.checkbox(release_after_loop, "Release plays after loop end")
-        .on_hover_text(
-            "When a looped note is released, it stops looping and plays on through the loop              end into the rest of the audio, as a sampler with a sustain loop does. The              envelope's release still applies; a long release lets the whole release be heard.",
-        );
+        .on_hover_text(RELEASE_AFTER_LOOP_HINT);
 }
+
+/// The hover text of "Release plays after loop end" (v0.3 §7.3).
+const RELEASE_AFTER_LOOP_HINT: &str = concat!(
+    "When a looped note is released, it stops looping and plays on through the loop end ",
+    "into the rest of the audio, as a sampler with a sustain loop does. The envelope's ",
+    "release still applies; a long release lets the whole release be heard.",
+);
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn release_after_loop_hint_has_single_spaces() {
+        let hint = RELEASE_AFTER_LOOP_HINT;
+        assert!(!hint.contains("  ") && !hint.contains('\n'), "{hint}");
+        assert!(hint.ends_with("be heard."));
+    }
 
     #[test]
     fn crossfade_ms_round_trips_through_frames() {

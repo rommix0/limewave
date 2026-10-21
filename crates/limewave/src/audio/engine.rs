@@ -41,10 +41,11 @@ pub enum Command {
     /// Whether voices started from now on leave the loop when released and play on to End
     /// (v0.3 §7.3). Sounding voices keep the setting they started with.
     SetReleasePastLoop(bool),
-    /// A dialog preview (plan ruling R2): like `NoteOn`, with the session attack, but its
+    /// A dialog preview (plan ruling R2): like `NoteOn`, with the session attack only (no
+    /// decay, full sustain), but its
     /// release always leaves the loop and holds its level until End, so the generated release
     /// is heard as it is. `NoteOff` releases it that way; `AllOff` (Stop) fades it out over
-    /// [`STEAL_FADE_MS`], so Stop silences it at once.
+    /// [`STEAL_FADE_MS`], so Stop silences it at once, as does a new note on the same key.
     PreviewOn {
         note: u8,
         from: usize,
@@ -182,7 +183,7 @@ impl MixerState {
         }
     }
 
-    /// Releases any voice already playing `note`, then starts a new one in a free slot. With no
+    /// Releases any voice already playing `note` (a preview fades out), then starts a new one in a free slot. With no
     /// free slot a voice is stolen: the one that was playing `note`, else the oldest releasing
     /// voice, else the oldest. The stolen voice fades out over [`STEAL_FADE_MS`] in a spare
     /// slot rather than being cut. `preview` starts a [`Command::PreviewOn`] voice.
@@ -198,7 +199,13 @@ impl MixerState {
         let mut existing = None;
         for (i, slot) in self.voices.iter_mut().enumerate() {
             if let Some(v) = slot.as_mut().filter(|v| v.note() == note) {
-                v.release();
+                // A preview released here would play its whole held release under the new
+                // note, so it fades out instead.
+                if v.is_preview() {
+                    v.fade_out(STEAL_FADE_MS);
+                } else {
+                    v.release();
+                }
                 existing = Some(i);
             }
         }
@@ -1112,6 +1119,53 @@ mod tests {
             active(&state),
             [60],
             "still sounding 30 ms after the release"
+        );
+    }
+
+    #[test]
+    fn retriggering_a_preview_note_fades_the_preview_out() {
+        let b = with_release_audio();
+        let (mut tx, mut rx) = rtrb::RingBuffer::new(256);
+        let mut state = MixerState::new();
+        tx.push(Command::PreviewOn {
+            note: 60,
+            from: 2000,
+        })
+        .unwrap();
+        block(&mut state, &b, &mut rx, 200);
+        // As "Play original" does while the preview holds on its loop.
+        tx.push(Command::NoteOn { note: 60, from: 0 }).unwrap();
+        block(&mut state, &b, &mut rx, 480);
+        assert_eq!(active(&state), [60], "the preview is gone within 10 ms");
+        // Had it been released, it would reach the release audio (0.75) at frame 800.
+        let out = left(&block(&mut state, &b, &mut rx, 1500));
+        assert!(
+            out.iter().all(|s| (*s - 0.25).abs() < 1e-6),
+            "only the new note"
+        );
+    }
+
+    #[test]
+    fn preview_uses_the_attack_only() {
+        let b = with_release_audio();
+        let (mut tx, mut rx) = rtrb::RingBuffer::new(256);
+        let mut state = MixerState::new();
+        tx.push(Command::SetEnvelope(Adsr {
+            attack_ms: 0.0,
+            decay_ms: 10.0,
+            sustain: 0.5,
+            release_ms: 30.0,
+        }))
+        .unwrap();
+        tx.push(Command::PreviewOn {
+            note: 60,
+            from: 1000,
+        })
+        .unwrap();
+        let out = left(&block(&mut state, &b, &mut rx, 3000));
+        assert!(
+            out.iter().all(|s| (*s - 0.25).abs() < 1e-6),
+            "full level on the loop, without decay or sustain"
         );
     }
 

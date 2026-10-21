@@ -301,10 +301,13 @@ impl Voice {
         self
     }
 
-    /// Makes this a dialog preview voice (plan ruling R2): its release always leaves the loop,
-    /// and holds the level reached instead of fading, so the voice plays the audio after the
-    /// loop end in full and ends at End. [`Voice::fade_out`] still fades it.
+    /// Makes this a dialog preview voice (plan ruling R2): it keeps only the attack (no decay,
+    /// full sustain), its release always leaves the loop, and the release holds the level
+    /// reached instead of fading, so the generated audio is heard as rendered and the voice
+    /// ends at End. [`Voice::fade_out`] still fades it.
     pub fn preview(mut self) -> Voice {
+        self.adsr.decay_ms = 0.0;
+        self.adsr.sustain = 1.0;
         self.past_loop = true;
         self.hold_release = true;
         self
