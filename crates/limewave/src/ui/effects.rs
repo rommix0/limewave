@@ -4,10 +4,10 @@ use std::ops::RangeInclusive;
 
 use eframe::egui::{self, Button, DragValue};
 use limewave_core::edit::LoopMode;
-use limewave_core::effects::{Effect, FadeCurve, Op, peak, plan_effect};
+use limewave_core::effects::{Effect, FadeCurve};
 use limewave_core::wav::SampleFormat;
 
-use crate::app::{LimewaveApp, SELECT_ALL_SHORTCUT, Session};
+use crate::app::{LimewaveApp, SELECT_ALL_SHORTCUT};
 use crate::theme::colors;
 
 /// The toolbar's Edit menu. Selection items need a selection and loop items a loop; an item
@@ -147,29 +147,6 @@ pub fn effects_menu(ui: &mut egui::Ui, app: &mut LimewaveApp) {
     });
 }
 
-/// The peak over Start...End once `effect` (a Gain or Normalize) is applied to `selection`,
-/// or `None` when the effect would not scale anything.
-fn predicted_peak(s: &Session, effect: Effect, selection: Option<(usize, usize)>) -> Option<f32> {
-    let e = s.edit();
-    let a = plan_effect(effect, &s.processed, e, selection)?;
-    let Op::Scale(k) = a.op else { return None };
-    let (t0, t1) = (e.start.min(e.end), e.start.max(e.end));
-    let audio = &s.processed;
-    let mut p = 0.0f32;
-    // Start...End before, after and inside the scaled range.
-    if a.first > t0 {
-        p = p.max(peak(audio, t0, (a.first - 1).min(t1)));
-    }
-    if a.last < t1 {
-        p = p.max(peak(audio, (a.last + 1).max(t0), t1));
-    }
-    let (lo, hi) = (a.first.max(t0), a.last.min(t1));
-    if lo <= hi {
-        p = p.max(k * peak(audio, lo, hi));
-    }
-    Some(p)
-}
-
 /// The effect the open dialog applies with the remembered values; `None` for Auto-trim,
 /// which is not an effect.
 fn dialog_effect(dialog: EffectDialog, p: &EffectParams) -> Option<Effect> {
@@ -191,13 +168,15 @@ pub fn effect_dialog(ctx: &egui::Context, app: &mut LimewaveApp) {
         return;
     };
     // Gain and Normalize can push an integer file's peak past full scale.
-    let clips = app.selected_session().is_some_and(|s| {
+    let effect = dialog_effect(dialog, &app.ui.effect_params);
+    let selection = app.ui.selection;
+    let clips = app.selected_session_mut().is_some_and(|s| {
         let integer = matches!(s.doc.format.format, SampleFormat::Int { .. });
         let scaling = matches!(dialog, EffectDialog::Gain | EffectDialog::Normalize);
         integer
             && scaling
-            && dialog_effect(dialog, &app.ui.effect_params)
-                .and_then(|e| predicted_peak(s, e, app.ui.selection))
+            && effect
+                .and_then(|e| s.predicted_peak(e, selection))
                 .is_some_and(|p| p > 1.0)
     });
     let mut apply = false;

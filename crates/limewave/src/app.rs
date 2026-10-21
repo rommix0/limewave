@@ -59,6 +59,9 @@ type LoadResult = (usize, Result<WavDocument, String>);
 /// The next [`Session::source`]. Starts at 1: source 0 is the engine's empty buffer.
 static NEXT_SOURCE: AtomicU64 = AtomicU64::new(1);
 
+/// A [`Session::predicted_peak`] question, an effect and a selection, with its answer.
+type PredictedPeak = (Effect, Option<(usize, usize)>, Option<f32>);
+
 /// One open file: the decoded document, its edit history and the data derived from it.
 pub struct Session {
     pub doc: WavDocument,
@@ -75,6 +78,10 @@ pub struct Session {
     pub mono: Vec<f32>,
     /// `processed` with the current crossfade applied.
     pub rendered: Vec<Vec<f32>>,
+    /// The peak of `processed` over the current edit's Start...End.
+    trim_peak: f32,
+    /// The last [`Session::predicted_peak`] question (effect and selection) and its answer.
+    predicted: Option<PredictedPeak>,
     pub destination: Option<Destination>,
     /// Set by a save that mixed a crossfade into the file (the inspector says so); cleared
     /// by the next edit, undo or redo.
@@ -99,6 +106,7 @@ impl Session {
         let peaks = processed.iter().map(|c| PeakPyramid::build(c)).collect();
         let mono = mono_sum(&processed);
         let rendered = render(&processed, &initial);
+        let trim_peak = trim_peak(&processed, &initial);
         Session {
             doc,
             processed_for: initial.effects.clone(),
@@ -107,6 +115,8 @@ impl Session {
             peaks,
             mono,
             rendered,
+            trim_peak,
+            predicted: None,
             destination: None,
             just_saved: false,
             view: None,
@@ -124,9 +134,51 @@ impl Session {
     /// True when the processed audio peaks above full scale between Start and End and the
     /// file is an integer format, so saving would clip.
     pub fn will_clip(&self) -> bool {
+        matches!(self.doc.format.format, SampleFormat::Int { .. }) && self.trim_peak > 1.0
+    }
+
+    /// The peak over Start...End once `effect` (a Gain or Normalize) is applied to `selection`,
+    /// or `None` when the effect would not scale anything. The answer is kept until the
+    /// question or the edit changes, so the dialog asking every frame does not rescan.
+    pub fn predicted_peak(
+        &mut self,
+        effect: Effect,
+        selection: Option<(usize, usize)>,
+    ) -> Option<f32> {
+        if let Some((cached_effect, cached_selection, p)) = &self.predicted
+            && *cached_effect == effect
+            && *cached_selection == selection
+        {
+            return *p;
+        }
+        let p = self.scan_predicted_peak(&effect, selection);
+        self.predicted = Some((effect, selection, p));
+        p
+    }
+
+    fn scan_predicted_peak(
+        &self,
+        effect: &Effect,
+        selection: Option<(usize, usize)>,
+    ) -> Option<f32> {
         let e = self.edit();
-        matches!(self.doc.format.format, SampleFormat::Int { .. })
-            && peak(&self.processed, e.start.min(e.end), e.start.max(e.end)) > 1.0
+        let a = plan_effect(effect.clone(), &self.processed, e, selection)?;
+        let Op::Scale(k) = a.op else { return None };
+        let (t0, t1) = (e.start.min(e.end), e.start.max(e.end));
+        let audio = &self.processed;
+        let mut p = 0.0f32;
+        // Start...End before, after and inside the scaled range.
+        if a.first > t0 {
+            p = p.max(peak(audio, t0, (a.first - 1).min(t1)));
+        }
+        if a.last < t1 {
+            p = p.max(peak(audio, (a.last + 1).max(t0), t1));
+        }
+        let (lo, hi) = (a.first.max(t0), a.last.min(t1));
+        if lo <= hi {
+            p = p.max(k * peak(audio, lo, hi));
+        }
+        Some(p)
     }
 
     /// The edit the views draw: the drag preview if there is one, else the current edit.
@@ -273,6 +325,8 @@ impl Session {
     fn refresh(&mut self, engine: Option<&AudioEngine>) {
         self.sync_processed();
         let e = self.history.current().clone();
+        self.trim_peak = trim_peak(&self.processed, &e);
+        self.predicted = None;
         self.publish(&e, engine);
     }
 
@@ -288,6 +342,11 @@ impl Session {
             None => self.rendered = render(&self.processed, e),
         }
     }
+}
+
+/// The peak of `audio` over `e`'s Start...End.
+fn trim_peak(audio: &[Vec<f32>], e: &EditState) -> f32 {
+    peak(audio, e.start.min(e.end), e.start.max(e.end))
 }
 
 /// A slot in the file list.
@@ -645,6 +704,14 @@ impl LimewaveApp {
     /// The selected file, if it is loaded.
     pub(crate) fn selected_session(&self) -> Option<&Session> {
         match self.selected.and_then(|i| self.files.get(i)) {
+            Some(FileEntry::Loaded(s)) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// The selected file, if it is loaded, for changing.
+    pub(crate) fn selected_session_mut(&mut self) -> Option<&mut Session> {
+        match self.selected.and_then(|i| self.files.get_mut(i)) {
             Some(FileEntry::Loaded(s)) => Some(s),
             _ => None,
         }
@@ -1656,6 +1723,48 @@ mod tests {
         s.undo(None);
         assert!(s.apply_effect(Effect::Invert, None, None));
         assert_eq!(s.processed, full(&s));
+    }
+
+    #[test]
+    fn will_clip_reads_a_peak_kept_until_start_or_end_moves() {
+        let mut s = session();
+        assert!(!s.will_clip());
+        // Corrupt the audio behind the cache: only a fresh scan sees the over.
+        s.processed[0][100] = 2.0;
+        assert!(!s.will_clip(), "not rescanned");
+        let e = EditState {
+            start: 50,
+            ..s.edit().clone()
+        };
+        s.apply(e, None);
+        assert!(s.will_clip(), "rescanned for the new Start");
+    }
+
+    #[test]
+    fn predicted_peak_is_kept_until_the_question_or_the_edit_changes() {
+        let mut s = session();
+        let unity = Effect::Gain { db: 0.0 };
+        let p = s.predicted_peak(unity.clone(), None).unwrap();
+        assert!((p - 0.5).abs() < 1e-3, "{p}");
+        s.processed[0][100] = 2.0;
+        assert_eq!(
+            s.predicted_peak(unity.clone(), None),
+            Some(p),
+            "not rescanned"
+        );
+        // A new selection or effect asks again.
+        assert_eq!(s.predicted_peak(unity.clone(), Some((0, 200))), Some(2.0));
+        let louder = s.predicted_peak(Effect::Gain { db: 6.0 }, Some((0, 200)));
+        assert!(louder.is_some_and(|p| p > 3.9), "{louder:?}");
+        // So does an edit.
+        s.processed[0][100] = 0.0;
+        let e = EditState {
+            end: 7000,
+            ..s.edit().clone()
+        };
+        s.apply(e, None);
+        let p = s.predicted_peak(unity, Some((0, 200))).unwrap();
+        assert!(p < 1.0, "{p}");
     }
 
     #[test]
