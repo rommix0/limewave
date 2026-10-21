@@ -5,6 +5,7 @@
 
 use std::cell::RefCell;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use arc_swap::ArcSwap;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -37,6 +38,67 @@ pub enum Command {
         from: usize,
         to: usize,
     },
+}
+
+/// Where one sounding voice is: its read position in file frames and its envelope level.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Cursor {
+    pub frame: f64,
+    pub level: f32,
+}
+
+/// The voices' positions, published by the audio thread for the UI to draw as cursors.
+///
+/// One slot per voice: the `f64` bits of the frame and the `f32` bits of the level, where a
+/// level of 0 marks an empty slot. The audio thread writes every slot once per callback with
+/// plain atomic stores (no allocation, no locks). The frame is stored `Relaxed` and the level
+/// with `Release`; [`Cursors::read`] loads the level with `Acquire` before the frame, so a
+/// cursor never pairs a new level with an older frame. Slots are independent: a read may mix
+/// slots from two consecutive callbacks, which at most moves one cursor by a few milliseconds.
+pub struct Cursors {
+    frames: [AtomicU64; MAX_VOICES],
+    levels: [AtomicU32; MAX_VOICES],
+}
+
+impl Cursors {
+    pub fn new() -> Cursors {
+        Cursors {
+            frames: [const { AtomicU64::new(0) }; MAX_VOICES],
+            levels: [const { AtomicU32::new(0) }; MAX_VOICES],
+        }
+    }
+
+    /// The cursors of the voices currently sounding. UI side; allocates.
+    pub fn read(&self) -> Vec<Cursor> {
+        self.levels
+            .iter()
+            .zip(&self.frames)
+            .filter_map(|(level, frame)| {
+                let level = f32::from_bits(level.load(Ordering::Acquire));
+                (level > 0.0).then(|| Cursor {
+                    frame: f64::from_bits(frame.load(Ordering::Relaxed)),
+                    level,
+                })
+            })
+            .collect()
+    }
+
+    /// Writes every slot from `voices`. Audio side; does not allocate.
+    fn publish(&self, voices: &[Option<Voice>; MAX_VOICES]) {
+        for (i, voice) in voices.iter().enumerate() {
+            let (frame, level) = voice
+                .as_ref()
+                .map_or((0.0, 0.0), |v| (v.position(), v.level()));
+            self.frames[i].store(frame.to_bits(), Ordering::Relaxed);
+            self.levels[i].store(level.to_bits(), Ordering::Release);
+        }
+    }
+}
+
+impl Default for Cursors {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Voice slots owned by the audio callback.
@@ -122,12 +184,15 @@ impl Default for MixerState {
 /// The body of the audio callback: applies pending commands (new notes play `current`), then
 /// fills interleaved `out` (cleared first) with the mixed voices, clamped to [-1, 1]. Each
 /// voice plays whichever of `current` and `previous` has its source; a voice whose source is
-/// in neither is dropped. Does not allocate.
+/// in neither is dropped. Afterwards the voices' positions are published to `cursors`. Does not
+/// allocate.
+#[allow(clippy::too_many_arguments)]
 pub fn process(
     state: &mut MixerState,
     current: &PlayBuffer,
     previous: &PlayBuffer,
     cmds: &mut rtrb::Consumer<Command>,
+    cursors: &Cursors,
     out: &mut [f32],
     channels: usize,
     device_rate: u32,
@@ -136,21 +201,21 @@ pub fn process(
         state.apply(cmd, current, device_rate);
     }
     out.fill(0.0);
-    if channels == 0 {
-        return;
-    }
-    for slot in &mut state.voices {
-        let Some(v) = slot else { continue };
-        let buf = [current, previous]
-            .into_iter()
-            .find(|b| b.source == v.source());
-        if !buf.is_some_and(|b| v.render_add(b, out, channels, device_rate)) {
-            *slot = None;
+    if channels > 0 {
+        for slot in &mut state.voices {
+            let Some(v) = slot else { continue };
+            let buf = [current, previous]
+                .into_iter()
+                .find(|b| b.source == v.source());
+            if !buf.is_some_and(|b| v.render_add(b, out, channels, device_rate)) {
+                *slot = None;
+            }
+        }
+        for s in out {
+            *s = s.clamp(-1.0, 1.0);
         }
     }
-    for s in out {
-        *s = s.clamp(-1.0, 1.0);
-    }
+    cursors.publish(&state.voices);
 }
 
 /// Everything the audio callback owns.
@@ -167,6 +232,7 @@ struct Callback {
     previous: Arc<PlayBuffer>,
     ui_rx: rtrb::Consumer<Command>,
     midi_rx: rtrb::Consumer<Command>,
+    cursors: Arc<Cursors>,
     channels: usize,
     device_rate: u32,
 }
@@ -174,6 +240,7 @@ struct Callback {
 impl Callback {
     fn new(
         buffer: Arc<ArcSwap<PlayBuffer>>,
+        cursors: Arc<Cursors>,
         ui_rx: rtrb::Consumer<Command>,
         midi_rx: rtrb::Consumer<Command>,
         channels: usize,
@@ -187,6 +254,7 @@ impl Callback {
             buffer,
             ui_rx,
             midi_rx,
+            cursors,
             channels,
             device_rate,
         }
@@ -209,6 +277,7 @@ impl Callback {
             &self.current,
             &self.previous,
             &mut self.ui_rx,
+            &self.cursors,
             out,
             self.channels,
             self.device_rate,
@@ -226,6 +295,7 @@ pub struct AudioEngine {
     /// Buffers swapped out by `set_buffer` that the audio thread may still hold. Each is dropped
     /// here on the UI thread once nothing else holds it, so the audio thread never frees one.
     retired: RefCell<Vec<Arc<PlayBuffer>>>,
+    cursors: Arc<Cursors>,
     ui_tx: rtrb::Producer<Command>,
     midi_tx: Option<rtrb::Producer<Command>>,
 }
@@ -249,8 +319,10 @@ impl AudioEngine {
         let buffer = Arc::new(ArcSwap::from_pointee(empty_buffer(device_rate)));
         let (ui_tx, ui_rx) = rtrb::RingBuffer::new(COMMAND_CAPACITY);
         let (midi_tx, midi_rx) = rtrb::RingBuffer::new(COMMAND_CAPACITY);
+        let cursors = Arc::new(Cursors::new());
         let cb = Callback::new(
             Arc::clone(&buffer),
+            Arc::clone(&cursors),
             ui_rx,
             midi_rx,
             usize::from(config.channels),
@@ -283,6 +355,7 @@ impl AudioEngine {
             _stream: stream,
             buffer,
             retired: RefCell::new(Vec::new()),
+            cursors,
             ui_tx,
             midi_tx: Some(midi_tx),
         })
@@ -296,6 +369,11 @@ impl AudioEngine {
         // After `swap`, a reader still holding an old buffer owns a counted reference, so a count
         // of 1 means only this list holds it and dropping it here is the final free.
         retired.retain(|b| Arc::strong_count(b) > 1);
+    }
+
+    /// The cursors of the voices sounding as of the last audio callback.
+    pub fn cursors(&self) -> Vec<Cursor> {
+        self.cursors.read()
     }
 
     /// Queues a command for the audio thread. Dropped if the queue is full.
@@ -427,8 +505,19 @@ mod tests {
         rx: &mut rtrb::Consumer<Command>,
         frames: usize,
     ) -> Vec<f32> {
+        block_with(state, b, rx, &Cursors::new(), frames)
+    }
+
+    /// Like [`block`], publishing the voices' positions to `cursors`.
+    fn block_with(
+        state: &mut MixerState,
+        b: &PlayBuffer,
+        rx: &mut rtrb::Consumer<Command>,
+        cursors: &Cursors,
+        frames: usize,
+    ) -> Vec<f32> {
         let mut out = vec![0.7; frames * 2];
-        process(state, b, b, rx, &mut out, 2, RATE);
+        process(state, b, b, rx, cursors, &mut out, 2, RATE);
         out
     }
 
@@ -444,7 +533,7 @@ mod tests {
         let swap = Arc::new(ArcSwap::from_pointee(first));
         let (tx, rx) = rtrb::RingBuffer::new(256);
         let (_, midi_rx) = rtrb::RingBuffer::new(256);
-        let cb = Callback::new(Arc::clone(&swap), rx, midi_rx, 2, RATE);
+        let cb = Callback::new(Arc::clone(&swap), Arc::default(), rx, midi_rx, 2, RATE);
         (cb, swap, tx)
     }
 
@@ -706,6 +795,77 @@ mod tests {
         let (mut tx, mut rx) = rtrb::RingBuffer::new(256);
         let mut state = MixerState::new();
         tx.push(Command::NoteOn { note: 60, from: 0 }).unwrap();
-        process(&mut state, &b, &b, &mut rx, &mut [], 0, RATE);
+        process(
+            &mut state,
+            &b,
+            &b,
+            &mut rx,
+            &Cursors::new(),
+            &mut [],
+            0,
+            RATE,
+        );
+    }
+
+    #[test]
+    fn cursors_report_sounding_voices() {
+        let b = looping();
+        let (mut tx, mut rx) = rtrb::RingBuffer::new(256);
+        let mut state = MixerState::new();
+        let cursors = Cursors::new();
+        assert!(cursors.read().is_empty());
+        tx.push(Command::SetEnvelope(FLAT)).unwrap();
+        tx.push(Command::NoteOn { note: 60, from: 0 }).unwrap();
+        block_with(&mut state, &b, &mut rx, &cursors, 480);
+        let got = cursors.read();
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert!((got[0].frame - 480.0).abs() <= 1.0, "{}", got[0].frame);
+        assert_eq!(got[0].level, 1.0);
+    }
+
+    #[test]
+    fn cursors_clear_when_voices_end() {
+        let b = looping();
+        let (mut tx, mut rx) = rtrb::RingBuffer::new(256);
+        let mut state = MixerState::new();
+        let cursors = Cursors::new();
+        tx.push(Command::SetEnvelope(FLAT)).unwrap();
+        tx.push(Command::NoteOn { note: 60, from: 0 }).unwrap();
+        tx.push(Command::NoteOn { note: 64, from: 0 }).unwrap();
+        block_with(&mut state, &b, &mut rx, &cursors, 64);
+        assert_eq!(cursors.read().len(), 2);
+
+        tx.push(Command::AllOff).unwrap();
+        block_with(&mut state, &b, &mut rx, &cursors, 100);
+        let fading = cursors.read();
+        assert_eq!(fading.len(), 2, "still releasing");
+        assert!(fading.iter().all(|c| c.level < 1.0));
+        // The 10 ms (480 frame) release is over.
+        block_with(&mut state, &b, &mut rx, &cursors, 480);
+        assert!(cursors.read().is_empty());
+    }
+
+    #[test]
+    fn cursors_follow_backward_loops() {
+        let mut b = looping();
+        b.loop_mode = LoopMode::Backward;
+        let (mut tx, mut rx) = rtrb::RingBuffer::new(256);
+        let mut state = MixerState::new();
+        let cursors = Cursors::new();
+        tx.push(Command::SetEnvelope(FLAT)).unwrap();
+        // Forward from 1500 to the loop end at 2999, then backward.
+        tx.push(Command::NoteOn {
+            note: 60,
+            from: 1500,
+        })
+        .unwrap();
+        block_with(&mut state, &b, &mut rx, &cursors, 1600);
+        let mut last = cursors.read()[0].frame;
+        for _ in 0..5 {
+            block_with(&mut state, &b, &mut rx, &cursors, 100);
+            let now = cursors.read()[0].frame;
+            assert!(now < last - 90.0, "{now} should be below {last}");
+            last = now;
+        }
     }
 }

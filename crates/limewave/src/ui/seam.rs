@@ -9,8 +9,9 @@ use limewave_core::edit::{EditState, LoopMode, Marker, move_marker};
 use limewave_core::render::{SeamData, seam_data};
 use limewave_core::wav::SampleFormat;
 
+use super::waveform::cursor_color;
 use crate::app::{Session, UiState};
-use crate::audio::engine::AudioEngine;
+use crate::audio::engine::{AudioEngine, Cursor};
 use crate::theme::colors;
 
 pub const MIN_HALF: usize = 16;
@@ -166,6 +167,7 @@ pub fn seam_view(
     s: &mut Session,
     ui_state: &mut UiState,
     engine: Option<&AudioEngine>,
+    cursors: &[Cursor],
 ) {
     let e = s.shown_edit().clone();
     if e.loop_mode == LoopMode::Off {
@@ -224,6 +226,43 @@ pub fn seam_view(
     painter.rect_filled(rect, 2.0, BACKGROUND);
     if let Some(seam) = &seam {
         draw(&painter, rect, seam, ui_state.seam_half);
+        draw_cursors(
+            &painter,
+            rect,
+            ui_state.seam_half,
+            (e.loop_start, e.loop_end),
+            cursors,
+        );
+    }
+}
+
+/// Cursors inside the window around the loop end (left half) or the loop start (right half), at
+/// the x of the sample they are on. A frame sits where `draw` puts that sample: the loop end
+/// next to the centre line on its left, the loop start next to it on its right.
+fn draw_cursors(
+    painter: &egui::Painter,
+    rect: Rect,
+    half: usize,
+    (loop_start, loop_end): (usize, usize),
+    cursors: &[Cursor],
+) {
+    let centre = rect.center().x;
+    let spacing = ((rect.width() / 2.0 - SIDE_MARGIN).max(1.0)) / half as f32;
+    let end = loop_end as f64 + 1.0;
+    let start = loop_start as f64;
+    for c in cursors {
+        let before_end = (end - half as f64..end).contains(&c.frame);
+        let after_start = (start..start + half as f64).contains(&c.frame);
+        let mut xs = Vec::with_capacity(2);
+        if before_end {
+            xs.push(centre - spacing / 2.0 - ((end - 1.0 - c.frame) as f32) * spacing);
+        }
+        if after_start {
+            xs.push(centre + spacing / 2.0 + ((c.frame - start) as f32) * spacing);
+        }
+        for x in xs {
+            painter.vline(x, rect.y_range(), Stroke::new(1.0, cursor_color(c)));
+        }
     }
 }
 

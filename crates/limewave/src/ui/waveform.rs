@@ -10,7 +10,7 @@ use limewave_core::edit::{EditState, LoopMode, Marker, move_marker};
 
 use super::coords::{ViewTransform, hit_marker};
 use crate::app::{Session, UiState};
-use crate::audio::engine::AudioEngine;
+use crate::audio::engine::{AudioEngine, Cursor};
 use crate::theme::colors;
 
 const BACKGROUND: Color32 = Color32::from_rgb(0x15, 0x17, 0x1d);
@@ -56,6 +56,7 @@ pub fn waveform_view(
     s: &mut Session,
     ui_state: &mut UiState,
     engine: Option<&AudioEngine>,
+    cursors: &[Cursor],
 ) {
     let (rect, response) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
     response.widget_info(|| WidgetInfo::labeled(Role::Canvas, true, "Waveform"));
@@ -129,6 +130,20 @@ pub fn waveform_view(
 
     let ruler_color = ui.visuals().weak_text_color();
     draw(&painter, rect, s, &view, hovered, ruler_color);
+    for c in cursors {
+        let x = view.frame_to_x(c.frame, left);
+        if (left..=rect.right()).contains(&x) {
+            painter.vline(x, rect.y_range(), Stroke::new(1.0, cursor_color(c)));
+        }
+    }
+}
+
+/// The colour of a playback cursor: neon, as opaque as the voice's envelope level.
+pub fn cursor_color(c: &Cursor) -> Color32 {
+    with_alpha(
+        colors::NEON,
+        (c.level.clamp(0.0, 1.0) * 255.0).round() as u8,
+    )
 }
 
 /// The edit after dragging `marker` to the (fractional) frame `target`, snapped onto an

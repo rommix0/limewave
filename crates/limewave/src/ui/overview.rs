@@ -7,7 +7,9 @@ use eframe::egui::{
 use limewave_core::edit::LoopMode;
 
 use super::coords::ViewTransform;
+use super::waveform::cursor_color;
 use crate::app::Session;
+use crate::audio::engine::Cursor;
 use crate::theme::colors;
 
 /// Height of the strip in points.
@@ -23,7 +25,7 @@ fn with_alpha(c: Color32, alpha: u8) -> Color32 {
     Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), alpha)
 }
 
-pub fn overview(ui: &mut egui::Ui, s: &mut Session) {
+pub fn overview(ui: &mut egui::Ui, s: &mut Session, cursors: &[Cursor]) {
     let width = ui.available_width().max(1.0);
     let (rect, response) =
         ui.allocate_exact_size(vec2(width, OVERVIEW_HEIGHT), Sense::click_and_drag());
@@ -114,6 +116,13 @@ pub fn overview(ui: &mut egui::Ui, s: &mut Session) {
     }
     marker(e.start, colors::START);
     marker(e.end, colors::END);
+
+    for c in cursors {
+        let x = left + (c.frame / frames_per_px_overview) as f32;
+        if (left..=rect.right()).contains(&x) {
+            painter.vline(x, rect.y_range(), Stroke::new(1.0, cursor_color(c)));
+        }
+    }
 
     // The visible range.
     let x0 = left + (view.first / frames_per_px_overview) as f32;

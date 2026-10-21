@@ -15,7 +15,7 @@ use limewave_core::notes::note_name;
 use limewave_core::render::render;
 use limewave_core::save::{Destination, default_folder};
 
-use crate::audio::engine::{AudioEngine, Command};
+use crate::audio::engine::{AudioEngine, Command, Cursor};
 use crate::audio::keys::{octave_shift, qwerty_note};
 use crate::audio::midi::{MidiConnection, connect_midi, list_midi_ports};
 use crate::audio::voice::{PlayBuffer, play_buffer};
@@ -712,6 +712,13 @@ impl LimewaveApp {
         }
     }
 
+    /// The playback cursors of the sounding voices; empty without an audio engine.
+    pub fn cursors(&self) -> Vec<Cursor> {
+        self.engine
+            .as_ref()
+            .map_or_else(Vec::new, AudioEngine::cursors)
+    }
+
     /// Draws the whole window into `ui`.
     pub fn show(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
@@ -740,7 +747,11 @@ impl LimewaveApp {
         }
         self.inspector_panel(ui);
         self.keyboard_panel(ui);
-        egui::CentralPanel::default().show(ui, |ui| self.central(ui));
+        let cursors = self.cursors();
+        if !cursors.is_empty() {
+            ctx.request_repaint();
+        }
+        egui::CentralPanel::default().show(ui, |ui| self.central(ui, &cursors));
         self.unsaved_prompt(&ctx);
         if let Some(req) = save_dialog(&ctx, &mut self.ui.save_dialog, &self.files) {
             self.save_results = Some(perform_save(self, req));
@@ -959,7 +970,7 @@ impl LimewaveApp {
         }
     }
 
-    fn central(&mut self, ui: &mut egui::Ui) {
+    fn central(&mut self, ui: &mut egui::Ui, cursors: &[Cursor]) {
         let engine = self.engine.as_ref();
         let ui_state = &mut self.ui;
         let Some(entry) = self.selected.and_then(|i| self.files.get_mut(i)) else {
@@ -970,15 +981,15 @@ impl LimewaveApp {
         match entry {
             FileEntry::Loaded(s) => {
                 ui.label(format!("{} frames", s.doc.frames));
-                overview(ui, s);
+                overview(ui, s, cursors);
                 ui.add_space(4.0);
                 egui::Panel::bottom("seam")
                     .resizable(true)
                     .default_size(SEAM_PANEL_HEIGHT)
                     .size_range(120.0..=600.0)
-                    .show(ui, |ui| seam_view(ui, s, ui_state, engine));
+                    .show(ui, |ui| seam_view(ui, s, ui_state, engine, cursors));
                 let size = ui.available_size();
-                ui.allocate_ui(size, |ui| waveform_view(ui, s, ui_state, engine));
+                ui.allocate_ui(size, |ui| waveform_view(ui, s, ui_state, engine, cursors));
             }
             FileEntry::Loading(_) => {
                 ui.weak("Loading…");
