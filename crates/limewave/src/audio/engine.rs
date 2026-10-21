@@ -46,9 +46,13 @@ pub enum Command {
     /// release always leaves the loop and holds its level until End, so the generated release
     /// is heard as it is. `NoteOff` releases it that way; `AllOff` (Stop) fades it out over
     /// [`STEAL_FADE_MS`], so Stop silences it at once, as does a new note on the same key.
+    /// With `hold_loop` false the voice ignores the loop from the start and plays straight
+    /// through to End (a Decay tail, v0.3 §7.1); with it true it holds on the loop until
+    /// released (a Sustain tail, a spectrum loop).
     PreviewOn {
         note: u8,
         from: usize,
+        hold_loop: bool,
     },
 }
 
@@ -149,14 +153,18 @@ impl MixerState {
     fn apply(&mut self, cmd: Command, buf: &PlayBuffer, device_rate: u32) {
         match cmd {
             Command::NoteOn { note, from } => {
-                self.note_on(note, from, None, false, buf, device_rate);
+                self.note_on(note, from, None, None, buf, device_rate);
             }
-            Command::PreviewOn { note, from } => {
-                self.note_on(note, from, None, true, buf, device_rate);
+            Command::PreviewOn {
+                note,
+                from,
+                hold_loop,
+            } => {
+                self.note_on(note, from, None, Some(hold_loop), buf, device_rate);
             }
             Command::SetReleasePastLoop(on) => self.release_past_loop = on,
             Command::PlayRange { note, from, to } => {
-                self.note_on(note, from, Some(to), false, buf, device_rate);
+                self.note_on(note, from, Some(to), None, buf, device_rate);
             }
             Command::NoteOff { note } => self
                 .voices
@@ -186,13 +194,14 @@ impl MixerState {
     /// Releases any voice already playing `note` (a preview fades out), then starts a new one in a free slot. With no
     /// free slot a voice is stolen: the one that was playing `note`, else the oldest releasing
     /// voice, else the oldest. The stolen voice fades out over [`STEAL_FADE_MS`] in a spare
-    /// slot rather than being cut. `preview` starts a [`Command::PreviewOn`] voice.
+    /// slot rather than being cut. `preview` (`Some(hold_loop)`) starts a
+    /// [`Command::PreviewOn`] voice.
     fn note_on(
         &mut self,
         note: u8,
         from: usize,
         stop_at: Option<usize>,
-        preview: bool,
+        preview: Option<bool>,
         buf: &PlayBuffer,
         device_rate: u32,
     ) {
@@ -219,7 +228,10 @@ impl MixerState {
         };
         let voice = Voice::new(note, from, buf, device_rate, self.adsr, stop_at)
             .release_past_loop(self.release_past_loop);
-        self.voices[slot] = Some(if preview { voice.preview() } else { voice });
+        self.voices[slot] = Some(match preview {
+            Some(hold_loop) => voice.preview(hold_loop),
+            None => voice,
+        });
         self.age[slot] = self.counter;
         self.counter += 1;
     }
@@ -1165,6 +1177,7 @@ mod tests {
         tx.push(Command::PreviewOn {
             note: 60,
             from: 2000,
+            hold_loop: true,
         })
         .unwrap();
         let out = left(&block(&mut state, &b, &mut rx, 200));
@@ -1183,6 +1196,39 @@ mod tests {
     }
 
     #[test]
+    fn a_preview_without_hold_loop_plays_through_the_loop_to_end() {
+        let b = with_release_audio();
+        let (mut tx, mut rx) = rtrb::RingBuffer::new(256);
+        let mut state = MixerState::new();
+        // From 2000, inside the loop (1000..=2999), with no note-off: it does not wrap.
+        tx.push(Command::PreviewOn {
+            note: 60,
+            from: 2000,
+            hold_loop: false,
+        })
+        .unwrap();
+        let out = left(&block(&mut state, &b, &mut rx, 2500));
+        assert!(out[200..1000].iter().all(|s| (*s - 0.25).abs() < 1e-6));
+        assert!(
+            out[1000..2000].iter().all(|s| (*s - 0.75).abs() < 1e-6),
+            "past the loop end at full level"
+        );
+        assert!(out[2000..].iter().all(|s| *s == 0.0), "ended at End");
+        assert!(active(&state).is_empty());
+
+        // Started past the loop end, it plays on from there instead of jumping back.
+        tx.push(Command::PreviewOn {
+            note: 60,
+            from: 3500,
+            hold_loop: false,
+        })
+        .unwrap();
+        let out = left(&block(&mut state, &b, &mut rx, 1000));
+        assert!(out[200..500].iter().all(|s| (*s - 0.75).abs() < 1e-6));
+        assert!(out[500..].iter().all(|s| *s == 0.0));
+    }
+
+    #[test]
     fn retriggering_a_preview_note_fades_the_preview_out() {
         let b = with_release_audio();
         let (mut tx, mut rx) = rtrb::RingBuffer::new(256);
@@ -1190,6 +1236,7 @@ mod tests {
         tx.push(Command::PreviewOn {
             note: 60,
             from: 2000,
+            hold_loop: true,
         })
         .unwrap();
         block(&mut state, &b, &mut rx, 200);
@@ -1220,6 +1267,7 @@ mod tests {
         tx.push(Command::PreviewOn {
             note: 60,
             from: 1000,
+            hold_loop: true,
         })
         .unwrap();
         let out = left(&block(&mut state, &b, &mut rx, 3000));
@@ -1237,6 +1285,7 @@ mod tests {
         tx.push(Command::PreviewOn {
             note: 60,
             from: 2000,
+            hold_loop: true,
         })
         .unwrap();
         block(&mut state, &b, &mut rx, 400);

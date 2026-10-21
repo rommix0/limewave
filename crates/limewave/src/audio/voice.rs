@@ -304,12 +304,17 @@ impl Voice {
     /// Makes this a dialog preview voice (plan ruling R2): it keeps only the attack (no decay,
     /// full sustain), its release always leaves the loop, and the release holds the level
     /// reached instead of fading, so the generated audio is heard as rendered and the voice
-    /// ends at End. [`Voice::fade_out`] still fades it.
-    pub fn preview(mut self) -> Voice {
+    /// ends at End. [`Voice::fade_out`] still fades it. Without `hold_loop` it ignores the
+    /// loop from the start, playing straight through to End.
+    pub fn preview(mut self, hold_loop: bool) -> Voice {
         self.adsr.decay_ms = 0.0;
         self.adsr.sustain = 1.0;
         self.past_loop = true;
         self.hold_release = true;
+        if !hold_loop {
+            self.leaving = true;
+            self.forward = true;
+        }
         self
     }
 
@@ -1101,7 +1106,7 @@ mod tests {
     #[test]
     fn preview_voice_holds_level_through_release() {
         let b = ones(10_000, LoopMode::Forward, 100, 999);
-        let mut v = Voice::new(60, 0, &b, RATE, adsr(0.0, 0.0, 1.0, 30.0), None).preview();
+        let mut v = Voice::new(60, 0, &b, RATE, adsr(0.0, 0.0, 1.0, 30.0), None).preview(true);
         render_frames(&mut v, &b, 500);
         v.release();
         // 100 ms later, three times the 30 ms release, it is still at full level.
@@ -1119,7 +1124,7 @@ mod tests {
     #[test]
     fn a_stolen_preview_voice_still_fades() {
         let b = ones(10_000, LoopMode::Forward, 100, 999);
-        let mut v = Voice::new(60, 0, &b, RATE, adsr(0.0, 0.0, 1.0, 30.0), None).preview();
+        let mut v = Voice::new(60, 0, &b, RATE, adsr(0.0, 0.0, 1.0, 30.0), None).preview(true);
         render_frames(&mut v, &b, 500);
         v.fade_out(5.0);
         let (out, alive) = render_frames(&mut v, &b, 241);

@@ -254,7 +254,7 @@ pub fn tail_dialog(ctx: &egui::Context, app: &mut LimewaveApp) {
 /// render. Apply applies the result rendered for `render_key` and closes the dialog; with no
 /// such result (a setting changed in the same frame) it does nothing, and the dialog stays
 /// open until the new result lands. `close` (Cancel, Escape) closes it. Closing always ends
-/// a live preview.
+/// a live preview and releases a "Play original" note.
 fn act(
     app: &mut LimewaveApp,
     d: TailDialogState,
@@ -271,7 +271,8 @@ fn act(
         // starts on the same key.
         let (step, edit) = (r.render.step.clone(), r.render.edit.clone());
         app.preview_step(&step, &edit);
-        app.play_preview(from);
+        // Decay plays into the tail; only Sustain holds on its loop until Stop (v0.3 §7.1).
+        app.play_preview(from, d.settings.mode == TailMode::Sustain);
     }
     if clicks.original {
         app.play_original(from);
@@ -290,12 +291,14 @@ fn act(
     };
     if applied || close {
         app.end_preview();
+        // A "Play original" still sounding stops with the dialog.
+        app.release_all();
     } else {
         app.ui.tail_dialog = Some(d);
     }
 }
 
-/// "Source 1600..=7999 (145 ms, automatic); tonal, 220.0 Hz; steady".
+/// "Source frames 1600–7999 (145 ms, automatic); tonal, 220.0 Hz; steady".
 fn analysis_line(a: &TailAnalysis, rate: u32, from_selection: bool) -> String {
     let (first, last) = a.source;
     let ms = (last + 1 - first) as f64 * 1000.0 / f64::from(rate.max(1));
@@ -312,7 +315,7 @@ fn analysis_line(a: &TailAnalysis, rate: u32, from_selection: bool) -> String {
         Some(t) if !a.fit.steady => format!("decay {t:.1} s"),
         _ => "steady".to_owned(),
     };
-    format!("Source {first}..={last} ({ms:.0} ms, {origin}); {character}; {decay}")
+    format!("Source frames {first}–{last} ({ms:.0} ms, {origin}); {character}; {decay}")
 }
 
 /// The Mode and Method radios, each with a "Suggested" tag after the analysis's pick.
@@ -543,7 +546,18 @@ mod tests {
 
     /// A dialog holding a finished render for its settings, and that render's key.
     fn dialog_with_result(app: &LimewaveApp) -> (TailDialogState, Option<RenderKey>) {
-        let mut d = TailDialogState::default();
+        dialog_with_result_for(app, TailSettings::default())
+    }
+
+    /// Like [`dialog_with_result`], for `settings`.
+    fn dialog_with_result_for(
+        app: &LimewaveApp,
+        settings: TailSettings,
+    ) -> (TailDialogState, Option<RenderKey>) {
+        let mut d = TailDialogState {
+            settings,
+            ..TailDialogState::default()
+        };
         let key = app.render_key(settings_hash(&d.settings, None));
         let s = app.selected_session().unwrap();
         let render = render_tail(&s.processed, s.edit(), None, 44100, &d.settings).unwrap();
@@ -588,6 +602,82 @@ mod tests {
         let s = app.selected_session().unwrap();
         assert_eq!(s.history.cursor(), 1, "applied");
         assert!(s.frames() > 8000);
+    }
+
+    /// [`tone_app`] with a headless engine, loop 1000..=2999 and End at 3999, and the
+    /// engine's output.
+    fn looped_tone_app() -> (LimewaveApp, crate::audio::engine::HeadlessOutput) {
+        let mut s = match tone_app().files.pop() {
+            Some(FileEntry::Loaded(s)) => s,
+            _ => unreachable!(),
+        };
+        let mut e = s.edit().clone();
+        (e.loop_mode, e.loop_start, e.loop_end, e.end) = (LoopMode::Forward, 1000, 2999, 3999);
+        s.apply(e, None);
+        let (engine, out) = crate::audio::engine::headless(48_000);
+        let mut app = LimewaveApp::build(egui::Context::default(), Some(engine), None);
+        app.files = vec![FileEntry::Loaded(s)];
+        app.select(0);
+        (app, out)
+    }
+
+    #[test]
+    fn decay_preview_plays_through_the_loop_and_sustain_holds_on_it() {
+        let preview = Clicks {
+            preview: true,
+            ..Clicks::default()
+        };
+        for (mode, held) in [(TailMode::Decay, false), (TailMode::Sustain, true)] {
+            let (mut app, mut out) = looped_tone_app();
+            let settings = TailSettings {
+                mode,
+                ..TailSettings::default()
+            };
+            let (d, key) = dialog_with_result_for(&app, settings);
+            // From inside the loop.
+            act(&mut app, d, &preview, false, key, 2000);
+            out.render(480);
+            assert_eq!(out.voice_sources().len(), 1, "{mode:?}: the preview sounds");
+            // Every tail here is far shorter than this; a held preview waits for Stop.
+            out.render(48_000 * 40);
+            assert_eq!(
+                !out.voice_sources().is_empty(),
+                held,
+                "{mode:?}: held on the loop: {held}"
+            );
+        }
+    }
+
+    #[test]
+    fn closing_the_dialog_silences_play_original() {
+        let original = Clicks {
+            original: true,
+            ..Clicks::default()
+        };
+        let (mut app, mut out) = looped_tone_app();
+        let (d, key) = dialog_with_result(&app);
+        act(&mut app, d, &original, false, key, 2000);
+        out.render(480);
+        assert_eq!(out.voice_sources().len(), 1, "the original plays");
+        let d = app.ui.tail_dialog.take().unwrap();
+        act(&mut app, d, &Clicks::default(), true, key, 2000);
+        assert!(app.ui.tail_dialog.is_none(), "closed");
+        // The default 30 ms release; 6000 frames of the file are still to play.
+        out.render(48 * 40);
+        assert!(out.voice_sources().is_empty(), "silenced on close");
+    }
+
+    #[test]
+    fn analysis_line_names_the_source_frames_plainly() {
+        let app = tone_app();
+        let s = app.selected_session().unwrap();
+        let a = analyse(&s.processed, s.edit(), None, 44100).unwrap();
+        let line = analysis_line(&a, 44100, false);
+        assert!(
+            line.starts_with("Source frames 1600–7999 (145 ms, automatic); tonal"),
+            "{line}"
+        );
+        assert!(line.ends_with("; steady"), "{line}");
     }
 
     #[test]

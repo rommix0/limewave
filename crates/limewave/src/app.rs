@@ -645,7 +645,7 @@ impl LimewaveApp {
         Self::build(egui::Context::default(), None, None)
     }
 
-    fn build(
+    pub(crate) fn build(
         ctx: egui::Context,
         mut engine: Option<AudioEngine>,
         audio_error: Option<String>,
@@ -1261,20 +1261,28 @@ impl LimewaveApp {
     }
 
     /// Plays the live dialog preview from `from` at the root key, with the session's attack
-    /// only and its release playing on past the loop ([`Command::PreviewOn`]).
-    pub fn play_preview(&mut self, from: usize) {
+    /// only and its release playing on past the loop ([`Command::PreviewOn`]). With
+    /// `hold_loop` it holds on the loop until released; without, it plays straight through
+    /// the loop to End.
+    pub fn play_preview(&mut self, from: usize, hold_loop: bool) {
         if let Some(note) = self.selected_session().map(|s| s.edit().root) {
-            self.send(Command::PreviewOn { note, from });
+            self.send(Command::PreviewOn {
+                note,
+                from,
+                hold_loop,
+            });
         }
     }
 
-    /// Plays the selected file's own audio from `from` at the root key, as "Play original" in
-    /// a dialog does. A live dialog preview is ended first, so the note plays the session's
-    /// buffer and not the preview's.
+    /// Plays the selected file's own audio once from `from` to its last frame at the root
+    /// key, ignoring the loop and End, as "Play original" in the tail dialog does: the real
+    /// ending is heard even when End has been moved earlier. A live dialog preview is ended
+    /// first, so the note plays the session's buffer and not the preview's.
     pub fn play_original(&mut self, from: usize) {
         self.end_preview();
-        if let Some(note) = self.selected_session().map(|s| s.edit().root) {
-            self.send(Command::NoteOn { note, from });
+        if let Some(s) = self.selected_session() {
+            let (note, to) = (s.edit().root, s.frames());
+            self.send(Command::PlayRange { note, from, to });
         }
     }
 
@@ -2626,7 +2634,7 @@ mod tests {
             .and_then(|s| s.dialog_preview.as_ref())
             .unwrap()
             .source;
-        app.play_preview(950);
+        app.play_preview(950, true);
         let sound = out.render(256);
         assert_eq!(out.sources(), (preview_source, session_source));
         assert_eq!(out.voice_sources(), [preview_source]);
@@ -2705,7 +2713,7 @@ mod tests {
         edit.effects.push(step.clone());
         edit.end = 1499;
         app.preview_step(&step, &edit);
-        app.play_preview(100);
+        app.play_preview(100, true);
         out.render(64);
         app.play_original_range(100, 199);
         assert!(app.selected_session().unwrap().dialog_preview.is_none());
@@ -2728,7 +2736,7 @@ mod tests {
         edit.effects.push(step.clone());
         edit.end = 1499;
         app.preview_step(&step, &edit);
-        app.play_preview(100);
+        app.play_preview(100, true);
         out.render(64);
         app.play_original(100);
         assert!(app.selected_session().unwrap().dialog_preview.is_none());
@@ -2743,6 +2751,27 @@ mod tests {
             [session_source],
             "only the original plays once the preview has faded"
         );
+    }
+
+    #[test]
+    fn play_original_plays_past_end_and_the_loop_once() {
+        // A looped file whose End was moved earlier: loop 100..=399, End 499 of 1000 frames.
+        let mut s = short_session();
+        let mut e = s.edit().clone();
+        (e.loop_mode, e.loop_start, e.loop_end, e.end) = (LoopMode::Forward, 100, 399, 499);
+        s.apply(e, None);
+        let (engine, mut out) = crate::audio::engine::headless(48_000);
+        let mut app = LimewaveApp::build(egui::Context::default(), Some(engine), None);
+        app.files = vec![FileEntry::Loaded(Box::new(s))];
+        app.select(0);
+        // From past the loop end: a held note would jump back to the loop start.
+        app.play_original(450);
+        out.render(400);
+        let at = app.cursors()[0].frame;
+        assert!(at > 499.0, "plays on past End, to the real ending: {at}");
+        // 550 frames, then the release: it ends by itself.
+        out.render(48_000);
+        assert!(out.voice_sources().is_empty(), "once, not held on the loop");
     }
 
     #[test]

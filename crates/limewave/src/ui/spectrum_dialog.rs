@@ -309,7 +309,7 @@ fn act(
         // then repeats the loop until Stop.
         let (step, edit) = (r.render.step.clone(), r.render.edit.clone());
         app.preview_step(&step, &edit);
-        app.play_preview(step.first);
+        app.play_preview(step.first, true);
     }
     if clicks.original {
         app.play_original_range(range.0, range.1);
