@@ -7,6 +7,7 @@ use eframe::egui::{
 };
 use limewave_core::document::load_wav;
 use limewave_core::edit::{self, EditState};
+use limewave_core::render::crossfade_len;
 use limewave_core::save::{Destination, SaveOutcome, default_folder, save_wav};
 use limewave_core::software_tag;
 
@@ -340,9 +341,9 @@ fn dialog_body(ui: &mut Ui, st: &mut SaveDialogState, files: &[FileEntry]) {
 }
 
 /// Whether saving `e` mixes a crossfade into the audio. A crossfade kept while the loop is
-/// off does not count.
+/// off or backward does not count.
 fn mixes_crossfade(e: &EditState) -> bool {
-    e.crossfade.min(e.max_crossfade()) > 0
+    crossfade_len(e) > 0
 }
 
 /// A session rebased onto its own file in `dir` saves over that file next time. `save_wav`

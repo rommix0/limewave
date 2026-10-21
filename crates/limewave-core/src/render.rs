@@ -14,6 +14,17 @@ pub fn fade_gains(shape: FadeShape, i: usize, n: usize) -> (f32, f32) {
     }
 }
 
+/// The crossfade length that [`crossfade_region`] mixes for `e`: `min(crossfade,
+/// max_crossfade)`, and 0 while the loop is off or backward (a backward loop is never
+/// crossfaded).
+pub fn crossfade_len(e: &EditState) -> usize {
+    if e.loop_mode == LoopMode::Backward {
+        0
+    } else {
+        e.crossfade.min(e.max_crossfade())
+    }
+}
+
 /// The crossfaded replacement for the frames ending at `loop_end`, as
 /// `(first_frame, replacement_frames_per_channel)`.
 ///
@@ -21,10 +32,7 @@ pub fn fade_gains(shape: FadeShape, i: usize, n: usize) -> (f32, f32) {
 /// effective length `min(crossfade, max_crossfade)` is zero, or the loop does not fit inside
 /// the audio. For `i in 0..N`: `y[i] = out * x[loop_end - N + 1 + i] + in * x[loop_start - N + i]`.
 pub fn crossfade_region(audio: &[Vec<f32>], e: &EditState) -> Option<(usize, Vec<Vec<f32>>)> {
-    if e.loop_mode == LoopMode::Backward {
-        return None;
-    }
-    let n = e.crossfade.min(e.max_crossfade());
+    let n = crossfade_len(e);
     let frames = audio.iter().map(Vec::len).min()?;
     if n == 0 || e.loop_end >= frames {
         return None;
@@ -213,8 +221,11 @@ mod tests {
         let mut e = looped(2000, 500, 1000, 100, FadeShape::EqualPower);
         e.loop_mode = LoopMode::Backward;
         assert!(crossfade_region(&audio, &e).is_none());
+        assert_eq!(crossfade_len(&e), 0);
         assert_eq!(render(&audio, &e), audio);
         assert_eq!(e.clone().clamped(2000).crossfade, 100);
+        e.loop_mode = LoopMode::Forward;
+        assert_eq!(crossfade_len(&e), 100);
     }
 
     #[test]

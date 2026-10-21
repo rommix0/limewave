@@ -61,6 +61,44 @@ fn harness(app: LimewaveApp) -> Harness<'static, LimewaveApp> {
 }
 
 #[test]
+fn a_backward_loop_is_not_reported_as_crossfaded() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = write_wav(dir.path(), "tone.wav");
+    let mut app = edited_app(source);
+    let s = session(&mut app);
+    let e = EditState {
+        loop_mode: LoopMode::Backward,
+        ..s.edit().clone()
+    };
+    s.apply(e, None);
+    assert_eq!(
+        s.edit().crossfade,
+        50,
+        "kept for when the mode changes back"
+    );
+    let mut h = harness(app);
+
+    h.key_press_modifiers(Modifiers::COMMAND | Modifiers::SHIFT, Key::S);
+    h.run();
+    assert!(h.state().ui.save_dialog.open);
+    assert_eq!(
+        h.query_all_by_label("Loop crossfade will be mixed into the audio")
+            .count(),
+        0
+    );
+    h.get_by_label("Save 1 file(s)").click();
+    h.run();
+    h.get_by_label("Close").click();
+    h.run();
+    assert!(!session(h.state_mut()).just_saved);
+    assert_eq!(
+        h.query_all_by_label("crossfade applied in saved file")
+            .count(),
+        0
+    );
+}
+
+#[test]
 fn save_as_dialog_saves_and_rebases() {
     let dir = tempfile::tempdir().unwrap();
     let source = write_wav(dir.path(), "tone.wav");
