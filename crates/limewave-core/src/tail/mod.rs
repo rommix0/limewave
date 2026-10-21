@@ -13,6 +13,7 @@
 //! `audio` is always the audio the new step will see: the original with `e.effects` applied.
 
 mod granular;
+mod harmonic;
 pub mod measure;
 mod smooth;
 
@@ -84,6 +85,9 @@ pub enum TailMethod {
     /// Freezes the spectrum at the cut and lets each frequency fade at its own rate (v0.3
     /// §4.4).
     Smooth,
+    /// Rebuilds the sound from its partials as smooth decaying tones, plus a quiet noise layer
+    /// for what they leave over (v0.3 §4.5).
+    Harmonic,
 }
 
 /// What the user asks for. `None` means "use the fitted default".
@@ -312,6 +316,7 @@ pub fn render_tail(
     let g = match s.method {
         TailMethod::Granular => granular::render(audio, cut, &analysis, &resolved, e, rate)?,
         TailMethod::Smooth => smooth::render(audio, cut, &analysis, &resolved, e, rate)?,
+        TailMethod::Harmonic => harmonic::render(audio, cut, &analysis, &resolved, e, rate)?,
     };
     let first = cut - g.overlap;
     let len = frame_count(&g.audio);
@@ -675,7 +680,14 @@ mod tests {
         };
         for (mode, method) in [TailMode::Decay, TailMode::Sustain]
             .into_iter()
-            .flat_map(|m| [TailMethod::Granular, TailMethod::Smooth].map(|k| (m, k)))
+            .flat_map(|m| {
+                [
+                    TailMethod::Granular,
+                    TailMethod::Smooth,
+                    TailMethod::Harmonic,
+                ]
+                .map(|k| (m, k))
+            })
         {
             for audio in [&x, &quiet] {
                 let s = TailSettings {

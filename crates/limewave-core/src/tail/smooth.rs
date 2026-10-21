@@ -19,8 +19,8 @@
 //!   The release continues the periodic signal, and only frames starting after the loop end
 //!   fade, so the loop's own audio is never changed.
 //!
-//! The analysis and synthesis pieces are `pub(crate)` so the Harmonic method can reuse them for
-//! its rates and its noise layer.
+//! The analysis, the synthesis and the join are `pub(crate)` so the Harmonic method can reuse
+//! them for its partials, its rates and its noise layer.
 
 use std::f64::consts::{PI, TAU};
 
@@ -328,24 +328,54 @@ fn bin_frequencies(
         .collect()
 }
 
-/// What [`render`] synthesizes.
-struct Plan {
-    frozen: Frozen,
-    course: Course,
+/// The spectral analysis Smooth and Harmonic share (v0.3 §4.2, §4.4), and the lengths it
+/// sets.
+pub(crate) struct Spectral {
+    /// The frame size (a power of two).
+    pub(crate) n: usize,
+    /// The hop, a quarter frame.
+    pub(crate) hop: usize,
+    /// The analysis frames, `[channel][frame][bin]`, the last ending at the cut.
+    pub(crate) frames: Frames,
+    /// Per bin: the last frame's magnitude, channels combined by energy.
+    pub(crate) mag_last: Vec<f32>,
+    /// The prominent peaks of `mag_last`, in ascending bin order.
+    pub(crate) peaks: Vec<usize>,
+    /// Per bin: the peak it is locked to, or `None` for a noise bin.
+    pub(crate) lock: Vec<Option<usize>>,
+    /// Per bin: the phase-vocoder frequency, in radians per sample.
+    pub(crate) raw: Vec<f64>,
+    /// The refined fundamental in radians per sample, for a tonal source whose peaks fit it.
+    pub(crate) w0: Option<f64>,
+    /// Per bin, in dB per second: the measured fall, which carries the level up to the cut.
+    pub(crate) measured: Vec<f32>,
+    /// Per bin, in dB per second: the target fall after the cut.
+    pub(crate) target: Vec<f32>,
+    /// How the level moves over the new audio.
+    pub(crate) course: Course,
     /// Frames of new audio after the cut.
-    after: usize,
-    /// The Sustain body length L (0 in Decay).
-    body: usize,
+    pub(crate) after: usize,
+    /// The Sustain body length L, a whole number of hops (0 in Decay).
+    pub(crate) body: usize,
 }
 
-/// Analyses the frames before the cut and freezes them (v0.3 §4.4).
-fn plan(
+/// The fundamental the period of a tonal source gives, in radians per sample.
+pub(crate) fn first_guess(a: &TailAnalysis) -> Option<f64> {
+    a.character
+        .period
+        .filter(|p| p.is_finite() && *p > 0.0)
+        .map(|p| TAU / f64::from(p))
+}
+
+/// Analyses the frames before the cut (v0.3 §4.2, §4.4): peaks, locking, the phase-vocoder
+/// frequencies, the refined fundamental, the per-bin rates and the length of the new audio.
+pub(crate) fn analyse_spectrum(
     audio: &[Vec<f32>],
     cut: usize,
     a: &TailAnalysis,
     s: &Resolved,
     rate: u32,
-) -> Result<Plan, TailError> {
+) -> Result<Spectral, TailError> {
     let (n, frames) = spectral_frames(audio, a.source.0, cut, rate)?;
     let hop = n / 4;
     let bins = n / 2 + 1;
@@ -368,42 +398,14 @@ fn plan(
             centre + princarg(f64::from(cross.arg()) - centre * hop as f64) / hop as f64
         })
         .collect();
-    let w0 = a
-        .character
-        .period
-        .filter(|p| p.is_finite() && *p > 0.0)
-        .and_then(|p| refine_fundamental(&peaks, &raw, &mag_last, TAU / f64::from(p)));
+    let w0 = first_guess(a).and_then(|w| refine_fundamental(&peaks, &raw, &mag_last, w));
     let loop_len = (s.mode == TailMode::Sustain).then(|| sustain_lengths(s.body_s, rate, hop));
-    let omega = bin_frequencies(&raw, &lock, w0, loop_len);
 
     let (t60, release) = match s.mode {
         TailMode::Decay => (s.decay_t60, true),
         TailMode::Sustain => (s.release_t60, s.release_t60 > 0.0),
     };
     let (measured, target) = per_bin_rates(&frames, &a.fit, Some(t60), s.darken, rate, hop);
-
-    let mut mag = Vec::with_capacity(frames.len());
-    let mut phasor = Vec::with_capacity(frames.len());
-    for ch in &frames {
-        mag.push(
-            (0..bins)
-                .map(|k| 0.5 * (ch[prev][k].norm() + ch[last][k].norm()))
-                .collect(),
-        );
-        phasor.push(
-            ch[last]
-                .iter()
-                .map(|x| {
-                    let m = x.norm();
-                    if m > 0.0 {
-                        x / m
-                    } else {
-                        Complex32::new(1.0, 0.0)
-                    }
-                })
-                .collect(),
-        );
-    }
 
     // The tail lasts until the slowest significant bin has faded to −90 dBFS.
     let loudest = mag_last.iter().copied().fold(0.0f32, f32::max);
@@ -431,22 +433,84 @@ fn plan(
             l,
         ),
     };
-    let noisy = lock.iter().map(Option::is_none).collect();
-    Ok(Plan {
-        frozen: Frozen {
-            n,
-            hop,
-            mag,
-            phasor,
-            omega,
-            noisy,
-            measured,
-            target,
-        },
+    Ok(Spectral {
+        n,
+        hop,
+        frames,
+        mag_last,
+        peaks,
+        lock,
+        raw,
+        w0,
+        measured,
+        target,
         course,
         after,
         body,
     })
+}
+
+/// What [`render`] synthesizes.
+struct Plan {
+    frozen: Frozen,
+    course: Course,
+    /// Frames of new audio after the cut.
+    after: usize,
+    /// The Sustain body length L (0 in Decay).
+    body: usize,
+}
+
+/// Analyses the frames before the cut and freezes them (v0.3 §4.4).
+fn plan(
+    audio: &[Vec<f32>],
+    cut: usize,
+    a: &TailAnalysis,
+    s: &Resolved,
+    rate: u32,
+) -> Result<Plan, TailError> {
+    let sp = analyse_spectrum(audio, cut, a, s, rate)?;
+    let loop_len = (sp.body > 0).then_some(sp.body);
+    let omega = bin_frequencies(&sp.raw, &sp.lock, sp.w0, loop_len);
+    let count = sp.frames.iter().map(Vec::len).min().unwrap_or(0);
+    let (prev, last) = (count - 2, count - 1);
+    let bins = sp.mag_last.len();
+
+    let mut mag = Vec::with_capacity(sp.frames.len());
+    let mut phasor = Vec::with_capacity(sp.frames.len());
+    for ch in &sp.frames {
+        mag.push(
+            (0..bins)
+                .map(|k| 0.5 * (ch[prev][k].norm() + ch[last][k].norm()))
+                .collect(),
+        );
+        phasor.push(ch[last].iter().copied().map(unit).collect());
+    }
+    let noisy = sp.lock.iter().map(Option::is_none).collect();
+    Ok(Plan {
+        frozen: Frozen {
+            n: sp.n,
+            hop: sp.hop,
+            mag,
+            phasor,
+            omega,
+            noisy,
+            measured: sp.measured,
+            target: sp.target,
+        },
+        course: sp.course,
+        after: sp.after,
+        body: sp.body,
+    })
+}
+
+/// The phase of `x` as a unit phasor (1 for a silent bin).
+pub(crate) fn unit(x: Complex32) -> Complex32 {
+    let m = x.norm();
+    if m > 0.0 {
+        x / m
+    } else {
+        Complex32::new(1.0, 0.0)
+    }
 }
 
 /// The seed of the random noise phases of frame `q`, well spread so that neither two frames
@@ -594,30 +658,52 @@ pub(super) fn render(
 ) -> Result<Generated, TailError> {
     let p = plan(audio, cut, a, s, rate)?;
     let f = &p.frozen;
+    let synth = synthesize(f, p.course, p.after, rate, s.seed);
+    Ok(finish(audio, cut, a, e, &synth, (f.n, f.hop), p.body, rate))
+}
+
+/// Joins synthesized audio onto the original and packages it, for Smooth and Harmonic.
+/// `synth` is in [`synthesize`]'s layout for frames of `n` at a hop of `hop`, and `body` is the
+/// Sustain body length (0 in Decay).
+///
+/// - The join is a quarter frame, or whatever room an existing loop leaves (v0.3 §4.6), with
+///   `OverlapShortened` when that is less.
+/// - What follows the body (the whole tail in Decay, the release in Sustain) ends in a 5 ms
+///   ramp to zero.
+/// - A source the analysis calls noisy gives `NoisySourceForMethod` (v0.3 §7.1).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn finish(
+    audio: &[Vec<f32>],
+    cut: usize,
+    a: &TailAnalysis,
+    e: &EditState,
+    synth: &[Vec<f32>],
+    (n, hop): (usize, usize),
+    body: usize,
+    rate: u32,
+) -> Generated {
     let mut warnings = Vec::new();
     if a.character.period.is_none() {
         warnings.push(TailWarning::NoisySourceForMethod);
     }
-    // The join: a quarter frame, or whatever room an existing loop leaves (v0.3 §4.6).
-    let join = join_overlap(e, cut, f.hop, 1).unwrap_or(0);
-    if join != f.hop {
+    let join = join_overlap(e, cut, hop, 1).unwrap_or(0);
+    if join != hop {
         warnings.push(TailWarning::OverlapShortened);
     }
-    let synth = synthesize(f, p.course, p.after, rate, s.seed);
-    let mut out = assemble(audio, cut, &synth, f.n, join);
+    let mut out = assemble(audio, cut, synth, n, join);
     for ch in &mut out {
-        let ending = &mut ch[join + p.body..];
+        let ending = &mut ch[join + body..];
         if !ending.is_empty() {
             end_ramp(ending, rate);
         }
     }
-    Ok(Generated {
+    Generated {
         audio: out,
         overlap: join,
-        body: p.body,
+        body,
         loop_crossfade: 0,
         warnings,
-    })
+    }
 }
 
 #[cfg(test)]
