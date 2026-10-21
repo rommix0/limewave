@@ -539,9 +539,15 @@ fn draw(
     }
 }
 
+/// Whether the crossfade ramp is drawn: only when a crossfade will actually be mixed in. A
+/// backward loop keeps its crossfade setting but never applies it.
+fn crossfade_shown(e: &EditState) -> bool {
+    e.crossfade > 0 && e.loop_mode != LoopMode::Backward
+}
+
 /// The crossfade as a ramp over the frames it replaces, ending at the loop end.
 fn draw_crossfade(painter: &egui::Painter, lanes: Rect, view: &ViewTransform, e: &EditState) {
-    if e.crossfade == 0 {
+    if !crossfade_shown(e) {
         return;
     }
     let after_end = e.loop_end + 1;
@@ -678,6 +684,20 @@ fn draw_ruler(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn crossfade_ramp_is_not_drawn_for_backward_loops() {
+        let looped = |loop_mode, crossfade| EditState {
+            loop_mode,
+            loop_start: 100,
+            loop_end: 200,
+            crossfade,
+            ..EditState::default_for(1000)
+        };
+        assert!(crossfade_shown(&looped(LoopMode::Forward, 50)));
+        assert!(!crossfade_shown(&looped(LoopMode::Backward, 50)));
+        assert!(!crossfade_shown(&looped(LoopMode::Forward, 0)));
+    }
 
     #[test]
     fn nice_steps_follow_the_one_two_five_ladder() {
