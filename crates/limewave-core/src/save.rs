@@ -1791,6 +1791,29 @@ mod tests {
         let out = doc(&build_wav_bytes(&d, &e));
         assert_eq!((out.frames, out.audio.len()), (FRAMES, 1));
 
+        // A marker-mirroring reverse running far past the end, with an extra loop to map.
+        let d = doc(&file(
+            vec![smpl_chunk(vec![fwd(2532, 2915), fwd(100, 200)])],
+            vec![],
+        ));
+        let mut e = d.initial_edit();
+        e.effects.push(AppliedEffect {
+            op: Op::Reverse {
+                mirror_markers: true,
+            },
+            first: 1,
+            last: usize::MAX,
+        });
+        let out = doc(&build_wav_bytes(&d, &e));
+        assert_eq!(out.frames, FRAMES);
+        // The same as the reverse clamped to the file: 1..=3999.
+        let s = out.smpl.unwrap();
+        assert_eq!(s.loops[1], fwd(3800, 3900));
+        let mut want = d.audio[0].clone();
+        want[1..].reverse();
+        let got = &out.audio[0];
+        assert!(got.iter().zip(&want).all(|(g, w)| (g - w).abs() <= LSB));
+
         let empty = wav_bytes(&[Vec::new()], RATE, I16, vec![]);
         let d = doc(&empty);
         assert_eq!(d.frames, 0);

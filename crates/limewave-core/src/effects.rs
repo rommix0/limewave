@@ -163,7 +163,8 @@ pub fn fade_gain(curve: FadeCurve, t: f32) -> f32 {
     }
 }
 
-/// Applies one step to the audio in place. The range is clamped to the file; channel tools
+/// Applies one step to the audio in place. The range is cut to the file, and a range that is
+/// empty or starts past the end changes nothing, as in [`EditState::clamped`]; channel tools
 /// ignore it. Every effect keeps the frame count.
 pub fn apply_effect(audio: &mut Vec<Vec<f32>>, a: &AppliedEffect) {
     match &a.op {
@@ -194,12 +195,11 @@ pub fn apply_effect(audio: &mut Vec<Vec<f32>>, a: &AppliedEffect) {
         }
         op => {
             for (c, ch) in audio.iter_mut().enumerate() {
-                if ch.is_empty() || a.first > a.last {
+                if a.first > a.last || a.first >= ch.len() {
                     continue;
                 }
-                let first = a.first.min(ch.len() - 1);
                 let last = a.last.min(ch.len() - 1);
-                apply_in_range(op, c, &mut ch[first..=last]);
+                apply_in_range(op, c, &mut ch[a.first..=last]);
             }
         }
     }
@@ -257,12 +257,13 @@ pub fn peak(audio: &[Vec<f32>], first: usize, last: usize) -> f32 {
 
 /// Where the frame `f` of the original lands after the marker-mirroring reverses in
 /// `effects`: each `Reverse { mirror_markers: true }` whose range contains the frame reflects
-/// it to `first + last - f`, in order.
+/// it to `first + last - f`, in order. Never overflows, whatever the ranges.
 pub fn map_frame(effects: &[AppliedEffect], f: usize) -> usize {
     effects.iter().fold(f, |f, a| match a.op {
+        // `last - (f - first)` is `first + last - f` without the overflowing sum.
         Op::Reverse {
             mirror_markers: true,
-        } if (a.first..=a.last).contains(&f) => a.first + a.last - f,
+        } if (a.first..=a.last).contains(&f) => a.last - (f - a.first),
         _ => f,
     })
 }
@@ -538,6 +539,35 @@ mod tests {
             last: 899,
         };
         assert_eq!(map_frame(&[sel], 300), 300);
+    }
+
+    #[test]
+    fn map_frame_never_overflows() {
+        let wild = [AppliedEffect {
+            op: Op::Reverse {
+                mirror_markers: true,
+            },
+            first: 10,
+            last: usize::MAX,
+        }];
+        assert_eq!(map_frame(&wild, usize::MAX - 1), 11);
+        assert_eq!(map_frame(&wild, 10), usize::MAX);
+        assert_eq!(map_frame(&wild, 5), 5);
+    }
+
+    #[test]
+    fn a_range_past_the_end_of_the_audio_changes_nothing() {
+        let x = constant(3, 0.5);
+        let mut y = x.clone();
+        apply_effect(
+            &mut y,
+            &AppliedEffect {
+                op: Op::Invert,
+                first: usize::MAX,
+                last: usize::MAX,
+            },
+        );
+        assert_eq!(y, x);
     }
 
     #[test]

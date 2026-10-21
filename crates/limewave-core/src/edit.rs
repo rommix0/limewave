@@ -1,6 +1,6 @@
 //! Edit state (trim and loop markers, tuning, effects), marker-move constraints and undo history.
 
-use crate::effects::AppliedEffect;
+use crate::effects::{AppliedEffect, Op};
 
 /// How the sample loops on playback.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -54,7 +54,8 @@ impl EditState {
 
     /// Forces the state to be valid for a file of `frames` frames.
     ///
-    /// If a loop of at least 2 frames cannot fit, the loop is turned off.
+    /// If a loop of at least 2 frames cannot fit, the loop is turned off. Effect ranges are
+    /// cut to the file, and effects left with nothing to work on are dropped.
     pub fn clamped(mut self, frames: usize) -> EditState {
         let last = frames.saturating_sub(1);
         self.end = self.end.min(last);
@@ -77,6 +78,15 @@ impl EditState {
             self.loop_end = self.loop_end.clamp(self.loop_start + 1, self.end);
             self.crossfade = self.crossfade.min(self.max_crossfade());
         }
+        // Effect ranges end inside the file; an empty one, or one wholly past the end, does
+        // nothing and is dropped. Channel tools ignore their range and are kept as they are.
+        self.effects.retain_mut(|a| {
+            if matches!(a.op, Op::StereoToMono | Op::SwapChannels | Op::MonoToStereo) {
+                return true;
+            }
+            a.last = a.last.min(last);
+            frames > 0 && a.first <= a.last
+        });
         self
     }
 
@@ -268,7 +278,6 @@ impl History {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::effects::Op;
 
     fn looped(frames: usize, end: usize, ls: usize, le: usize) -> EditState {
         EditState {
@@ -310,6 +319,39 @@ mod tests {
             last: 99,
         });
         assert_eq!(e.clone().clamped(100).effects, e.effects);
+    }
+
+    #[test]
+    fn clamped_fits_effect_ranges_to_the_file() {
+        let fx = |op: Op, first: usize, last: usize| AppliedEffect { op, first, last };
+        let mirror = Op::Reverse {
+            mirror_markers: true,
+        };
+        let mut e = EditState::default_for(100);
+        e.effects = vec![
+            fx(Op::Invert, 10, 20),
+            fx(Op::Invert, 90, usize::MAX),
+            fx(mirror.clone(), 1, usize::MAX),
+            // Wholly outside the file, or empty: dropped.
+            fx(Op::Invert, 100, 200),
+            fx(Op::Invert, usize::MAX, usize::MAX),
+            fx(Op::Invert, 50, 40),
+            // Channel tools ignore their range and are kept as they are.
+            fx(Op::SwapChannels, 7, 3),
+        ];
+        assert_eq!(
+            e.clamped(100).effects,
+            vec![
+                fx(Op::Invert, 10, 20),
+                fx(Op::Invert, 90, 99),
+                fx(mirror, 1, 99),
+                fx(Op::SwapChannels, 7, 3),
+            ]
+        );
+
+        let mut empty = EditState::default_for(0);
+        empty.effects = vec![fx(Op::Invert, 0, 0), fx(Op::MonoToStereo, 0, 0)];
+        assert_eq!(empty.clamped(0).effects, vec![fx(Op::MonoToStereo, 0, 0)]);
     }
 
     #[test]
