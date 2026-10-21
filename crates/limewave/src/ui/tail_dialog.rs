@@ -7,10 +7,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::ops::RangeInclusive;
 use std::time::Duration;
 
-use eframe::egui::{
-    self, Button, Color32, DragValue, RichText, Role, Sense, Stroke, TextStyle, WidgetInfo, pos2,
-    vec2,
-};
+use eframe::egui::{self, DragValue, RichText, TextStyle};
 use limewave_core::edit::{EditState, LoopMode};
 use limewave_core::effects::apply_effect;
 use limewave_core::tail::{
@@ -21,6 +18,12 @@ use limewave_core::tail::{
 use crate::app::{LimewaveApp, Session};
 use crate::render_worker::{RenderKey, RenderSlot, spawn_render};
 use crate::theme::colors;
+#[cfg(test)]
+use crate::ui::dialog_kit::PLOT_COLUMNS;
+use crate::ui::dialog_kit::{
+    ButtonHints, Clicks, button_row, draw_loop_edges, draw_loop_fill, draw_wave, fixed_height,
+    plot_canvas, span, wave_columns,
+};
 
 /// The preview, and Play original, start this many seconds before the cut (v0.3 §7.1).
 const PREVIEW_LEAD_S: f64 = 1.0;
@@ -30,10 +33,16 @@ const DECAY_T60_S: RangeInclusive<f32> = 0.01..=60.0;
 const BODY_S: RangeInclusive<f32> = 0.1..=30.0;
 const RELEASE_T60_S: RangeInclusive<f32> = 0.0..=60.0;
 
-/// The preview plot: its height and how many min/max columns the worker makes for it.
+/// The preview plot's height.
 const PLOT_HEIGHT: f32 = 110.0;
-const PLOT_COLUMNS: usize = 480;
-const PLOT_BACKGROUND: Color32 = Color32::from_rgb(0x15, 0x17, 0x1d);
+
+/// The hover texts of the Preview, Play original and Stop buttons.
+const BUTTON_HINTS: ButtonHints = ButtonHints {
+    preview: "Play the result from 1 s before the cut. Stop leaves the loop and plays the \
+              generated release",
+    original: "Play the untouched audio from the same point",
+    stop: "Release the note: a held preview plays the generated release",
+};
 
 /// The settings area is as tall as the Sustain settings (four rows) in either mode, and the
 /// result area as the plot plus this many text lines: the summary and up to four warnings.
@@ -76,18 +85,7 @@ impl TailPlot {
         let frames = audio.iter().map(Vec::len).min().unwrap_or(0);
         let first = first.min(frames);
         let len = frames - first;
-        let count = PLOT_COLUMNS.min(len);
-        let channels = audio.len().max(1) as f32;
-        let columns = (0..count)
-            .map(|c| {
-                let a = first + c * len / count;
-                let b = (first + (c + 1) * len / count).max(a + 1);
-                (a..b).fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), i| {
-                    let v = audio.iter().map(|ch| ch[i]).sum::<f32>() / channels;
-                    (lo.min(v), hi.max(v))
-                })
-            })
-            .collect();
+        let columns = wave_columns(audio, first, len);
         TailPlot {
             first,
             len,
@@ -129,16 +127,6 @@ fn selection_hash(selection: Option<(usize, usize)>) -> u64 {
     let mut h = DefaultHasher::new();
     selection.hash(&mut h);
     h.finish()
-}
-
-/// What the buttons asked for this frame.
-#[derive(Default)]
-struct Clicks {
-    preview: bool,
-    original: bool,
-    stop: bool,
-    apply: bool,
-    cancel: bool,
 }
 
 /// The Generate tail… modal for `app.ui.tail_dialog`. It starts the analysis and the
@@ -252,26 +240,7 @@ pub fn tail_dialog(ctx: &egui::Context, app: &mut LimewaveApp) {
         }
         let ready = matches!(result, Some(Ok(_)));
         ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            clicks.preview = ui
-                .add_enabled(ready, Button::new("Preview"))
-                .on_hover_text(
-                    "Play the result from 1 s before the cut. Stop leaves the loop and plays \
-                     the generated release",
-                )
-                .clicked();
-            clicks.original = ui
-                .button("Play original")
-                .on_hover_text("Play the untouched audio from the same point")
-                .clicked();
-            clicks.stop = ui
-                .button("Stop")
-                .on_hover_text("Release the note: a held preview plays the generated release")
-                .clicked();
-            ui.separator();
-            clicks.apply = ui.add_enabled(ready, Button::new("Apply")).clicked();
-            clicks.cancel = ui.button("Cancel").clicked();
-        });
+        clicks = button_row(ui, ready, &BUTTON_HINTS);
     });
     if d.settings != before {
         d.render.restart();
@@ -500,17 +469,6 @@ fn darken_row(ui: &mut egui::Ui, darken: &mut f32, hint: &str) {
     ui.end_row();
 }
 
-/// Runs `add`, then pads below it to `height`, so what follows stays put when the content
-/// changes (content taller than `height` simply grows).
-fn fixed_height(ui: &mut egui::Ui, height: f32, add: impl FnOnce(&mut egui::Ui)) {
-    let top = ui.cursor().top();
-    add(ui);
-    let used = ui.cursor().top() - top;
-    if used < height {
-        ui.add_space(height - used);
-    }
-}
-
 /// The warning lines of v0.3 §7.1, short enough for one line each.
 fn warning_text(w: TailWarning) -> &'static str {
     match w {
@@ -526,11 +484,7 @@ fn warning_text(w: TailWarning) -> &'static str {
 /// The preview plot: the last second before the cut, then the tail (tinted), with the cut
 /// marked and, in Sustain, the loop. `None` draws the empty plot, while there is no result.
 fn plot(ui: &mut egui::Ui, shown: Option<(&TailPlot, &EditState, TailMode)>, cut: usize) {
-    let width = ui.available_width().max(1.0);
-    let (rect, response) = ui.allocate_exact_size(vec2(width, PLOT_HEIGHT), Sense::hover());
-    response.widget_info(|| WidgetInfo::labeled(Role::Canvas, true, "Tail preview"));
-    let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 2.0, PLOT_BACKGROUND);
+    let (rect, painter) = plot_canvas(ui, PLOT_HEIGHT, "Tail preview");
     let Some((p, edit, mode)) = shown else {
         return;
     };
@@ -541,38 +495,25 @@ fn plot(ui: &mut egui::Ui, shown: Option<(&TailPlot, &EditState, TailMode)>, cut
         let t = frame.saturating_sub(p.first) as f32 / p.len as f32;
         rect.left() + t.clamp(0.0, 1.0) * rect.width()
     };
-    let span = |a: f32, b: f32| egui::Rect::from_x_y_ranges(a..=b, rect.y_range());
-    painter.rect_filled(span(x_of(cut), rect.right()), 0.0, colors::generated_tint());
+    painter.rect_filled(
+        span(rect, x_of(cut), rect.right()),
+        0.0,
+        colors::generated_tint(),
+    );
     let looped = mode == TailMode::Sustain && edit.loop_mode != LoopMode::Off;
+    let (a, b) = (x_of(edit.loop_start), x_of(edit.loop_end + 1));
     if looped {
-        let (a, b) = (x_of(edit.loop_start), x_of(edit.loop_end + 1));
-        let fill = Color32::from_rgba_unmultiplied(
-            colors::LOOP.r(),
-            colors::LOOP.g(),
-            colors::LOOP.b(),
-            28,
-        );
-        painter.rect_filled(span(a, b), 0.0, fill);
+        draw_loop_fill(&painter, rect, a, b);
     }
-    let mid = rect.center().y;
-    let half = rect.height() * 0.45;
-    let column_w = rect.width() / p.columns.len() as f32;
-    let wave = Stroke::new(column_w.clamp(1.0, 2.0), colors::WAVE);
-    for (i, &(lo, hi)) in p.columns.iter().enumerate() {
-        let x = rect.left() + (i as f32 + 0.5) * column_w;
-        let (top, bottom) = (
-            mid - hi.clamp(-1.0, 1.0) * half,
-            mid - lo.clamp(-1.0, 1.0) * half,
-        );
-        painter.line_segment([pos2(x, top), pos2(x, bottom.max(top + 1.0))], wave);
-    }
+    draw_wave(&painter, rect, &p.columns);
     if looped {
-        let stroke = Stroke::new(1.5, colors::LOOP);
-        for x in [x_of(edit.loop_start), x_of(edit.loop_end + 1)] {
-            painter.vline(x, rect.y_range(), stroke);
-        }
+        draw_loop_edges(&painter, rect, a, b);
     }
-    painter.vline(x_of(cut), rect.y_range(), Stroke::new(1.5, colors::END));
+    painter.vline(
+        x_of(cut),
+        rect.y_range(),
+        egui::Stroke::new(1.5, colors::END),
+    );
 }
 
 #[cfg(test)]

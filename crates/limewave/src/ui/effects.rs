@@ -9,6 +9,7 @@ use limewave_core::wav::SampleFormat;
 
 use crate::app::{LimewaveApp, SELECT_ALL_SHORTCUT};
 use crate::theme::colors;
+use crate::ui::spectrum_dialog::SpectrumDialogState;
 use crate::ui::tail_dialog::TailDialogState;
 
 /// The toolbar's Edit menu. Selection items need a selection and loop items a loop; an item
@@ -106,8 +107,8 @@ pub enum EffectDialog {
     AutoTrim,
 }
 
-/// The toolbar's Effects menu. Gain, Normalize, the fades, Stereo to mono, Auto-trim and
-/// Generate tail open a dialog; the rest apply at once. A channel tool that does not fit the
+/// The toolbar's Effects menu. Gain, Normalize, the fades, Stereo to mono, Auto-trim,
+/// Generate tail and Make loop from spectrum open a dialog; the rest apply at once. A channel tool that does not fit the
 /// file is greyed out.
 pub fn effects_menu(ui: &mut egui::Ui, app: &mut LimewaveApp) {
     let loaded = app.selected_session().is_some();
@@ -162,6 +163,16 @@ pub fn effects_menu(ui: &mut egui::Ui, app: &mut LimewaveApp) {
             .clicked()
         {
             app.ui.tail_dialog = Some(TailDialogState::default());
+        }
+        if ui
+            .add_enabled(loaded, Button::new("Make loop from spectrum…"))
+            .on_hover_text(
+                "Replace the selection, or Start…End, with a seamless loop made from its \
+                 average spectrum",
+            )
+            .clicked()
+        {
+            app.ui.spectrum_dialog = Some(SpectrumDialogState::default());
         }
     });
 }

@@ -41,6 +41,7 @@ use crate::ui::save_dialog::{
     save_dialog, save_results_window,
 };
 use crate::ui::seam::{DEFAULT_HALF, SeamChannel, seam_view};
+use crate::ui::spectrum_dialog::{SpectrumDialogState, spectrum_dialog};
 use crate::ui::tail_dialog::{TailDialogState, tail_dialog};
 use crate::ui::waveform::waveform_view;
 
@@ -458,13 +459,6 @@ impl FileEntry {
 /// The pause after the last settings change before a dialog renders again (v0.3 §7).
 const RENDER_DEBOUNCE: Duration = Duration::from_millis(200);
 
-/// The Make loop from spectrum… dialog's state (v0.3 §7.2). For now only its render; the
-/// settings, the analysis and the result type come with the dialog.
-#[derive(Default)]
-pub struct SpectrumDialogState {
-    pub render: RenderSlot<()>,
-}
-
 /// View and tool settings that outlive a single frame.
 pub struct UiState {
     pub snap: bool,
@@ -844,8 +838,10 @@ impl LimewaveApp {
     /// Makes `i` the edited file and hands its sound to the audio engine. Notes still sounding
     /// from the previous file are released.
     pub fn select(&mut self, i: usize) {
-        // The tail dialog belongs to the file it was opened for.
-        if self.ui.tail_dialog.take().is_some() {
+        // The render dialogs belong to the file they were opened for.
+        let tail = self.ui.tail_dialog.take().is_some();
+        let spectrum = self.ui.spectrum_dialog.take().is_some();
+        if tail || spectrum {
             self.end_preview();
         }
         self.selected = Some(i);
@@ -891,8 +887,9 @@ impl LimewaveApp {
         }
     }
 
-    /// Releases every note and forgets the held keys.
-    fn release_all(&mut self) {
+    /// Releases every note and forgets the held keys, as the toolbar's Stop does. Dialog
+    /// previews fade out at once.
+    pub(crate) fn release_all(&mut self) {
         self.send(Command::AllOff);
         self.ui.held.clear();
     }
@@ -1235,6 +1232,7 @@ impl LimewaveApp {
             self.ui.tail_dialog = Some(d);
         }
         if let Some(mut d) = self.ui.spectrum_dialog.take() {
+            self.drain_render(&mut d.analysis, block);
             self.drain_render(&mut d.render, block);
             self.ui.spectrum_dialog = Some(d);
         }
@@ -1277,6 +1275,20 @@ impl LimewaveApp {
         self.end_preview();
         if let Some(note) = self.selected_session().map(|s| s.edit().root) {
             self.send(Command::NoteOn { note, from });
+        }
+    }
+
+    /// Plays the selected file's own audio from `first` to `last` (inclusive) once at the root
+    /// key, as "Play original" in the spectrum-loop dialog does. A live dialog preview is ended
+    /// first, as in [`LimewaveApp::play_original`].
+    pub fn play_original_range(&mut self, first: usize, last: usize) {
+        self.end_preview();
+        if let Some(note) = self.selected_session().map(|s| s.edit().root) {
+            self.send(Command::PlayRange {
+                note,
+                from: first,
+                to: last + 1,
+            });
         }
     }
 
@@ -1449,6 +1461,7 @@ impl LimewaveApp {
         self.unsaved_prompt(&ctx);
         effect_dialog(&ctx, self);
         tail_dialog(&ctx, self);
+        spectrum_dialog(&ctx, self);
         if let Some(req) = save_dialog(&ctx, &mut self.ui.save_dialog, &self.files) {
             self.save_results = Some(perform_save(self, req));
         }
@@ -1782,6 +1795,7 @@ mod tests {
     use limewave_core::document::load_wav_bytes;
     use limewave_core::edit::LoopMode;
     use limewave_core::effects::{FadeCurve, MonoSource, Splice, SpliceKind};
+    use limewave_core::spectrum_loop::SpectrumLoopError;
     use limewave_core::tail::TailError;
     use limewave_core::testwav::{sine, wav_bytes};
     use limewave_core::wav::SampleFormat;
@@ -2535,11 +2549,23 @@ mod tests {
         let mut app = app_with(session());
         let key = app.render_key(1).unwrap();
         let mut d = SpectrumDialogState::default();
-        d.render.start(spawn_render(key, app.ctx.clone(), || ()));
+        d.analysis.start(spawn_render(key, app.ctx.clone(), || {
+            Err(SpectrumLoopError::Silent)
+        }));
+        d.render.start(spawn_render(key, app.ctx.clone(), || {
+            Err(SpectrumLoopError::NoAudio)
+        }));
         app.ui.spectrum_dialog = Some(d);
         app.wait_for_renders();
-        let render = &app.ui.spectrum_dialog.as_ref().unwrap().render;
-        assert_eq!(render.result(Some(key)), Some(&()));
+        let d = app.ui.spectrum_dialog.as_ref().unwrap();
+        assert!(matches!(
+            d.analysis.result(Some(key)),
+            Some(Err(SpectrumLoopError::Silent))
+        ));
+        assert!(matches!(
+            d.render.result(Some(key)),
+            Some(Err(SpectrumLoopError::NoAudio))
+        ));
     }
 
     #[test]
@@ -2643,6 +2669,51 @@ mod tests {
             unreachable!()
         };
         assert!(first.dialog_preview.is_none(), "the preview ended");
+    }
+
+    #[test]
+    fn switching_files_closes_the_spectrum_dialog_and_ends_its_preview() {
+        let mut app = LimewaveApp::for_test();
+        app.files = vec![
+            FileEntry::Loaded(Box::new(short_session())),
+            FileEntry::Loaded(Box::new(short_session())),
+        ];
+        app.select(0);
+        app.ui.spectrum_dialog = Some(SpectrumDialogState::default());
+        let step = tail(1, 1000, 900, 500);
+        let mut edit = app.selected_session().unwrap().edit().clone();
+        edit.effects.push(step.clone());
+        edit.end = 1499;
+        app.preview_step(&step, &edit);
+        app.select(1);
+        assert!(app.ui.spectrum_dialog.is_none(), "closed");
+        let FileEntry::Loaded(first) = &app.files[0] else {
+            unreachable!()
+        };
+        assert!(first.dialog_preview.is_none(), "the preview ended");
+    }
+
+    #[test]
+    fn play_original_range_ends_the_preview_and_plays_the_range_once() {
+        let (engine, mut out) = crate::audio::engine::headless(48_000);
+        let mut app = LimewaveApp::build(egui::Context::default(), Some(engine), None);
+        app.files = vec![FileEntry::Loaded(Box::new(short_session()))];
+        app.select(0);
+        let session_source = app.selected_session().unwrap().source;
+        let step = tail(1, 1000, 900, 500);
+        let mut edit = app.selected_session().unwrap().edit().clone();
+        edit.effects.push(step.clone());
+        edit.end = 1499;
+        app.preview_step(&step, &edit);
+        app.play_preview(100);
+        out.render(64);
+        app.play_original_range(100, 199);
+        assert!(app.selected_session().unwrap().dialog_preview.is_none());
+        out.render(480);
+        assert_eq!(out.voice_sources(), [session_source], "the original plays");
+        // 100 frames at the file's rate, then the voice's release: long gone after a second.
+        out.render(48_000);
+        assert!(out.voice_sources().is_empty(), "once, not looping");
     }
 
     #[test]
