@@ -245,3 +245,33 @@ fn preview_then_cancel_restores_the_session_buffer() {
     assert_eq!(s.rendered, rendered, "the session buffer is back");
     assert_eq!(s.history.cursor(), 0);
 }
+
+/// Where the Apply button is.
+fn apply_rect(h: &Harness<'static, LimewaveApp>) -> eframe::egui::Rect {
+    h.get_by_label("Apply").rect()
+}
+
+#[test]
+fn the_dialog_keeps_its_place_while_rendering() {
+    let mut h = harness(&bytes(tone(), None));
+    open_dialog(&mut h);
+    let at = apply_rect(&h);
+    assert!(apply_enabled(&h));
+
+    // A long pause keeps the next render pending. Single frames: a run would wait it out.
+    h.state_mut().ui.render_debounce = Duration::from_secs(3600);
+    for (radio, what) in [("Granular", "a method change"), ("Decay", "a mode change")] {
+        h.get_by_role_and_label(Role::RadioButton, radio).click();
+        h.step();
+        h.step();
+        h.get_by_label("Rendering…");
+        assert!(!apply_enabled(&h), "nothing to apply yet");
+        assert_eq!(apply_rect(&h), at, "Apply stays put after {what}");
+    }
+
+    // The result lands without moving it either.
+    h.state_mut().ui.render_debounce = Duration::ZERO;
+    settle(&mut h);
+    assert!(apply_enabled(&h));
+    assert_eq!(apply_rect(&h), at, "Apply stays put when the result lands");
+}

@@ -8,7 +8,8 @@ use std::ops::RangeInclusive;
 use std::time::Duration;
 
 use eframe::egui::{
-    self, Button, Color32, DragValue, RichText, Role, Sense, Stroke, WidgetInfo, pos2, vec2,
+    self, Button, Color32, DragValue, RichText, Role, Sense, Stroke, TextStyle, WidgetInfo, pos2,
+    vec2,
 };
 use limewave_core::edit::{EditState, LoopMode};
 use limewave_core::effects::apply_effect;
@@ -18,7 +19,7 @@ use limewave_core::tail::{
 };
 
 use crate::app::{LimewaveApp, Session};
-use crate::render_worker::{RenderSlot, spawn_render};
+use crate::render_worker::{RenderKey, RenderSlot, spawn_render};
 use crate::theme::colors;
 
 /// The preview, and Play original, start this many seconds before the cut (v0.3 §7.1).
@@ -33,6 +34,12 @@ const RELEASE_T60_S: RangeInclusive<f32> = 0.0..=60.0;
 const PLOT_HEIGHT: f32 = 110.0;
 const PLOT_COLUMNS: usize = 480;
 const PLOT_BACKGROUND: Color32 = Color32::from_rgb(0x15, 0x17, 0x1d);
+
+/// The settings area is as tall as the Sustain settings (four rows) in either mode, and the
+/// result area as the plot plus this many text lines: the summary and up to four warnings.
+const SETTINGS_ROWS: f32 = 4.0;
+const RESULT_LINES: f32 = 5.0;
+const GRID_SPACING: f32 = 4.0;
 
 /// The Generate tail… dialog's state, while it is open.
 #[derive(Default)]
@@ -210,11 +217,20 @@ pub fn tail_dialog(ctx: &egui::Context, app: &mut LimewaveApp) {
             ui.add_space(4.0);
             mode_and_method(ui, &mut d.settings, &a);
             ui.add_space(4.0);
-            settings_grid(ui, &mut d.settings, &a);
+            // The settings and the result keep a fixed height, so the modal (centred on the
+            // screen) does not move, and its buttons stay under the pointer, while a new
+            // result renders or the mode changes.
+            let body = ui.text_style_height(&TextStyle::Body);
+            let row = ui.spacing().interact_size.y.max(body);
+            let spacing = ui.spacing().item_spacing.y;
+            let settings_h = SETTINGS_ROWS * (row + GRID_SPACING + 2.0) + spacing;
+            fixed_height(ui, settings_h, |ui| settings_grid(ui, &mut d.settings, &a));
             ui.add_space(6.0);
-            match result {
+            let result_h = PLOT_HEIGHT + spacing + RESULT_LINES * (body + spacing + 2.0);
+            let mode = d.settings.mode;
+            fixed_height(ui, result_h, |ui| match result {
                 Some(Ok(r)) => {
-                    plot(ui, &r.plot, &r.render.edit, cut, d.settings.mode);
+                    plot(ui, Some((&r.plot, &r.render.edit, mode)), cut);
                     let added = (r.render.edit.end + 1).saturating_sub(cut);
                     ui.weak(format!(
                         "The tail adds {:.2} s.",
@@ -225,12 +241,14 @@ pub fn tail_dialog(ctx: &egui::Context, app: &mut LimewaveApp) {
                     }
                 }
                 Some(Err(err)) => {
+                    plot(ui, None, cut);
                     ui.colored_label(colors::END, err.to_string());
                 }
                 None => {
+                    plot(ui, None, cut);
                     ui.weak("Rendering…");
                 }
-            }
+            });
         }
         let ready = matches!(result, Some(Ok(_)));
         ui.add_space(8.0);
@@ -259,6 +277,23 @@ pub fn tail_dialog(ctx: &egui::Context, app: &mut LimewaveApp) {
         d.render.restart();
     }
 
+    let close = clicks.cancel || modal.should_close();
+    act(app, d, &clicks, close, render_key, from);
+}
+
+/// Carries out the buttons clicked this frame, after any settings change has restarted the
+/// render. Apply applies the result rendered for `render_key` and closes the dialog; with no
+/// such result (a setting changed in the same frame) it does nothing, and the dialog stays
+/// open until the new result lands. `close` (Cancel, Escape) closes it. Closing always ends
+/// a live preview.
+fn act(
+    app: &mut LimewaveApp,
+    d: TailDialogState,
+    clicks: &Clicks,
+    close: bool,
+    render_key: Option<RenderKey>,
+    from: usize,
+) {
     let ready = d.render.result(render_key).and_then(|r| r.as_ref().ok());
     if clicks.preview
         && let Some(r) = ready
@@ -275,12 +310,16 @@ pub fn tail_dialog(ctx: &egui::Context, app: &mut LimewaveApp) {
     if clicks.stop {
         app.release_root();
     }
-    let apply = clicks.apply.then(|| ready.map(|r| r.render.edit.clone()));
-    if let Some(Some(edit)) = apply {
-        app.end_preview();
-        app.apply_dialog_edit(edit);
-    }
-    if clicks.apply || clicks.cancel || modal.should_close() {
+    let applied = match ready {
+        Some(r) if clicks.apply => {
+            let edit = r.render.edit.clone();
+            app.end_preview();
+            app.apply_dialog_edit(edit);
+            true
+        }
+        _ => false,
+    };
+    if applied || close {
         app.end_preview();
     } else {
         app.ui.tail_dialog = Some(d);
@@ -366,7 +405,7 @@ fn suggested_tag(ui: &mut egui::Ui) {
 fn settings_grid(ui: &mut egui::Ui, s: &mut TailSettings, a: &TailAnalysis) {
     egui::Grid::new("tail_settings")
         .num_columns(2)
-        .spacing([10.0, 4.0])
+        .spacing([10.0, GRID_SPACING])
         .show(ui, |ui| match s.mode {
             TailMode::Decay => {
                 fitted_row(
@@ -461,30 +500,40 @@ fn darken_row(ui: &mut egui::Ui, darken: &mut f32, hint: &str) {
     ui.end_row();
 }
 
-/// The warning lines of v0.3 §7.1.
+/// Runs `add`, then pads below it to `height`, so what follows stays put when the content
+/// changes (content taller than `height` simply grows).
+fn fixed_height(ui: &mut egui::Ui, height: f32, add: impl FnOnce(&mut egui::Ui)) {
+    let top = ui.cursor().top();
+    add(ui);
+    let used = ui.cursor().top() - top;
+    if used < height {
+        ui.add_space(height - used);
+    }
+}
+
+/// The warning lines of v0.3 §7.1, short enough for one line each.
 fn warning_text(w: TailWarning) -> &'static str {
     match w {
-        TailWarning::LoopCrossfadeFallback => {
-            "The seamless loop did not fit the source, so the loop uses a crossfade."
-        }
-        TailWarning::OverlapShortened => {
-            "The join was shortened to stay clear of the existing loop."
-        }
+        TailWarning::LoopCrossfadeFallback => "No seamless loop fitted; the loop uses a crossfade.",
+        TailWarning::OverlapShortened => "The join was shortened to stay clear of the loop.",
         TailWarning::ShortSource => "The source region is short; repetition may be audible.",
         TailWarning::NoisySourceForMethod => {
-            "This method suits pitched sounds, and the source sounds noisy."
+            "This method suits pitched sounds; the source is noisy."
         }
     }
 }
 
 /// The preview plot: the last second before the cut, then the tail (tinted), with the cut
-/// marked and, in Sustain, the loop.
-fn plot(ui: &mut egui::Ui, p: &TailPlot, edit: &EditState, cut: usize, mode: TailMode) {
+/// marked and, in Sustain, the loop. `None` draws the empty plot, while there is no result.
+fn plot(ui: &mut egui::Ui, shown: Option<(&TailPlot, &EditState, TailMode)>, cut: usize) {
     let width = ui.available_width().max(1.0);
     let (rect, response) = ui.allocate_exact_size(vec2(width, PLOT_HEIGHT), Sense::hover());
     response.widget_info(|| WidgetInfo::labeled(Role::Canvas, true, "Tail preview"));
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 2.0, PLOT_BACKGROUND);
+    let Some((p, edit, mode)) = shown else {
+        return;
+    };
     if p.len == 0 || p.columns.is_empty() {
         return;
     }
@@ -529,6 +578,76 @@ fn plot(ui: &mut egui::Ui, p: &TailPlot, edit: &EditState, cut: usize, mode: Tai
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
+    use crate::app::FileEntry;
+    use limewave_core::document::load_wav_bytes;
+    use limewave_core::testwav::{sine, wav_bytes};
+    use limewave_core::wav::SampleFormat;
+
+    /// An app showing a steady 220 Hz tone of 8000 frames.
+    fn tone_app() -> LimewaveApp {
+        let bytes = wav_bytes(
+            &[sine(220.0, 44100, 8000, 0.5)],
+            44100,
+            SampleFormat::Int { bits: 16 },
+            Vec::new(),
+        );
+        let doc = load_wav_bytes(PathBuf::from("t.wav"), &bytes).unwrap();
+        let mut app = LimewaveApp::for_test();
+        app.files = vec![FileEntry::Loaded(Box::new(Session::new(doc)))];
+        app.select(0);
+        app
+    }
+
+    /// A dialog holding a finished render for its settings, and that render's key.
+    fn dialog_with_result(app: &LimewaveApp) -> (TailDialogState, Option<RenderKey>) {
+        let mut d = TailDialogState::default();
+        let key = app.render_key(settings_hash(&d.settings, None));
+        let s = app.selected_session().unwrap();
+        let render = render_tail(&s.processed, s.edit(), None, 44100, &d.settings).unwrap();
+        let plot = TailPlot::new(&s.processed, 0);
+        let result = Ok(TailResult { render, plot });
+        d.render
+            .start(spawn_render(key.unwrap(), egui::Context::default(), || {
+                result
+            }));
+        d.render.finish(key, true);
+        assert!(d.render.result(key).is_some());
+        (d, key)
+    }
+
+    #[test]
+    fn apply_closes_the_dialog_only_when_it_applies() {
+        let apply = Clicks {
+            apply: true,
+            ..Clicks::default()
+        };
+        // A setting committed in the same frame as the click restarts the render, so there
+        // is nothing to apply: the dialog stays open, and Apply waits for the new result.
+        let mut app = tone_app();
+        let (mut d, key) = dialog_with_result(&app);
+        d.settings.darken = 0.5;
+        d.render.restart();
+        act(&mut app, d, &apply, false, key, 0);
+        assert!(app.ui.tail_dialog.is_some(), "still open");
+        let s = app.selected_session().unwrap();
+        assert_eq!(
+            (s.history.cursor(), s.frames()),
+            (0, 8000),
+            "nothing applied"
+        );
+
+        // With the result, Apply applies it and closes. (Each frame takes the dialog out
+        // first, as `tail_dialog` does.)
+        app.ui.tail_dialog = None;
+        let (d, key) = dialog_with_result(&app);
+        act(&mut app, d, &apply, false, key, 0);
+        assert!(app.ui.tail_dialog.is_none(), "closed");
+        let s = app.selected_session().unwrap();
+        assert_eq!(s.history.cursor(), 1, "applied");
+        assert!(s.frames() > 8000);
+    }
 
     #[test]
     fn settings_hash_covers_every_setting_and_the_selection() {
