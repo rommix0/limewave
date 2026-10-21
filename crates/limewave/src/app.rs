@@ -438,6 +438,37 @@ pub enum PendingAction {
     OpenFolder(PathBuf),
 }
 
+/// How long the UI keeps repainting after a note-on while it waits for the voice's cursor.
+const CURSOR_WAIT: Duration = Duration::from_millis(250);
+
+/// Keeps the UI repainting while play cursors are on screen, and from a note-on until its
+/// cursor first shows. The audio thread starts the voice a callback later, so the frame that
+/// sends the note sees no cursor yet; without the wait the UI would sleep until the next input.
+#[derive(Default)]
+struct CursorWatch {
+    /// When the wait for a new voice gives up.
+    until: Option<Instant>,
+}
+
+impl CursorWatch {
+    fn note_started(&mut self, now: Instant) {
+        self.until = Some(now + CURSOR_WAIT);
+    }
+
+    /// Whether to ask for another frame, given whether any cursor shows now.
+    fn keep_repainting(&mut self, sounding: bool, now: Instant) -> bool {
+        if sounding {
+            self.until = None;
+            return true;
+        }
+        let waiting = self.until.is_some_and(|t| now < t);
+        if !waiting {
+            self.until = None;
+        }
+        waiting
+    }
+}
+
 /// The key the audition envelope is saved under in the app settings.
 const ENVELOPE_KEY: &str = "envelope";
 
@@ -466,6 +497,10 @@ pub struct LimewaveApp {
     sent_envelope: Option<Adsr>,
     /// True while the engine has been silenced because no loaded file is selected.
     silenced: bool,
+    /// Keeps the play cursors moving; see [`CursorWatch`].
+    cursor_watch: CursorWatch,
+    /// The sequence of the last MIDI note-on the cursor watch has seen.
+    midi_seen: Option<u32>,
     /// Whether a widget held the keyboard focus at the end of the last frame. egui drops the
     /// focus when Escape arrives, before this app sees the key, so the field that Escape
     /// closes would otherwise look unfocused.
@@ -522,6 +557,8 @@ impl LimewaveApp {
             midi_error: None,
             sent_envelope: None,
             silenced: false,
+            cursor_watch: CursorWatch::default(),
+            midi_seen: None,
             focus_last_frame: false,
             ctx,
             loader: None,
@@ -718,6 +755,9 @@ impl LimewaveApp {
     }
 
     fn send(&mut self, c: Command) {
+        if matches!(c, Command::NoteOn { .. } | Command::PlayRange { .. }) {
+            self.cursor_watch.note_started(Instant::now());
+        }
         if let Some(engine) = &mut self.engine {
             engine.send(c);
         }
@@ -919,7 +959,9 @@ impl LimewaveApp {
         };
         let Some(tx) = producer else { return };
         let last_note = Arc::clone(&self.midi_last_note);
-        match connect_midi(index, tx, Arc::clone(&self.start_frame), last_note) {
+        let ctx = self.ctx.clone();
+        let wake = move || ctx.request_repaint();
+        match connect_midi(index, tx, Arc::clone(&self.start_frame), last_note, wake) {
             Ok(conn) => {
                 self.midi = Some(conn);
                 self.midi_selected = Some(index);
@@ -958,19 +1000,18 @@ impl LimewaveApp {
     }
 
     /// While "Set from MIDI" is armed, a note-on newer than the one seen when it was armed
-    /// becomes the root key and disarms it. Waits by repainting, as the MIDI thread cannot
-    /// wake the UI.
-    fn update_midi_learn(&mut self, ctx: &egui::Context) {
+    /// becomes the root key and disarms it. The MIDI thread wakes the UI on each note-on.
+    fn update_midi_learn(&mut self) {
         self.ui.midi_connected = self.midi.is_some();
         let Some(seen) = self.ui.midi_learn else {
             return;
         };
-        match decode_last_note(self.midi_last_note.load(Ordering::Relaxed)) {
-            Some((sequence, note)) if sequence != seen => {
-                self.ui.midi_learn = None;
-                self.set_root(note);
-            }
-            _ => ctx.request_repaint_after(Duration::from_millis(50)),
+        if let Some((sequence, note)) =
+            decode_last_note(self.midi_last_note.load(Ordering::Relaxed))
+            && sequence != seen
+        {
+            self.ui.midi_learn = None;
+            self.set_root(note);
         }
     }
 
@@ -1102,6 +1143,17 @@ impl LimewaveApp {
         }
     }
 
+    /// Starts the cursor watch for a MIDI note-on not seen before.
+    fn watch_midi(&mut self, now: Instant) {
+        let sequence = decode_last_note(self.midi_last_note.load(Ordering::Relaxed)).map(|n| n.0);
+        if sequence != self.midi_seen {
+            self.midi_seen = sequence;
+            if sequence.is_some() {
+                self.cursor_watch.note_started(now);
+            }
+        }
+    }
+
     /// The playback cursors of the sounding voices; empty without an audio engine.
     pub fn cursors(&self) -> Vec<Cursor> {
         self.engine
@@ -1120,7 +1172,7 @@ impl LimewaveApp {
         self.handle_shortcuts(&ctx);
         self.sync_audio();
         self.handle_keyboard(&ctx);
-        self.update_midi_learn(&ctx);
+        self.update_midi_learn();
 
         self.toolbar(ui);
         if !self.single_file {
@@ -1140,7 +1192,10 @@ impl LimewaveApp {
         self.sync_envelope();
         self.keyboard_panel(ui);
         let cursors = self.cursors();
-        if !cursors.is_empty() {
+        let now = Instant::now();
+        self.watch_midi(now);
+        // Without an engine no cursor ever shows, so there is nothing to wait for.
+        if self.engine.is_some() && self.cursor_watch.keep_repainting(!cursors.is_empty(), now) {
             ctx.request_repaint();
         }
         egui::CentralPanel::default().show(ui, |ui| self.central(ui, &cursors));
@@ -1498,6 +1553,51 @@ mod tests {
         let s = Session::new(load_wav_bytes(PathBuf::from("t.wav"), &bytes).unwrap());
         assert_eq!(s.edit().root, 57);
         assert!(!s.history.is_dirty());
+    }
+
+    #[test]
+    fn cursor_watch_waits_for_a_new_note_then_follows_the_cursors() {
+        let t0 = Instant::now();
+        let ms = |n| t0 + Duration::from_millis(n);
+        let mut w = CursorWatch::default();
+        assert!(!w.keep_repainting(false, t0), "nothing playing");
+        assert!(w.keep_repainting(true, t0), "a cursor shows");
+
+        w.note_started(t0);
+        assert!(w.keep_repainting(false, ms(10)), "waiting for the voice");
+        assert!(w.keep_repainting(true, ms(20)));
+        // Once the cursor has shown, its end stops the repaints.
+        assert!(!w.keep_repainting(false, ms(30)));
+
+        // A note that never sounds stops the wait in time.
+        w.note_started(ms(100));
+        assert!(w.keep_repainting(false, ms(100) + CURSOR_WAIT / 2));
+        assert!(!w.keep_repainting(false, ms(100) + CURSOR_WAIT));
+    }
+
+    #[test]
+    fn notes_from_the_ui_and_from_midi_start_the_cursor_watch() {
+        let mut app = LimewaveApp::for_test();
+        let now = Instant::now();
+        assert!(!app.cursor_watch.keep_repainting(false, now));
+        app.note_on(60);
+        assert!(app.cursor_watch.keep_repainting(false, now));
+
+        let mut app = LimewaveApp::for_test();
+        app.watch_midi(now);
+        assert!(!app.cursor_watch.keep_repainting(false, now), "no note yet");
+        app.midi_last_note.store((1 << 8) | 60, Ordering::Relaxed);
+        app.watch_midi(now);
+        assert!(
+            app.cursor_watch.keep_repainting(false, now),
+            "a new MIDI note"
+        );
+        app.cursor_watch = CursorWatch::default();
+        app.watch_midi(now);
+        assert!(
+            !app.cursor_watch.keep_repainting(false, now),
+            "already seen"
+        );
     }
 
     #[test]

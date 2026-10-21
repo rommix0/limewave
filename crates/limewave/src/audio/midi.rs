@@ -55,7 +55,8 @@ impl MidiConnection {
 
 /// Opens input port `index`. Each note message is pushed to `tx` (dropped if the queue is full);
 /// a NoteOn starts from the frame currently stored in `start_frame` and also advances
-/// `last_note` (read it with [`decode_last_note`]).
+/// `last_note` (read it with [`decode_last_note`]) and then calls `wake`, so the UI can draw
+/// the new voice's cursor.
 ///
 /// On failure the error message comes back together with `tx`. To switch ports, call
 /// [`MidiConnection::close`] on the old connection to get the producer back, then call
@@ -65,6 +66,7 @@ pub fn connect_midi(
     tx: rtrb::Producer<Command>,
     start_frame: Arc<AtomicUsize>,
     last_note: Arc<AtomicU32>,
+    wake: impl Fn() + Send + 'static,
 ) -> Result<MidiConnection, (String, rtrb::Producer<Command>)> {
     let input = match MidiInput::new(CLIENT_NAME) {
         Ok(input) => input,
@@ -79,7 +81,7 @@ pub fn connect_midi(
     match input.connect(
         port,
         "Limewave input",
-        move |_, msg, _| forward(&cb_slot, msg, &start_frame, &last_note),
+        move |_, msg, _| forward_and_wake(&cb_slot, msg, &start_frame, &last_note, &wake),
         (),
     ) {
         Ok(conn) => Ok(MidiConnection { conn, slot }),
@@ -90,12 +92,29 @@ pub fn connect_midi(
     }
 }
 
-/// The MIDI callback body. It never blocks: if the slot is busy or already taken, or the queue
-/// is full, the message is dropped.
-fn forward(slot: &Slot, msg: &[u8], start_frame: &AtomicUsize, last_note: &AtomicU32) {
-    let Some(cmd) = parse_midi(msg, start_frame) else {
-        return;
-    };
+/// The MIDI callback: [`forward`], then `wake` after a note-on. The command is queued first,
+/// so waking the UI never delays the note.
+fn forward_and_wake(
+    slot: &Slot,
+    msg: &[u8],
+    start_frame: &AtomicUsize,
+    last_note: &AtomicU32,
+    wake: &dyn Fn(),
+) {
+    if let Some(Command::NoteOn { .. }) = forward(slot, msg, start_frame, last_note) {
+        wake();
+    }
+}
+
+/// Queues the command for a MIDI message and returns it. It never blocks: if the slot is busy
+/// or already taken, or the queue is full, the message is dropped.
+fn forward(
+    slot: &Slot,
+    msg: &[u8],
+    start_frame: &AtomicUsize,
+    last_note: &AtomicU32,
+) -> Option<Command> {
+    let cmd = parse_midi(msg, start_frame)?;
     if let Command::NoteOn { note, .. } = cmd {
         // This callback is the only writer, so a load then a store cannot lose an update.
         let previous = last_note.load(Ordering::Relaxed);
@@ -107,6 +126,7 @@ fn forward(slot: &Slot, msg: &[u8], start_frame: &AtomicUsize, last_note: &Atomi
     {
         let _ = tx.push(cmd);
     }
+    Some(cmd)
 }
 
 /// Removes the producer from the slot. Only `connect_midi`'s error path and
@@ -144,7 +164,7 @@ mod tests {
     fn midi_failed_connect_returns_the_producer() {
         let (tx, mut rx) = rtrb::RingBuffer::new(4);
         let start = Arc::new(AtomicUsize::new(0));
-        let Err((msg, mut tx)) = connect_midi(usize::MAX, tx, start, Arc::default()) else {
+        let Err((msg, mut tx)) = connect_midi(usize::MAX, tx, start, Arc::default(), || {}) else {
             panic!("port usize::MAX cannot exist");
         };
         assert!(!msg.is_empty());
@@ -183,6 +203,22 @@ mod tests {
         // A note-off leaves it alone.
         forward(&slot, &[0x80, 64, 0], &start, &last);
         assert_eq!(now(), Some((2, 64)));
+    }
+
+    #[test]
+    fn a_note_on_wakes_the_ui() {
+        let (tx, _rx) = rtrb::RingBuffer::new(4);
+        let slot = Mutex::new(Some(tx));
+        let start = AtomicUsize::new(0);
+        let last = AtomicU32::new(0);
+        let woken = std::cell::Cell::new(0);
+        let wake = || woken.set(woken.get() + 1);
+        forward_and_wake(&slot, &[0x90, 60, 100], &start, &last, &wake);
+        assert_eq!(woken.get(), 1);
+        // A note-off needs no wake: the cursor already keeps the UI repainting.
+        forward_and_wake(&slot, &[0x80, 60, 0], &start, &last, &wake);
+        forward_and_wake(&slot, &[0xB0, 1, 2], &start, &last, &wake);
+        assert_eq!(woken.get(), 1);
     }
 
     #[test]
