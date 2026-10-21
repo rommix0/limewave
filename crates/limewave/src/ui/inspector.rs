@@ -11,6 +11,7 @@ use limewave_core::wav::SampleFormat;
 
 use crate::app::{Session, UiState};
 use crate::audio::engine::AudioEngine;
+use crate::audio::voice::Adsr;
 use crate::theme::colors;
 use crate::ui::save_dialog::SaveCommand;
 
@@ -90,7 +91,7 @@ pub struct InspectorAction {
 pub fn inspector(
     ui: &mut Ui,
     s: &mut Session,
-    ui_state: &UiState,
+    ui_state: &mut UiState,
     engine: Option<&AudioEngine>,
 ) -> InspectorAction {
     ScrollArea::vertical()
@@ -101,6 +102,8 @@ pub fn inspector(
             let toggle_midi_learn = tuning_section(ui, s, ui_state, engine);
             ui.separator();
             loop_section(ui, s, ui_state, engine);
+            ui.separator();
+            envelope_section(ui, &mut ui_state.envelope);
             ui.separator();
             InspectorAction {
                 save: save_section(ui, s),
@@ -405,6 +408,42 @@ fn loop_section(ui: &mut Ui, s: &mut Session, ui_state: &UiState, engine: Option
         ui.label(RichText::new("Crossfade is off for backward loops").color(colors::XFADE));
         ui.weak("Some samplers ignore backward loops and play them forward.");
     }
+}
+
+/// The audition envelope: attack, decay and release in ms, sustain in %.
+fn envelope_section(ui: &mut Ui, envelope: &mut Adsr) {
+    ui.heading("Envelope");
+    let time = |ui: &mut Ui, name: &str, ms: &mut f32| {
+        ui.horizontal(|ui| {
+            let label = ui.label(name);
+            ui.add(
+                DragValue::new(ms)
+                    .range(0.0..=10_000.0)
+                    .speed(1.0)
+                    .max_decimals(1)
+                    .suffix(" ms"),
+            )
+            .labelled_by(label.id);
+        });
+    };
+    time(ui, "Attack", &mut envelope.attack_ms);
+    time(ui, "Decay", &mut envelope.decay_ms);
+    ui.horizontal(|ui| {
+        let label = ui.label("Sustain");
+        let mut percent = envelope.sustain * 100.0;
+        let field = ui.add(
+            DragValue::new(&mut percent)
+                .range(0.0..=100.0)
+                .speed(0.5)
+                .max_decimals(1)
+                .suffix(" %"),
+        );
+        // Only a change is written back, so the %-to-fraction round trip cannot drift.
+        if field.labelled_by(label.id).changed() {
+            envelope.sustain = percent / 100.0;
+        }
+    });
+    time(ui, "Release", &mut envelope.release_ms);
 }
 
 #[cfg(test)]

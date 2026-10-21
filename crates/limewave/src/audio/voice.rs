@@ -49,6 +49,28 @@ impl Adsr {
             release_ms: fix(self.release_ms, d.release_ms, MAX_STAGE_MS),
         }
     }
+
+    /// The envelope as `"attack,decay,sustain,release"`, for the saved app settings.
+    pub fn to_storage_string(&self) -> String {
+        format!(
+            "{},{},{},{}",
+            self.attack_ms, self.decay_ms, self.sustain, self.release_ms
+        )
+    }
+
+    /// Reads [`Adsr::to_storage_string`] back, clamped. Anything other than exactly four finite
+    /// numbers gives `None`.
+    pub fn from_storage_string(s: &str) -> Option<Adsr> {
+        let mut parts = s.split(',').map(|p| p.trim().parse::<f32>().ok());
+        let mut next = || parts.next().flatten().filter(|v| v.is_finite());
+        let adsr = Adsr {
+            attack_ms: next()?,
+            decay_ms: next()?,
+            sustain: next()?,
+            release_ms: next()?,
+        };
+        parts.next().is_none().then(|| adsr.clamped())
+    }
 }
 
 /// Output frames an envelope stage of `ms` lasts at `rate`.
@@ -477,6 +499,25 @@ mod tests {
     use super::*;
 
     const RATE: u32 = 48_000;
+
+    #[test]
+    fn adsr_storage_string_round_trips() {
+        let d = Adsr::DEFAULT;
+        assert_eq!(Adsr::from_storage_string(&d.to_storage_string()), Some(d));
+        assert_eq!(Adsr::from_storage_string("1,2,3"), None);
+        assert_eq!(Adsr::from_storage_string("a,b,c,d"), None);
+        assert_eq!(Adsr::from_storage_string("NaN,0,1,30"), None);
+        assert_eq!(
+            Adsr::from_storage_string("20000,0,2,5"),
+            Some(Adsr {
+                attack_ms: 10_000.0,
+                decay_ms: 0.0,
+                sustain: 1.0,
+                release_ms: 5.0,
+            })
+        );
+    }
+
     /// No attack or decay, so the samples come out unchanged until the release.
     const FLAT: Adsr = Adsr {
         attack_ms: 0.0,

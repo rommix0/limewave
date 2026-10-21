@@ -26,7 +26,7 @@ use limewave_core::wav::SampleFormat;
 use crate::audio::engine::{AudioEngine, Command, Cursor};
 use crate::audio::keys::{octave_shift, qwerty_note};
 use crate::audio::midi::{MidiConnection, connect_midi, decode_last_note, list_midi_ports};
-use crate::audio::voice::{PlayBuffer, play_buffer};
+use crate::audio::voice::{Adsr, PlayBuffer, play_buffer};
 use crate::folder;
 use crate::theme::{self, colors};
 use crate::ui::coords::ViewTransform;
@@ -339,6 +339,8 @@ pub struct UiState {
     pub effect_dialog: Option<EffectDialog>,
     /// Set while "Set from MIDI" is armed: the note-on sequence number seen when it was armed.
     pub midi_learn: Option<u32>,
+    /// The audition envelope, shared by every file and remembered between runs.
+    pub envelope: Adsr,
     /// Whether a MIDI input is connected; set each frame for the inspector.
     pub midi_connected: bool,
     /// Why the last action did nothing, shown in the toolbar until the next action.
@@ -362,6 +364,7 @@ impl Default for UiState {
             effect_params: EffectParams::default(),
             effect_dialog: None,
             midi_learn: None,
+            envelope: Adsr::DEFAULT,
             midi_connected: false,
             message: None,
         }
@@ -375,6 +378,9 @@ pub enum PendingAction {
     OpenFile(PathBuf),
     OpenFolder(PathBuf),
 }
+
+/// The key the audition envelope is saved under in the app settings.
+const ENVELOPE_KEY: &str = "envelope";
 
 pub struct LimewaveApp {
     pub files: Vec<FileEntry>,
@@ -397,6 +403,8 @@ pub struct LimewaveApp {
     midi_ports: Vec<String>,
     midi_selected: Option<usize>,
     midi_error: Option<String>,
+    /// The envelope last sent to the engine, so it is sent only when it changes.
+    sent_envelope: Option<Adsr>,
     /// True while the engine has been silenced because no loaded file is selected.
     silenced: bool,
     /// Whether a widget held the keyboard focus at the end of the last frame. egui drops the
@@ -416,7 +424,15 @@ impl LimewaveApp {
             Ok(engine) => (Some(engine), None),
             Err(e) => (None, Some(e)),
         };
-        Self::build(cc.egui_ctx.clone(), engine, audio_error)
+        let mut app = Self::build(cc.egui_ctx.clone(), engine, audio_error);
+        if let Some(envelope) = cc
+            .storage
+            .and_then(|s| s.get_string(ENVELOPE_KEY))
+            .and_then(|s| Adsr::from_storage_string(&s))
+        {
+            app.ui.envelope = envelope;
+        }
+        app
     }
 
     /// An app with no audio engine and no MIDI, for tests.
@@ -445,6 +461,7 @@ impl LimewaveApp {
             midi_ports: Vec::new(),
             midi_selected: None,
             midi_error: None,
+            sent_envelope: None,
             silenced: false,
             focus_last_frame: false,
             ctx,
@@ -1051,6 +1068,7 @@ impl LimewaveApp {
             }
         }
         self.inspector_panel(ui);
+        self.sync_envelope();
         self.keyboard_panel(ui);
         let cursors = self.cursors();
         if !cursors.is_empty() {
@@ -1082,9 +1100,20 @@ impl LimewaveApp {
         }
     }
 
+    /// Sends the envelope to the audio engine when it differs from the one last sent.
+    fn sync_envelope(&mut self) {
+        let envelope = self.ui.envelope.clamped();
+        if self.sent_envelope != Some(envelope) {
+            if let Some(engine) = &mut self.engine {
+                engine.set_envelope(envelope);
+            }
+            self.sent_envelope = Some(envelope);
+        }
+    }
+
     fn inspector_panel(&mut self, ui: &mut egui::Ui) {
         let engine = self.engine.as_ref();
-        let ui_state = &self.ui;
+        let ui_state = &mut self.ui;
         let selected = self.selected.and_then(|i| self.files.get_mut(i));
         let mut action = InspectorAction::default();
         egui::Panel::right("inspector")
@@ -1358,6 +1387,10 @@ impl eframe::App for LimewaveApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.show(ui);
     }
+
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        storage.set_string(ENVELOPE_KEY, self.ui.envelope.clamped().to_storage_string());
+    }
 }
 
 #[cfg(test)]
@@ -1377,6 +1410,18 @@ mod tests {
             Vec::new(),
         );
         Session::new(load_wav_bytes(PathBuf::from("t.wav"), &bytes).unwrap())
+    }
+
+    #[test]
+    fn envelope_default_and_sync() {
+        assert_eq!(UiState::default().envelope, Adsr::DEFAULT);
+        let mut app = LimewaveApp::for_test();
+        app.ui.envelope.release_ms = 80.0;
+        app.sync_envelope();
+        let sent = app.sent_envelope.expect("envelope recorded");
+        assert_eq!(sent.release_ms, 80.0);
+        app.sync_envelope();
+        assert_eq!(app.sent_envelope, Some(sent));
     }
 
     #[test]
