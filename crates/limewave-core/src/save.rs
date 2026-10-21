@@ -7,7 +7,9 @@ use std::path::{Path, PathBuf};
 use crate::cue::remap_markers;
 use crate::document::WavDocument;
 use crate::edit::{EditState, LoopMode};
-use crate::effects::{AppliedEffect, Op, map_frame, process};
+use crate::effects::{
+    AppliedEffect, Op, changes_length, frames_after, map_frame, map_range, process,
+};
 use crate::error::SaveError;
 use crate::meta::{info_set, sync_acid, sync_inst};
 use crate::render::crossfade_region;
@@ -41,8 +43,8 @@ fn to_u32(n: usize) -> u32 {
 }
 
 /// The inclusive frame ranges (sorted, merged) that effects or the crossfade change in a file
-/// of `frames` frames. A channel tool changes every frame whatever its stored range, and a
-/// splice every frame from its start.
+/// of `frames` frames. A channel tool changes every frame whatever its stored range. Only for
+/// effects that keep the frame count: with a splice nothing stays in place to compare against.
 fn changed_ranges(
     effects: &[AppliedEffect],
     crossfade: Option<(usize, usize)>,
@@ -55,7 +57,6 @@ fn changed_ranges(
         .iter()
         .map(|a| match a.op {
             Op::StereoToMono(_) | Op::SwapChannels | Op::MonoToStereo => (0, last_frame),
-            Op::Splice(_) => (a.first, last_frame),
             _ => (a.first, a.last.min(last_frame)),
         })
         .chain(crossfade)
@@ -86,9 +87,9 @@ fn crossfade_in_place(audio: &mut [Vec<f32>], e: &EditState) -> Option<(usize, u
 /// The `data` bytes for `audio`, the effects-processed audio of `doc`, with the crossfade
 /// applied and trimmed to frames `e.start..=e.end`. `e` must be clamped.
 ///
-/// While the channel count is unchanged, the original bytes are kept and only the frames inside
-/// an effect's range or the crossfade region are re-encoded. When it changed, all frames are
-/// encoded with `format`, the new layout.
+/// While the channel count and the frame count are unchanged, the original bytes are kept and
+/// only the frames inside an effect's range or the crossfade region are re-encoded. When either
+/// changed (a channel tool or a splice), all frames are encoded with `format`, the new layout.
 fn edited_data(
     doc: &WavDocument,
     e: &EditState,
@@ -99,7 +100,7 @@ fn edited_data(
         return Vec::new();
     }
     let crossfaded = crossfade_in_place(&mut audio, e);
-    if audio.len() != usize::from(doc.format.channels) {
+    if audio.len() != usize::from(doc.format.channels) || changes_length(&e.effects) {
         let trimmed: Vec<Vec<f32>> = audio
             .iter()
             .map(|ch| ch[e.start.min(ch.len())..(e.end + 1).min(ch.len())].to_vec())
@@ -133,7 +134,7 @@ fn tuning_or_loop_changed(init: &EditState, e: &EditState) -> bool {
 }
 
 /// The `smpl` chunk for `e` (clamped), keeping the original's other fields and those of
-/// its extra loops that lie inside the trim range (shifted by `-e.start`).
+/// its extra loops that are saved (see [`saved_extra_loop`]).
 ///
 /// Loop 0 is type 0 (forward), 1 (ping-pong) or 2 (backward), except that an original
 /// unknown type (3 and up, shown as forward) is kept while the loop mode and points
@@ -174,32 +175,73 @@ fn edited_smpl(doc: &WavDocument, init: &EditState, e: &EditState) -> Smpl {
         fraction: 0,
         play_count: 0,
     });
-    let range = e.start..=e.end;
-    let shift = to_u32(e.start);
     let extra = s
         .loops
         .iter()
         .skip(1)
-        .map(|l| {
-            let (start, end) = (
-                map_frame(&e.effects, l.start as usize).unwrap_or(l.start as usize),
-                map_frame(&e.effects, l.end as usize).unwrap_or(l.end as usize),
-            );
-            // A mirroring reverse swaps the ends; an ordered loop stays ordered.
-            if l.start <= l.end && start > end {
-                (end, start, l)
-            } else {
-                (start, end, l)
-            }
-        })
-        .filter(|(start, end, _)| range.contains(start) && range.contains(end))
-        .map(|(start, end, l)| SmplLoop {
-            start: to_u32(start) - shift,
-            end: to_u32(end) - shift,
-            ..*l
-        });
+        .filter_map(|l| saved_extra_loop(e, l));
     s.loops = first.into_iter().chain(extra).collect();
     s
+}
+
+/// Whether a splice in `effects` replaces any frame of the ordered range `first..=last` of the
+/// original, following the range through the steps before each splice as markers move.
+fn touches_replaced(effects: &[AppliedEffect], first: usize, last: usize) -> bool {
+    effects
+        .iter()
+        .try_fold((first, last), |(lo, hi), a| {
+            let hit =
+                matches!(a.op, Op::Splice(_)) && a.first <= a.last && lo <= a.last && hi >= a.first;
+            if hit {
+                None
+            } else {
+                map_range(std::slice::from_ref(a), lo, hi)
+            }
+        })
+        .is_none()
+}
+
+/// The extra `smpl` loop `l` as saved for `e` (clamped): its ends follow the audio as cues do
+/// and count from `e.start`. `None` when it is not saved, because a splice replaced some of
+/// its frames or it does not lie inside Start…End.
+fn saved_extra_loop(e: &EditState, l: &SmplLoop) -> Option<SmplLoop> {
+    let (first, last) = (l.start.min(l.end) as usize, l.start.max(l.end) as usize);
+    if touches_replaced(&e.effects, first, last) {
+        return None;
+    }
+    let (start, end) = (
+        map_frame(&e.effects, l.start as usize)?,
+        map_frame(&e.effects, l.end as usize)?,
+    );
+    // A mirroring reverse swaps the ends; an ordered loop stays ordered.
+    let (start, end) = if l.start <= l.end && start > end {
+        (end, start)
+    } else {
+        (start, end)
+    };
+    let range = e.start..=e.end;
+    (range.contains(&start) && range.contains(&end)).then(|| SmplLoop {
+        start: to_u32(start) - to_u32(e.start),
+        end: to_u32(end) - to_u32(e.start),
+        ..*l
+    })
+}
+
+/// The extra `smpl` loops (index 1 and up) of `doc` that saving it edited by `e` leaves out,
+/// for the save dialog: a splice replaced some of their audio, or they do not lie inside
+/// Start…End. Empty when the original `smpl` chunk is written back as it is.
+pub fn dropped_extra_loops(doc: &WavDocument, e: &EditState) -> Vec<SmplLoop> {
+    let e = e.clone().clamped(doc.frames);
+    match &doc.smpl {
+        Some(s) if !smpl_unchanged(doc, &doc.initial_edit(), &e) => s
+            .loops
+            .iter()
+            .skip(1)
+            .filter(|l| saved_extra_loop(&e, l).is_none())
+            .copied()
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// Whether the original `smpl` chunk can be written back as it is: the loop mode, points, root
@@ -266,13 +308,14 @@ pub fn build_wav_bytes(doc: &WavDocument, e: &EditState) -> Vec<u8> {
     // chunks are written back as they are, so a save with no edits stays byte for byte.
     let frames_move = doc.frames != 0
         && (e.start != 0
-            || e.end + 1 != doc.frames
+            || e.end + 1 != frames_after(doc.frames, &e.effects)
+            || changes_length(&e.effects)
             || e.effects.iter().any(|a| {
                 matches!(
                     a.op,
                     Op::Reverse {
                         mirror_markers: true
-                    } | Op::Splice(_)
+                    }
                 )
             }));
     let tuning_changed = (e.root, e.cents) != (init.root, init.cents);
@@ -317,12 +360,13 @@ pub fn build_wav_bytes(doc: &WavDocument, e: &EditState) -> Vec<u8> {
         }
         chunks.push(c);
     }
-    // Cue positions follow the trim and the reverses. An unreadable chunk stays as it is;
-    // loading has already warned.
+    // Cue positions follow the trim, the reverses and the splices; cues in replaced audio go.
+    // An unreadable chunk stays as it is; loading has already warned.
     if frames_move {
         let _ = remap_markers(
             &mut chunks,
-            &|f| map_frame(&e.effects, f).unwrap_or(f),
+            &|f| map_frame(&e.effects, f),
+            &|first, last| map_range(&e.effects, first, last),
             e.start,
             e.end,
         );
@@ -499,13 +543,15 @@ mod tests {
     use crate::document::{load_wav, load_wav_bytes};
     use crate::edit::FadeShape;
     use crate::effects::{
-        AppliedEffect, Effect, MonoSource, Op, mirror_edit, plan_effect, process,
+        AppliedEffect, Effect, MonoSource, Op, Splice, SpliceKind, frames_after, mirror_edit,
+        plan_effect, process,
     };
     use crate::meta::info_get;
     use crate::render::render;
     use crate::riff::{list_type, parse_riff};
     use crate::testwav::{sine, wav_bytes};
     use crate::wav::{SampleFormat, decode, parse_fmt};
+    use std::sync::Arc;
 
     const RATE: u32 = 44100;
     const FRAMES: usize = 4000;
@@ -1906,5 +1952,257 @@ mod tests {
             let out = build_wav_bytes(&d, &e);
             assert!(data_of(&out).is_empty());
         }
+    }
+
+    /// A splice step putting `audio` in place of `first..=last`, all of it generated.
+    fn splice(kind: SpliceKind, first: usize, last: usize, audio: Vec<Vec<f32>>) -> AppliedEffect {
+        let n = audio.first().map_or(0, Vec::len);
+        AppliedEffect {
+            op: Op::Splice(Arc::new(Splice {
+                kind,
+                audio,
+                generated: (0, n.saturating_sub(1)),
+            })),
+            first,
+            last,
+        }
+    }
+
+    /// `e` with the splice `a` pushed and End on the new last frame, as applying a tail leaves
+    /// it.
+    fn spliced(d: &WavDocument, mut e: EditState, a: AppliedEffect) -> EditState {
+        e.effects.push(a);
+        e.end = frames_after(d.frames, &e.effects) - 1;
+        e
+    }
+
+    /// `n` frames rising from -0.5 towards 0.5, falling instead in the second channel.
+    fn ramp(channels: usize, n: usize) -> Vec<Vec<f32>> {
+        (0..channels)
+            .map(|c| {
+                (0..n)
+                    .map(|i| {
+                        let v = i as f32 / n as f32 - 0.5;
+                        if c == 1 { -v } else { v }
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// A mono 16-bit file of 1000 frames: `fmt `, `extra`, `data`.
+    fn short_file(extra: Vec<Chunk>) -> Vec<u8> {
+        wav_bytes(&[sine(441.0, RATE, 1000, 0.8)], RATE, I16, extra)
+    }
+
+    /// A `LIST/adtl` chunk holding `entries`.
+    fn adtl(entries: &[(&[u8; 4], Vec<u8>)]) -> Chunk {
+        let mut data = b"adtl".to_vec();
+        for (id, body) in entries {
+            data.extend_from_slice(*id);
+            data.extend_from_slice(&to_u32(body.len()).to_le_bytes());
+            data.extend_from_slice(body);
+            if body.len() % 2 == 1 {
+                data.push(0);
+            }
+        }
+        chunk(b"LIST", data)
+    }
+
+    fn labl_body(id: u32, text: &str) -> Vec<u8> {
+        let mut body = id.to_le_bytes().to_vec();
+        body.extend_from_slice(text.as_bytes());
+        body.push(0);
+        body
+    }
+
+    fn ltxt_body(id: u32, len: u32) -> Vec<u8> {
+        let mut body = id.to_le_bytes().to_vec();
+        body.extend_from_slice(&len.to_le_bytes());
+        body.extend_from_slice(b"rgn \0\0\0\0\0\0\0\0");
+        body
+    }
+
+    /// The cues of a saved file as `(id, position)`.
+    fn cue_positions(bytes: &[u8]) -> Vec<(u32, u32)> {
+        let c = chunks(bytes);
+        let cues = parse_cue(&c[find(&c, b"cue ").unwrap()].data).unwrap();
+        cues.iter().map(|p| (p.id, p.position)).collect()
+    }
+
+    /// The `LIST/adtl` entries of a saved file as `(kind, cue id, ltxt length or 0)`.
+    fn adtl_entries(bytes: &[u8]) -> Vec<([u8; 4], u32, u32)> {
+        let c = chunks(bytes);
+        let list = c.iter().find(|c| list_type(c) == Some(*b"adtl")).unwrap();
+        let body = &list.data[4..];
+        let mut out = Vec::new();
+        let mut at = 0;
+        while at + 8 <= body.len() {
+            let id: [u8; 4] = body[at..at + 4].try_into().unwrap();
+            let size = u32_at(body, at + 4) as usize;
+            let len = if &id == b"ltxt" {
+                u32_at(body, at + 12)
+            } else {
+                0
+            };
+            out.push((id, u32_at(body, at + 8), len));
+            at += 8 + size + (size & 1);
+        }
+        out
+    }
+
+    #[test]
+    fn tail_save_reencodes_every_format() {
+        let formats = [
+            (SampleFormat::Int { bits: 16 }, 1.0 / 32768.0),
+            (SampleFormat::Int { bits: 24 }, 1.0 / 8_388_608.0),
+            (SampleFormat::Float { bits: 32 }, 0.0),
+        ];
+        for (format, lsb) in formats {
+            for channels in 1..=2 {
+                let what = format!("{format:?}, {channels} channels");
+                let audio: Vec<Vec<f32>> = (0..channels)
+                    .map(|c| sine(441.0 + 110.0 * c as f32, RATE, 1000, 0.8))
+                    .collect();
+                // The float files carry a `fact` chunk; the integer ones have none and get none.
+                let float = matches!(format, SampleFormat::Float { .. });
+                let extra = if float {
+                    vec![chunk(b"fact", 1000u32.to_le_bytes().to_vec())]
+                } else {
+                    vec![]
+                };
+                let d = doc(&wav_bytes(&audio, RATE, format, extra));
+                let tail = ramp(channels, 600);
+                let e = spliced(
+                    &d,
+                    d.initial_edit(),
+                    splice(SpliceKind::Tail, 900, 999, tail.clone()),
+                );
+                let out = build_wav_bytes(&d, &e);
+
+                let back = doc(&out);
+                assert_eq!((back.frames, back.audio.len()), (1500, channels), "{what}");
+                for ((got, before), tail) in back.audio.iter().zip(&d.audio).zip(&tail) {
+                    let want = before[..900].iter().chain(tail);
+                    for (i, (g, w)) in got.iter().zip(want).enumerate() {
+                        assert!((g - w).abs() <= lsb, "{what}, frame {i}");
+                    }
+                }
+                let c = chunks(&out);
+                match find(&c, b"fact") {
+                    Some(i) => assert_eq!(u32_at(&c[i].data, 0), 1500, "{what}"),
+                    None => assert!(!float, "{what}: fact lost"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cues_follow_a_splice() {
+        let bytes = short_file(vec![
+            chunk(
+                b"cue ",
+                cue_bytes(&[
+                    cue_point(1, 100),
+                    cue_point(2, 950),
+                    cue_point(3, 1000),
+                    cue_point(4, 850),
+                ]),
+            ),
+            adtl(&[
+                (b"labl", labl_body(1, "kept")),
+                (b"labl", labl_body(2, "replaced")),
+                (b"ltxt", ltxt_body(4, 120)),
+            ]),
+        ]);
+        let d = doc(&bytes);
+        let e = spliced(
+            &d,
+            d.initial_edit(),
+            splice(SpliceKind::Tail, 900, 999, ramp(1, 600)),
+        );
+        assert_eq!(e.end, 1499);
+        let out = build_wav_bytes(&d, &e);
+        // Cue 2 lay in the replaced audio and goes with its label; the end-of-file cue moves to
+        // the new end; the range 850..=969 crossing the cut now ends at it.
+        assert_eq!(cue_positions(&out), vec![(1, 100), (3, 1500), (4, 850)]);
+        assert_eq!(
+            adtl_entries(&out),
+            vec![(*b"labl", 1, 0), (*b"ltxt", 4, 50)]
+        );
+    }
+
+    #[test]
+    fn cues_after_a_shortening_splice_shift() {
+        let d = doc(&short_file(vec![chunk(
+            b"cue ",
+            cue_bytes(&[cue_point(1, 700), cue_point(2, 100)]),
+        )]));
+        let loop_audio = ramp(1, 100);
+        let e = spliced(
+            &d,
+            d.initial_edit(),
+            splice(SpliceKind::SpectrumLoop, 200, 599, loop_audio.clone()),
+        );
+        assert_eq!(e.end, 699);
+        let out = build_wav_bytes(&d, &e);
+        assert_eq!(cue_positions(&out), vec![(1, 400), (2, 100)]);
+
+        // The shorter audio is written whole, not patched into the original bytes.
+        let back = doc(&out);
+        assert_eq!(back.frames, 700);
+        let want: Vec<f32> = d.audio[0][..200]
+            .iter()
+            .chain(&loop_audio[0])
+            .chain(&d.audio[0][600..])
+            .copied()
+            .collect();
+        for (i, (g, w)) in back.audio[0].iter().zip(&want).enumerate() {
+            assert!((g - w).abs() <= LSB, "frame {i}");
+        }
+    }
+
+    #[test]
+    fn extra_loops_touching_replaced_audio_are_reported() {
+        let d = doc(&short_file(vec![smpl_chunk(vec![
+            fwd(300, 799),
+            fwd(100, 200),
+            fwd(880, 960),
+        ])]));
+        let e = spliced(
+            &d,
+            d.initial_edit(),
+            splice(SpliceKind::Tail, 900, 999, ramp(1, 600)),
+        );
+        assert_eq!(dropped_extra_loops(&d, &e), vec![fwd(880, 960)]);
+        assert_eq!(
+            smpl_of(&build_wav_bytes(&d, &e)).unwrap().loops,
+            vec![fwd(300, 799), fwd(100, 200)]
+        );
+        // Nothing is dropped without edits; a loop cut off by Start is reported too.
+        assert!(dropped_extra_loops(&d, &d.initial_edit()).is_empty());
+        let head = EditState { start: 150, ..e };
+        assert_eq!(
+            dropped_extra_loops(&d, &head),
+            vec![fwd(100, 200), fwd(880, 960)]
+        );
+
+        // A loop spanning a replaced block goes even though both its ends survive; one after
+        // the block moves with the audio.
+        let d = doc(&short_file(vec![smpl_chunk(vec![
+            fwd(10, 150),
+            fwd(150, 650),
+            fwd(700, 800),
+        ])]));
+        let e = spliced(
+            &d,
+            d.initial_edit(),
+            splice(SpliceKind::SpectrumLoop, 200, 599, ramp(1, 100)),
+        );
+        assert_eq!(dropped_extra_loops(&d, &e), vec![fwd(150, 650)]);
+        assert_eq!(
+            smpl_of(&build_wav_bytes(&d, &e)).unwrap().loops,
+            vec![fwd(10, 150), fwd(400, 500)]
+        );
     }
 }

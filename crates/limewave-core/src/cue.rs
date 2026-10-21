@@ -148,14 +148,17 @@ pub fn check_markers(chunks: &[Chunk]) -> Result<(), String> {
 }
 
 /// Moves the cue positions in the first `cue ` chunk and first `LIST/adtl` to follow the
-/// audio. `map` sends an original frame to where its sound lands (a reverse mirrors it);
-/// `start..=end` are the saved frames, and positions are counted from `start`.
+/// audio. `map` sends an original frame to where its sound lands (a reverse mirrors it,
+/// a splice shifts it), or gives `None` when that frame was replaced; `range` does the same
+/// for an inclusive range, giving the part that survives. `start..=end` are the saved frames,
+/// and positions are counted from `start`.
 ///
-/// - A point cue is kept when `start <= map(position) <= end + 1`; `end + 1` is the exclusive
-///   end, where some editors put an end-of-file marker, and it becomes the saved length. Its
-///   `position` and `sample_offset` become `map(old) - start`, each from its own old value.
-///   (Ranges below are not given this extra frame.)
-/// - A cue with an `ltxt` range `[p, p + len - 1]` maps both ends, orders them, clips them to
+/// - A point cue is kept when `map(position)` is `Some(at)` with `start <= at <= end + 1`;
+///   `end + 1` is the exclusive end, where some editors put an end-of-file marker, and it
+///   becomes the saved length. Its `position` becomes `at - start`, and its `sample_offset`
+///   `map(old) - start`, or the new position when that offset was replaced. (Ranges below are
+///   not given this extra frame.)
+/// - A cue with an `ltxt` range `[p, p + len - 1]` takes `range` of it, clips that to
 ///   `start..=end` and is kept when anything is left. Its position becomes the clipped low end
 ///   minus `start`, and the `ltxt` length the clipped length.
 /// - A dropped cue also loses its `labl`, `note` and `ltxt` entries.
@@ -164,7 +167,8 @@ pub fn check_markers(chunks: &[Chunk]) -> Result<(), String> {
 /// read, both are left untouched and the reason is returned.
 pub fn remap_markers(
     chunks: &mut [Chunk],
-    map: &dyn Fn(usize) -> usize,
+    map: &dyn Fn(usize) -> Option<usize>,
+    range: &dyn Fn(usize, usize) -> Option<(usize, usize)>,
     start: usize,
     end: usize,
 ) -> Result<(), String> {
@@ -183,30 +187,27 @@ pub fn remap_markers(
     let mut kept = Vec::with_capacity(points.len());
     for p in &points {
         // The first `ltxt` with a sample length makes the cue a range.
-        let range = subs.iter().position(|s| {
+        let ltxt = subs.iter().position(|s| {
             &s.id == b"ltxt"
                 && s.data.len() >= 8
                 && u32_at(&s.data, 0) == p.id
                 && u32_at(&s.data, 4) > 0
         });
-        let moved = match range {
-            None => {
-                let at = map(p.position as usize);
-                (start..=end.saturating_add(1))
-                    .contains(&at)
-                    .then_some(CuePoint {
-                        position: shift(at),
-                        sample_offset: shift(map(p.sample_offset as usize)),
-                        ..*p
-                    })
-            }
+        let moved = match ltxt {
+            None => map(p.position as usize)
+                .filter(|at| (start..=end.saturating_add(1)).contains(at))
+                .map(|at| CuePoint {
+                    position: shift(at),
+                    sample_offset: shift(map(p.sample_offset as usize).unwrap_or(at)),
+                    ..*p
+                }),
             Some(i) => {
                 let len = u32_at(&subs[i].data, 4);
                 let low = p.position as usize;
                 let high = low.saturating_add(len as usize - 1);
-                let (a, b) = (map(low), map(high));
-                let (a, b) = (a.min(b).max(start), a.max(b).min(end));
-                (a <= b).then(|| {
+                let clipped =
+                    range(low, high).map(|(a, b)| (a.min(b).max(start), a.max(b).min(end)));
+                clipped.filter(|(a, b)| a <= b).map(|(a, b)| {
                     let new_len = u32::try_from(b - a + 1).unwrap_or(u32::MAX);
                     if new_len != len {
                         subs[i].data[4..8].copy_from_slice(&new_len.to_le_bytes());
@@ -218,7 +219,7 @@ pub fn remap_markers(
                         sample_offset: if p.sample_offset == p.position {
                             shift(a)
                         } else {
-                            shift(map(p.sample_offset as usize))
+                            shift(map(p.sample_offset as usize).unwrap_or(a))
                         },
                         ..*p
                     }
@@ -298,6 +299,35 @@ mod tests {
         parse_adtl(&chunks[1].data).unwrap()
     }
 
+    fn same(f: usize) -> Option<usize> {
+        Some(f)
+    }
+
+    fn same_range(a: usize, b: usize) -> Option<(usize, usize)> {
+        Some((a, b))
+    }
+
+    #[test]
+    fn replaced_cues_are_dropped_with_their_entries() {
+        // Frames 400..=599 were replaced: point cue 1 and range cue 2 lie wholly inside.
+        let map = |f: usize| (!(400..600).contains(&f)).then_some(f);
+        let range = |a: usize, b: usize| (b < 400 || a >= 600).then_some((a, b));
+        let mut chunks = vec![
+            cue_chunk(&[point(1, 450), point(2, 420), point(3, 100)]),
+            adtl_chunk(&[labl(1, "a"), ltxt(2, 10), labl(3, "c")]),
+        ];
+        remap_markers(&mut chunks, &map, &range, 0, 999).unwrap();
+        assert_eq!(cues(&chunks), vec![point(3, 100)]);
+        assert_eq!(subs(&chunks), vec![labl(3, "c")]);
+
+        // A surviving range is clipped to Start...End after `range` has had its say.
+        let mut chunks = vec![cue_chunk(&[point(1, 300)]), adtl_chunk(&[ltxt(1, 200)])];
+        let before = |a: usize, b: usize| Some((a, b.min(399)));
+        remap_markers(&mut chunks, &same, &before, 350, 999).unwrap();
+        assert_eq!(cues(&chunks)[0].position, 0);
+        assert_eq!(u32_at(&subs(&chunks)[0].data, 4), 50);
+    }
+
     #[test]
     fn parse_and_write_round_trip() {
         let points = vec![point(1, 10), point(7, 99_999)];
@@ -319,7 +349,7 @@ mod tests {
     #[test]
     fn head_trim_shifts_cues() {
         let mut chunks = vec![cue_chunk(&[point(1, 500)])];
-        remap_markers(&mut chunks, &|f| f, 100, 999).unwrap();
+        remap_markers(&mut chunks, &same, &same_range, 100, 999).unwrap();
         let c = cues(&chunks);
         assert_eq!((c[0].position, c[0].sample_offset), (400, 400));
     }
@@ -330,14 +360,14 @@ mod tests {
             cue_chunk(&[point(1, 50), point(2, 500)]),
             adtl_chunk(&[labl(1, "a"), labl(2, "b")]),
         ];
-        remap_markers(&mut chunks, &|f| f, 100, 999).unwrap();
+        remap_markers(&mut chunks, &same, &same_range, 100, 999).unwrap();
         let c = cues(&chunks);
         assert_eq!(c.len(), 1);
         assert_eq!((c[0].id, c[0].position), (2, 400));
         assert_eq!(subs(&chunks), vec![labl(2, "b")]);
         // A cue after End goes too.
         let mut chunks = vec![cue_chunk(&[point(1, 500), point(2, 901)])];
-        remap_markers(&mut chunks, &|f| f, 0, 899).unwrap();
+        remap_markers(&mut chunks, &same, &same_range, 0, 899).unwrap();
         assert_eq!(cues(&chunks), vec![point(1, 500)]);
     }
 
@@ -345,11 +375,11 @@ mod tests {
     fn end_of_file_cue_is_kept_at_the_saved_length() {
         // A point cue on the exclusive end (frame 1000 of 1000) survives; one frame later does not.
         let mut chunks = vec![cue_chunk(&[point(1, 1000), point(2, 1001)])];
-        remap_markers(&mut chunks, &|f| f, 100, 999).unwrap();
+        remap_markers(&mut chunks, &same, &same_range, 100, 999).unwrap();
         assert_eq!(cues(&chunks), vec![point(1, 900)]);
         // A range ending past the audio is still clipped, not extended.
         let mut chunks = vec![cue_chunk(&[point(1, 990)]), adtl_chunk(&[ltxt(1, 20)])];
-        remap_markers(&mut chunks, &|f| f, 0, 999).unwrap();
+        remap_markers(&mut chunks, &same, &same_range, 0, 999).unwrap();
         assert_eq!(u32_at(&subs(&chunks)[0].data, 4), 10);
     }
 
@@ -370,7 +400,14 @@ mod tests {
             cue_chunk(&[point(1, 200), point(2, 10)]),
             adtl_chunk(&[ltxt(1, 101)]),
         ];
-        remap_markers(&mut chunks, &|f| 999 - f, 0, 999).unwrap();
+        remap_markers(
+            &mut chunks,
+            &|f| Some(999 - f),
+            &|a, b| Some((999 - b, 999 - a)),
+            0,
+            999,
+        )
+        .unwrap();
         let c = cues(&chunks);
         assert_eq!((c[0].position, c[0].sample_offset), (699, 699));
         assert_eq!(c[1].position, 989);
@@ -380,12 +417,12 @@ mod tests {
     #[test]
     fn ltxt_range_crossing_start_is_clipped() {
         let mut chunks = vec![cue_chunk(&[point(1, 80)]), adtl_chunk(&[ltxt(1, 101)])];
-        remap_markers(&mut chunks, &|f| f, 100, 999).unwrap();
+        remap_markers(&mut chunks, &same, &same_range, 100, 999).unwrap();
         assert_eq!(cues(&chunks)[0].position, 0);
         assert_eq!(u32_at(&subs(&chunks)[0].data, 4), 81);
         // A range entirely before Start goes, with its entry.
         let mut chunks = vec![cue_chunk(&[point(1, 10)]), adtl_chunk(&[ltxt(1, 20)])];
-        remap_markers(&mut chunks, &|f| f, 100, 999).unwrap();
+        remap_markers(&mut chunks, &same, &same_range, 100, 999).unwrap();
         assert!(cues(&chunks).is_empty());
         assert!(subs(&chunks).is_empty());
     }
@@ -408,7 +445,7 @@ mod tests {
             },
         ];
         let before = chunks.clone();
-        remap_markers(&mut chunks, &|f| f, 0, 999).unwrap();
+        remap_markers(&mut chunks, &same, &same_range, 0, 999).unwrap();
         assert_eq!(chunks, before);
     }
 
@@ -424,7 +461,7 @@ mod tests {
             adtl_chunk(&[labl(1, "a")]),
         ];
         let before = chunks.clone();
-        assert!(remap_markers(&mut chunks, &|f| f, 100, 999).is_err());
+        assert!(remap_markers(&mut chunks, &same, &same_range, 100, 999).is_err());
         assert_eq!(chunks, before);
         assert!(check_markers(&chunks).is_err());
     }
@@ -441,7 +478,7 @@ mod tests {
             },
         ];
         let before = chunks.clone();
-        assert!(remap_markers(&mut chunks, &|f| f, 100, 999).is_err());
+        assert!(remap_markers(&mut chunks, &same, &same_range, 100, 999).is_err());
         assert_eq!(chunks, before);
         assert!(check_markers(&chunks).is_err());
     }
@@ -450,7 +487,7 @@ mod tests {
     fn files_without_cues_and_unknown_entries_are_untouched() {
         let mut chunks = vec![adtl_chunk(&[labl(1, "a")])];
         let before = chunks.clone();
-        remap_markers(&mut chunks, &|f| f, 100, 999).unwrap();
+        remap_markers(&mut chunks, &same, &same_range, 100, 999).unwrap();
         assert_eq!(chunks, before);
 
         // Entries of other kinds, and labels of cues that do not exist, stay.
@@ -462,7 +499,7 @@ mod tests {
             cue_chunk(&[point(1, 50)]),
             adtl_chunk(&[labl(1, "a"), labl(9, "orphan"), other.clone()]),
         ];
-        remap_markers(&mut chunks, &|f| f, 100, 999).unwrap();
+        remap_markers(&mut chunks, &same, &same_range, 100, 999).unwrap();
         assert_eq!(subs(&chunks), vec![labl(9, "orphan"), other]);
     }
 }
