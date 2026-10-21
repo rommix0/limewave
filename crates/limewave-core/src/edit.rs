@@ -537,6 +537,10 @@ mod tests {
         );
         let t = set_trim_to_selection(&e, (250, 600)).unwrap();
         assert_eq!((t.start, t.end), (250, 600));
+        // A selection dragged right to left gives the same trim, and the same refusal.
+        let t = set_trim_to_selection(&e, (600, 250)).unwrap();
+        assert_eq!((t.start, t.end), (250, 600));
+        assert!(set_trim_to_selection(&e, (400, 200)).is_err());
 
         let off = EditState::default_for(1000);
         let t = set_trim_to_selection(&off, (200, 400)).unwrap();

@@ -4,7 +4,7 @@ use eframe::egui::vec2;
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
 use limewave::app::{FileEntry, LimewaveApp, Session};
-use limewave_core::effects::Effect;
+use limewave_core::effects::{AppliedEffect, Effect, FadeCurve, Op, peak};
 use limewave_core::riff::Chunk;
 use limewave_core::smpl::{Smpl, SmplLoop};
 use limewave_core::testwav::{sine, wav_bytes};
@@ -104,6 +104,79 @@ fn gain_dialog_applies_to_the_selection() {
     let s = session(h.state());
     assert_eq!(s.processed[0][1500], s.doc.audio[0][1500]);
     assert!(!s.history.is_dirty(), "one undo restores");
+}
+
+#[test]
+fn fade_dialogs_apply_the_chosen_curve_to_start_end() {
+    let mut h = looped_harness();
+    assert_eq!(h.state().ui.effect_params.fade_curve, FadeCurve::Linear);
+    for (item, curve_label, curve, op) in [
+        (
+            "Fade in…",
+            "S-curve",
+            FadeCurve::SCurve,
+            Op::FadeIn as fn(FadeCurve) -> Op,
+        ),
+        (
+            "Fade out…",
+            "Exponential",
+            FadeCurve::Exponential,
+            Op::FadeOut,
+        ),
+    ] {
+        menu_click(&mut h, item);
+        h.get_by_label(curve_label).click();
+        h.run();
+        assert_eq!(h.state().ui.effect_params.fade_curve, curve, "remembered");
+        h.get_by_label("Apply").click();
+        h.run();
+        assert_eq!(h.state().ui.effect_dialog, None);
+        let e = session(h.state()).edit();
+        // No selection: the fades take Start...End, the whole file here.
+        assert_eq!(
+            e.effects.last(),
+            Some(&AppliedEffect {
+                op: op(curve),
+                first: 0,
+                last: 7999,
+            })
+        );
+    }
+    let s = session(h.state());
+    assert_eq!(s.processed[0][0], 0.0, "faded in from silence");
+    assert!(s.processed[0][7999].abs() < 1e-6, "faded out to silence");
+}
+
+#[test]
+fn normalize_dialog_applies_the_target_peak() {
+    let mut h = looped_harness();
+    h.state_mut().ui.effect_params.normalize_db = -6.0;
+    menu_click(&mut h, "Normalize…");
+    h.get_by_label("Apply").click();
+    h.run();
+    assert_eq!(h.state().ui.effect_dialog, None);
+    let s = session(h.state());
+    let target = 10f32.powf(-6.0 / 20.0);
+    let got = peak(&s.processed, 0, 7999);
+    assert!((got - target).abs() < 1e-4, "{got}");
+    assert!(s.history.is_dirty());
+}
+
+#[test]
+fn normalize_dialog_on_silence_says_why_nothing_happened() {
+    let mut h = harness_for(app_with(&wav_bytes(
+        &[vec![0.0; 1000]],
+        44100,
+        SampleFormat::Int { bits: 16 },
+        Vec::new(),
+    )));
+    menu_click(&mut h, "Normalize…");
+    h.get_by_label("Apply").click();
+    h.run();
+    assert_eq!(h.state().ui.effect_dialog, None);
+    assert!(!session(h.state()).history.is_dirty());
+    let message = h.state().ui.message.as_deref().expect("a reason is shown");
+    assert!(message.contains("silent"), "{message}");
 }
 
 #[test]

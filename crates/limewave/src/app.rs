@@ -1585,6 +1585,38 @@ mod tests {
     }
 
     #[test]
+    fn a_drag_back_to_where_it_began_renders_the_current_edit_again() {
+        let mut s = session();
+        let plain = EditState {
+            loop_mode: LoopMode::Forward,
+            loop_start: 2000,
+            loop_end: 6000,
+            ..s.edit().clone()
+        };
+        s.apply(plain.clone(), None);
+        let rendered = s.rendered.clone();
+        s.set_preview(
+            EditState {
+                crossfade: 10,
+                ..plain.clone()
+            },
+            None,
+        );
+        assert_ne!(s.rendered, rendered, "the faded preview renders");
+        // Back where it began, within the throttle: the view follows, the render waits.
+        s.set_preview(plain.clone(), None);
+        assert_ne!(s.rendered, rendered, "throttled");
+
+        s.commit_preview(None);
+        assert!(s.preview.is_none());
+        assert_eq!(s.edit(), &plain);
+        assert_eq!(s.rendered, rendered, "the current edit is rendered again");
+        // No history entry was added: one undo is back at the file as loaded.
+        s.undo(None);
+        assert!(!s.history.is_dirty());
+    }
+
+    #[test]
     fn a_file_selected_while_loading_gets_its_sound_once_loaded() {
         let mut app = LimewaveApp::for_test();
         app.files = vec![

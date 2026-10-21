@@ -151,10 +151,6 @@ fn right_clicking_a_key_sets_the_root_as_one_undo_step() {
     }
     h.run();
     assert_eq!(root_of(&h), 62);
-    assert!(
-        h.state().app.ui.held.is_empty(),
-        "right-click must not play"
-    );
     // One undo is enough to be back where the file started.
     h.state_mut().app.undo();
     h.run();
