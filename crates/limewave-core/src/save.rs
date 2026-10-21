@@ -231,8 +231,9 @@ fn smpl_unchanged(doc: &WavDocument, init: &EditState, e: &EditState) -> bool {
             .skip(1)
             .all(|l| l.start as usize <= e.end && l.end as usize <= e.end)
         // Loop 0 too, even when it was disabled on load for lying out of range; unless the
-        // tail is untouched, so a no-edit save still gives the file back as it was.
-        && (e.end + 1 == doc.frames
+        // tail is untouched, so a no-edit save still gives the file back as it was. (A file
+        // of no frames has nothing to trim: its clamped end is 0.)
+        && (e.end + 1 >= doc.frames
             || smpl
                 .loops
                 .first()
@@ -1026,6 +1027,26 @@ mod tests {
     }
 
     #[test]
+    fn an_acid_root_without_its_flag_is_ignored() {
+        let mut acid = acid_chunk(57);
+        acid.data[..4].copy_from_slice(&0u32.to_le_bytes());
+        let tag = software_tag();
+        let bytes = file(vec![acid, info(&[(b"ISFT", &tag)])], vec![]);
+        let d = doc(&bytes);
+        assert_eq!(d.initial_edit().root, 60);
+        assert_eq!(build_wav_bytes(&d, &d.initial_edit()), bytes);
+
+        // A tuning change writes the root and sets the flag, leaving the other flags alone.
+        let rooted = EditState {
+            root: 48,
+            ..d.initial_edit()
+        };
+        let c = chunks(&build_wav_bytes(&d, &rooted));
+        let acid = &c[find(&c, b"acid").unwrap()].data;
+        assert_eq!(acid[..6], [0x02, 0, 0, 0, 48, 0]);
+    }
+
+    #[test]
     fn no_edit_save_keeps_the_inst_root_and_tune_of_a_file_without_smpl() {
         let tag = software_tag();
         let bytes = file(
@@ -1767,6 +1788,21 @@ mod tests {
         let trimmed = EditState { end: 2000, ..init };
         let s = smpl_of(&build_wav_bytes(&d, &trimmed)).unwrap();
         assert!(s.loops.is_empty(), "{:?}", s.loops);
+    }
+
+    #[test]
+    fn no_edit_save_of_a_zero_frame_file_with_a_loop_is_identical() {
+        let tag = software_tag();
+        let audio = vec![Vec::new()];
+        let bytes = wav_bytes(
+            &audio,
+            RATE,
+            I16,
+            vec![smpl_chunk(vec![fwd(5, 50)]), info(&[(b"ISFT", &tag)])],
+        );
+        let d = doc(&bytes);
+        assert_eq!(d.frames, 0);
+        assert_eq!(build_wav_bytes(&d, &d.initial_edit()), bytes);
     }
 
     #[test]

@@ -152,12 +152,16 @@ pub fn sync_inst(data: &mut [u8], root: u8, cents: f32) {
     data[1] = tune as u8;
 }
 
-/// Writes the root note (u16 at byte 4) into an `acid` chunk body. No-op if
-/// the body is shorter than 6 bytes.
+/// The `acid` flags bit (in the u32 at byte 0) that says the root note is set.
+const ACID_ROOT_SET: u8 = 0x02;
+
+/// Writes the root note (u16 at byte 4) into an `acid` chunk body and raises its
+/// root-set flag. No-op if the body is shorter than 6 bytes.
 pub fn sync_acid(data: &mut [u8], root: u8) {
     if data.len() < 6 {
         return;
     }
+    data[0] |= ACID_ROOT_SET;
     data[4..6].copy_from_slice(&u16::from(root).to_le_bytes());
 }
 
@@ -174,9 +178,13 @@ pub fn read_inst(data: &[u8]) -> Option<(u8, f32)> {
 }
 
 /// Reads what [`sync_acid`] writes: the root note (u16 at byte 4). `None` if the body is
-/// shorter than 6 bytes or the root is not a MIDI note (above 127).
+/// shorter than 6 bytes, the root-set flag is clear or the root is not a MIDI note (above
+/// 127).
 pub fn read_acid(data: &[u8]) -> Option<u8> {
-    let root = u16::from_le_bytes([*data.get(4)?, *data.get(5)?]);
+    if data.len() < 6 || data[0] & ACID_ROOT_SET == 0 {
+        return None;
+    }
+    let root = u16::from_le_bytes([data[4], data[5]]);
     u8::try_from(root).ok().filter(|r| *r <= 127)
 }
 
@@ -411,6 +419,10 @@ mod tests {
         assert_eq!(data[..4], [0xAA; 4]);
         assert_eq!(data[6..], [0xAA; 18]);
 
+        let mut unset = [0u8; 8];
+        sync_acid(&mut unset, 48);
+        assert_eq!(unset[..6], [0x02, 0, 0, 0, 48, 0], "root-set flag raised");
+
         let mut short = [1u8; 5];
         sync_acid(&mut short, 48);
         assert_eq!(short, [1; 5]);
@@ -436,5 +448,8 @@ mod tests {
         assert_eq!(read_acid(&[0; 5]), None, "too short");
         acid[4..6].copy_from_slice(&300u16.to_le_bytes());
         assert_eq!(read_acid(&acid), None, "not a note");
+        let mut unflagged = [0u8; 24];
+        unflagged[4] = 57;
+        assert_eq!(read_acid(&unflagged), None, "root-set flag clear");
     }
 }
