@@ -286,34 +286,48 @@ fn draw_cursors(
     painter: &egui::Painter,
     rect: Rect,
     half: usize,
-    (loop_start, loop_end): (usize, usize),
+    loop_points: (usize, usize),
     backward: bool,
     cursors: &[Cursor],
 ) {
     let centre = rect.center().x;
     let spacing = ((rect.width() / 2.0 - SIDE_MARGIN).max(1.0)) / half as f32;
-    let end = loop_end as f64 + 1.0;
-    let start = loop_start as f64;
     for c in cursors {
-        let mut xs = Vec::with_capacity(2);
-        if backward {
-            if (start..start + half as f64).contains(&c.frame) {
-                xs.push(centre - spacing / 2.0 - ((c.frame - start) as f32) * spacing);
-            }
-            if (end - half as f64..end).contains(&c.frame) {
-                xs.push(centre + spacing / 2.0 + ((end - 1.0 - c.frame) as f32) * spacing);
-            }
-        } else {
-            if (end - half as f64..end).contains(&c.frame) {
-                xs.push(centre - spacing / 2.0 - ((end - 1.0 - c.frame) as f32) * spacing);
-            }
-            if (start..start + half as f64).contains(&c.frame) {
-                xs.push(centre + spacing / 2.0 + ((c.frame - start) as f32) * spacing);
-            }
-        }
-        for x in xs {
+        for x in cursor_xs(c.frame, centre, spacing, half, loop_points, backward)
+            .into_iter()
+            .flatten()
+        {
             painter.vline(x, rect.y_range(), Stroke::new(1.0, cursor_color(c)));
         }
+    }
+}
+
+/// Where a cursor at `frame` shows in the seam view: once on each side of the seam it lies
+/// within `half` frames of, so at most twice.
+fn cursor_xs(
+    frame: f64,
+    centre: f32,
+    spacing: f32,
+    half: usize,
+    (loop_start, loop_end): (usize, usize),
+    backward: bool,
+) -> [Option<f32>; 2] {
+    let end = loop_end as f64 + 1.0;
+    let start = loop_start as f64;
+    let near_start = (start..start + half as f64).contains(&frame);
+    let near_end = (end - half as f64..end).contains(&frame);
+    let left = |frames: f64| centre - spacing / 2.0 - (frames as f32) * spacing;
+    let right = |frames: f64| centre + spacing / 2.0 + (frames as f32) * spacing;
+    if backward {
+        [
+            near_start.then(|| left(frame - start)),
+            near_end.then(|| right(end - 1.0 - frame)),
+        ]
+    } else {
+        [
+            near_end.then(|| left(end - 1.0 - frame)),
+            near_start.then(|| right(frame - start)),
+        ]
     }
 }
 
@@ -444,6 +458,21 @@ mod tests {
     use limewave_core::render::seam_data_backward;
 
     use super::*;
+
+    #[test]
+    fn cursor_xs_place_a_cursor_on_its_side_of_the_seam() {
+        let xs = |frame, backward| cursor_xs(frame, 100.0, 2.0, 10, (1000, 1999), backward);
+        // Forward: the loop end is left of the seam, the loop start right of it.
+        assert_eq!(xs(1999.0, false), [Some(99.0), None]);
+        assert_eq!(xs(1003.0, false), [None, Some(107.0)]);
+        assert_eq!(xs(1500.0, false), [None, None]);
+        // Backward: mirrored.
+        assert_eq!(xs(1003.0, true), [Some(93.0), None]);
+        assert_eq!(xs(1999.0, true), [None, Some(101.0)]);
+        // A loop shorter than the window shows a cursor on both sides.
+        let short = cursor_xs(1002.0, 100.0, 2.0, 10, (1000, 1004), false);
+        assert_eq!(short, [Some(95.0), Some(105.0)]);
+    }
 
     #[test]
     fn sample_text_scales_to_the_bit_depth() {
