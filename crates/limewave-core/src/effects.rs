@@ -274,10 +274,17 @@ pub fn map_frame(effects: &[AppliedEffect], f: usize) -> usize {
 /// ends and reflect (`new start = first + last - old end`). Start, End and everything else
 /// stay as they are.
 pub fn mirror_edit(e: &EditState, first: usize, last: usize) -> EditState {
-    let sum = first + last;
+    // `first + last - f` without the overflowing sum, saturating at both ends.
+    let reflect = |f: usize| {
+        if f >= first {
+            last.saturating_sub(f - first)
+        } else {
+            last.saturating_add(first - f)
+        }
+    };
     EditState {
-        loop_start: sum.saturating_sub(e.loop_end),
-        loop_end: sum.saturating_sub(e.loop_start),
+        loop_start: reflect(e.loop_end),
+        loop_end: reflect(e.loop_start),
         ..e.clone()
     }
 }
@@ -555,6 +562,25 @@ mod tests {
         assert_eq!(map_frame(&wild, usize::MAX - 1), 11);
         assert_eq!(map_frame(&wild, 10), usize::MAX);
         assert_eq!(map_frame(&wild, 5), 5);
+    }
+
+    #[test]
+    fn mirror_edit_never_overflows() {
+        let e = EditState {
+            loop_mode: LoopMode::Forward,
+            loop_start: 20,
+            loop_end: usize::MAX - 1,
+            ..EditState::default_for(100)
+        };
+        let m = mirror_edit(&e, 10, usize::MAX);
+        assert_eq!((m.loop_start, m.loop_end), (11, usize::MAX - 10));
+        let low = EditState {
+            loop_start: 5,
+            loop_end: 30,
+            ..e
+        };
+        let m = mirror_edit(&low, 10, usize::MAX);
+        assert_eq!((m.loop_start, m.loop_end), (usize::MAX - 20, usize::MAX));
     }
 
     #[test]
