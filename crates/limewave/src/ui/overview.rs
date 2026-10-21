@@ -33,7 +33,7 @@ pub fn overview(ui: &mut egui::Ui, s: &mut Session, cursors: &[Cursor]) {
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 2.0, BACKGROUND);
 
-    let total = s.doc.frames;
+    let total = s.frames();
     if total == 0 {
         return;
     }
@@ -98,9 +98,13 @@ pub fn overview(ui: &mut egui::Ui, s: &mut Session, cursors: &[Cursor]) {
     }
     painter.extend(shapes);
 
-    // The loop and the trim markers.
-    let e = s.shown_edit();
+    // Generated audio, the loop and the trim markers.
     let x_of = |f: usize| left + (f as f64 / frames_per_px_overview) as f32;
+    for (first, last) in s.tint_ranges() {
+        let tint = Rect::from_x_y_ranges(x_of(first)..=x_of(last + 1), rect.y_range());
+        painter.rect_filled(tint, 0.0, colors::generated_tint());
+    }
+    let e = s.shown_edit();
     let marker = |f: usize, c: Color32| {
         let x = x_of(f).clamp(left, rect.right());
         painter.line_segment(

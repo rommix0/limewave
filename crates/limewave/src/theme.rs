@@ -14,6 +14,11 @@ pub mod colors {
     pub const XFADE: Color32 = Color32::from_rgb(0xc0, 0x84, 0xfc);
     pub const NEON: Color32 = Color32::from_rgb(0x22, 0xd3, 0xee);
     pub const LIME: Color32 = Color32::from_rgb(0xa3, 0xe6, 0x35);
+
+    /// The tint over generated audio (tails and spectrum loops): lime at alpha 30.
+    pub fn generated_tint() -> Color32 {
+        Color32::from_rgba_unmultiplied(LIME.r(), LIME.g(), LIME.b(), 30)
+    }
 }
 
 /// Forces the dark theme and paints panels with the Limewave panel colour.

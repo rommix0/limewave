@@ -8,7 +8,9 @@ use eframe::egui::{
 use limewave_core::document::load_wav;
 use limewave_core::edit::{self, EditState};
 use limewave_core::render::crossfade_len;
-use limewave_core::save::{Destination, SaveOutcome, default_folder, save_wav};
+use limewave_core::save::{
+    Destination, SaveOutcome, default_folder, dropped_extra_loops, save_wav,
+};
 use limewave_core::software_tag;
 
 use crate::app::{FileEntry, LimewaveApp, Session};
@@ -300,6 +302,20 @@ fn dialog_body(ui: &mut Ui, st: &mut SaveDialogState, files: &[FileEntry]) {
     if chosen.iter().any(|s| mixes_crossfade(s.edit())) {
         ui.colored_label(colors::XFADE, "Loop crossfade will be mixed into the audio");
     }
+    let trim = st.trim_after_loop.then_some(st.padding);
+    for s in &chosen {
+        for line in dropped_loop_lines(s, trim) {
+            let text = if chosen.len() > 1 {
+                format!(
+                    "{}: {line}",
+                    s.doc.path.file_name().unwrap_or_default().to_string_lossy()
+                )
+            } else {
+                line
+            };
+            ui.colored_label(colors::END, text);
+        }
+    }
     ui.horizontal(|ui| {
         let trim = ui.checkbox(&mut st.trim_after_loop, "Trim after loop end, keep");
         let padding = ui.add(DragValue::new(&mut st.padding).range(0..=1_000_000));
@@ -341,6 +357,32 @@ fn dialog_body(ui: &mut Ui, st: &mut SaveDialogState, files: &[FileEntry]) {
     ui.checkbox(&mut st.only_changed, "Only save files that changed");
 }
 
+/// The edit a save of `s` writes: its current edit, with End moved to the loop end plus
+/// `trim_after_loop` frames of padding when that is set.
+fn saved_edit(s: &Session, trim_after_loop: Option<usize>) -> EditState {
+    let e = s.edit();
+    match trim_after_loop {
+        Some(padding) => edit::trim_after_loop(e, padding, s.doc.frames),
+        None => e.clone(),
+    }
+}
+
+/// One line per extra `smpl` loop that saving `s` (with `trim_after_loop`, as the save
+/// will) leaves out, naming the loop by its index in the file's `smpl` chunk and its frames.
+fn dropped_loop_lines(s: &Session, trim_after_loop: Option<usize>) -> Vec<String> {
+    let dropped = dropped_extra_loops(&s.doc, &saved_edit(s, trim_after_loop));
+    let Some(smpl) = &s.doc.smpl else {
+        return Vec::new();
+    };
+    smpl.loops
+        .iter()
+        .enumerate()
+        .skip(1)
+        .filter(|(_, l)| dropped.contains(l))
+        .map(|(i, l)| format!("Extra loop {i} ({}–{}) will be dropped", l.start, l.end))
+        .collect()
+}
+
 /// Whether saving `e` mixes a crossfade into the audio. A crossfade kept while the loop is
 /// off or backward does not count.
 fn mixes_crossfade(e: &EditState) -> bool {
@@ -375,13 +417,11 @@ fn save_session(
     dest: &Destination,
     trim_after_loop: Option<usize>,
 ) -> Result<SaveOutcome, String> {
-    let frames = s.doc.frames;
+    // The length the views show: a splice step changes it from `doc.frames`.
+    let frames = s.frames();
     let channels = s.processed.len();
-    let mut e = s.edit().clone();
-    if let Some(padding) = trim_after_loop {
-        e = edit::trim_after_loop(&e, padding, frames);
-    }
-    let crossfaded = mixes_crossfade(&e.clone().clamped(frames));
+    let e = saved_edit(s, trim_after_loop);
+    let crossfaded = mixes_crossfade(&e.clone().clamped(s.doc.frames));
     let outcome =
         save_wav(&s.doc, &e, &effective_destination(s, dest)).map_err(|err| err.to_string())?;
     match load_wav(&outcome.written) {
@@ -1106,6 +1146,61 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, source);
         assert!(results[0].1.is_err());
+    }
+
+    #[test]
+    fn save_dialog_lists_dropped_loops() {
+        use egui_kittest::kittest::Queryable;
+        use limewave_core::effects::{AppliedEffect, Op, Splice, SpliceKind};
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut smpl = Smpl::parse(&smpl_chunk(1000, 5000).data).unwrap();
+        let extra = |start, end| SmplLoop {
+            cue_id: 1,
+            start,
+            end,
+            ..smpl.loops[0]
+        };
+        // Loop 1 lies over the audio the splice replaces; loop 2 does not.
+        smpl.loops.extend([extra(7000, 7500), extra(2000, 3000)]);
+        let bytes = wav_bytes(
+            &[sine(440.0, 44100, 8000, 0.5)],
+            44100,
+            SampleFormat::Int { bits: 16 },
+            vec![Chunk {
+                id: *b"smpl",
+                data: smpl.to_bytes(),
+            }],
+        );
+        let path = dir.path().join("multi.wav");
+        std::fs::write(&path, bytes).unwrap();
+        let mut app = app_with(&[path]);
+        let s = session(&mut app, 0);
+        let mut e = s.edit().clone();
+        e.effects.push(AppliedEffect {
+            op: Op::Splice(Arc::new(Splice {
+                kind: SpliceKind::Tail,
+                audio: vec![vec![0.1; 3000]],
+                generated: (2000, 2999),
+            })),
+            first: 6000,
+            last: 7999,
+        });
+        s.apply(e, None);
+        app.ui.save_dialog.open_for(0, &app.files, false);
+
+        let mut h = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1100.0, 900.0))
+            .allow_missing_glyphs()
+            .build_ui_state(|ui, app: &mut LimewaveApp| app.show(ui), app);
+        h.run();
+        h.get_by_label("Extra loop 1 (7000–7500) will be dropped");
+        assert!(
+            h.query_by_label("Extra loop 2 (2000–3000) will be dropped")
+                .is_none(),
+            "a loop clear of the splice is kept"
+        );
     }
 
     #[test]

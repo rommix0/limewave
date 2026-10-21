@@ -293,8 +293,9 @@ fn tuning_section(
 fn loop_section(ui: &mut Ui, s: &mut Session, ui_state: &UiState, engine: Option<&AudioEngine>) {
     ui.heading("Loop");
     let shown = s.shown_edit().clone();
-    let frames = s.doc.frames;
-    let last = frames.saturating_sub(1);
+    // Fields range over the file as it is now; marker moves take the original count.
+    let last = s.frames().saturating_sub(1);
+    let original_frames = s.doc.frames;
     let loop_on = shown.loop_mode != LoopMode::Off;
     let backward = shown.loop_mode == LoopMode::Backward;
 
@@ -326,7 +327,7 @@ fn loop_section(ui: &mut Ui, s: &mut Session, ui_state: &UiState, engine: Option
         let r = ui.add(DragValue::new(&mut v).range(0..=last).speed(1.0));
         let r = r.labelled_by(name.id);
         track(s, engine, &r, |e| {
-            move_marker(e, marker, v, ui_state.lock_length, frames)
+            move_marker(e, marker, v, ui_state.lock_length, original_frames)
         });
         ui.end_row();
     };

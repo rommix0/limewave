@@ -117,9 +117,10 @@ fn thumbnail(ui: &mut Ui, s: &Session) {
     let mid = rect.center().y;
     let half = rect.height() / 2.0 - 1.0;
     let stroke = Stroke::new(1.0, colors::WAVE);
+    let frames = s.frames();
     for x in 0..columns {
-        let from = x * s.doc.frames / columns;
-        let to = ((x + 1) * s.doc.frames / columns).max(from + 1);
+        let from = x * frames / columns;
+        let to = ((x + 1) * frames / columns).max(from + 1);
         let (lo, hi) = s
             .peaks
             .iter()

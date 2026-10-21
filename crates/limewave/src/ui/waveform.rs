@@ -165,7 +165,7 @@ pub fn waveform_view(
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 2.0, BACKGROUND);
 
-    let total = s.doc.frames;
+    let total = s.frames();
     let width = rect.width();
     let left = rect.left();
     if total == 0 || width < 1.0 || rect.height() <= RULER_HEIGHT {
@@ -426,7 +426,7 @@ fn frame_at(view: &ViewTransform, x: f32, left: f32, total: usize) -> usize {
 /// and clamped to the file, and with `snap` its first edge snapped like a loop start and its
 /// last like a loop end.
 fn dragged_selection(s: &Session, a: f64, b: f64, snap: bool) -> (usize, usize) {
-    let last_frame = s.doc.frames.saturating_sub(1) as f64;
+    let last_frame = s.frames().saturating_sub(1) as f64;
     let at = |f: f64| f.round().clamp(0.0, last_frame) as usize;
     let (mut first, mut last) = (at(a.min(b)), at(a.max(b)));
     if snap {
@@ -504,7 +504,11 @@ fn draw(
         draw_lane(painter, lane, view, channel, peaks);
     }
 
-    // Outside the trim, and the loop region.
+    // Generated audio, then outside the trim and the loop region.
+    for (first, last) in s.tint_ranges() {
+        let tint = Rect::from_x_y_ranges(visible_x(first)..=visible_x(last + 1), lanes.y_range());
+        painter.rect_filled(tint, 0.0, colors::generated_tint());
+    }
     let shade = with_alpha(Color32::BLACK, 90);
     let before = Rect::from_x_y_ranges(left..=visible_x(e.start), lanes.y_range());
     let after = Rect::from_x_y_ranges(visible_x(e.end)..=rect.right(), lanes.y_range());

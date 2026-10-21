@@ -1,6 +1,7 @@
 //! Waveform and overview views driven through the whole app with synthetic pointer input.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Instant;
 
 use eframe::egui::{
@@ -14,7 +15,7 @@ use limewave::ui::waveform::flag_hit_point;
 use limewave_core::document::load_wav_bytes;
 use limewave_core::dsp::{Crossing, is_crossing, is_upward};
 use limewave_core::edit::{LoopMode, Marker};
-use limewave_core::effects::Effect;
+use limewave_core::effects::{AppliedEffect, Effect, Op, Splice, SpliceKind};
 use limewave_core::riff::Chunk;
 use limewave_core::smpl::{Smpl, SmplLoop};
 use limewave_core::testwav::{sine, wav_bytes};
@@ -440,4 +441,81 @@ fn applying_an_effect_to_a_long_file_is_quick() {
 
 fn session_frames(h: &Harness<'static, LimewaveApp>) -> usize {
     session(h).doc.frames
+}
+
+/// An app showing a 1000-frame mono sine after a tail splice that makes it 1500 frames long.
+fn tail_harness() -> Harness<'static, LimewaveApp> {
+    let bytes = wav_bytes(
+        &[sine(220.0, 44100, 1000, 0.5)],
+        44100,
+        SampleFormat::Int { bits: 16 },
+        Vec::new(),
+    );
+    let mut s = Session::new(load_wav_bytes(PathBuf::from("short.wav"), &bytes).unwrap());
+    let audio = vec![(0..600).map(|i| (i as f32 * 0.05).sin() * 0.25).collect()];
+    let mut e = s.edit().clone();
+    e.effects.push(AppliedEffect {
+        op: Op::Splice(Arc::new(Splice {
+            kind: SpliceKind::Tail,
+            audio,
+            generated: (100, 599),
+        })),
+        first: 900,
+        last: 999,
+    });
+    s.apply(e, None);
+    assert_eq!(s.frames(), 1500);
+    assert_eq!(s.edit().end, 999, "the splice leaves End where it was");
+
+    let mut app = LimewaveApp::for_test();
+    app.files = vec![FileEntry::Loaded(Box::new(s))];
+    app.select(0);
+    let mut h = Harness::builder()
+        .with_size(eframe::egui::vec2(1100.0, 700.0))
+        .with_step_dt(0.25)
+        // The seam readout uses an arrow that the test font set lacks.
+        .allow_missing_glyphs()
+        .build_ui_state(|ui, app: &mut LimewaveApp| app.show(ui), app);
+    h.run();
+    h
+}
+
+#[test]
+fn end_marker_can_be_dragged_into_the_tail() {
+    let mut h = tail_harness();
+    assert_eq!(session(&h).view.unwrap().first, 0.0);
+    // The whole file, tail included, is in view.
+    let rect = waveform_rect(&h);
+    let last = session(&h)
+        .view
+        .unwrap()
+        .x_to_frame(rect.right(), rect.left());
+    assert!(last >= 1499.0, "the view ends at frame {last}");
+
+    let from = flag_pos(&h, Marker::End);
+    drag(&mut h, from, pos2(rect.right() - 1.0, from.y));
+    assert_eq!(
+        session(&h).edit().end,
+        1499,
+        "dragged to the end of the tail"
+    );
+
+    // Typed into the inspector.
+    let FileEntry::Loaded(s) = &mut h.state_mut().files[0] else {
+        unreachable!()
+    };
+    s.undo(None);
+    assert_eq!(s.edit().end, 999);
+    h.run();
+    h.get_by_label("End").set_value_accesskit(1499.0);
+    h.run();
+    assert_eq!(
+        session(&h).edit().end,
+        1499,
+        "a typed End of 1499 is accepted"
+    );
+    assert!(
+        h.get_by_label("1500 frames").rect().width() > 0.0,
+        "the label counts the tail"
+    );
 }

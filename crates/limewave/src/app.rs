@@ -15,8 +15,8 @@ use limewave_core::edit::{
     trim_after_loop,
 };
 use limewave_core::effects::{
-    AppliedEffect, Effect, Op, apply_effect, mirror_edit, peak, plan_effect, process,
-    silence_bounds,
+    AppliedEffect, Effect, Op, apply_effect, generated_ranges, mirror_edit, peak, plan_effect,
+    process, silence_bounds,
 };
 use limewave_core::notes::note_name;
 use limewave_core::render::render;
@@ -67,8 +67,8 @@ pub struct Session {
     pub doc: WavDocument,
     pub history: History,
     /// `doc.audio` after the current edit's effects: what the views draw and the engine plays
-    /// (apart from the crossfade). Same frame count as `doc.audio`, but the channel count may
-    /// differ after a channel tool.
+    /// (apart from the crossfade). The channel count may differ after a channel tool, and the
+    /// frame count after a splice step ([`Session::frames`]).
     pub processed: Vec<Vec<f32>>,
     /// The effects `processed` was made with.
     processed_for: Vec<AppliedEffect>,
@@ -129,6 +129,19 @@ impl Session {
 
     pub fn edit(&self) -> &EditState {
         self.history.current()
+    }
+
+    /// The length of the file after the current edit's effects: what the views show and
+    /// play. It differs from `doc.frames` once a splice step (a generated tail or a spectrum
+    /// loop) is in the list. Core helpers still take `doc.frames`, the original count.
+    pub fn frames(&self) -> usize {
+        self.processed.first().map_or(0, Vec::len)
+    }
+
+    /// The frames of generated audio in the shown edit, as sorted inclusive ranges in
+    /// final coordinates: the views tint them.
+    pub fn tint_ranges(&self) -> Vec<(usize, usize)> {
+        generated_ranges(&self.shown_edit().effects)
     }
 
     /// True when the processed audio peaks above full scale between Start and End and the
@@ -323,7 +336,13 @@ impl Session {
     /// Recomputes `processed` and `rendered` for the current edit and publishes it to the
     /// engine.
     fn refresh(&mut self, engine: Option<&AudioEngine>) {
+        let before = self.frames();
         self.sync_processed();
+        let frames = self.frames();
+        if frames != before {
+            // Keep the view on the file; the next draw fits it to the real width.
+            self.view = self.view.map(|v| v.clamped(frames, 1.0));
+        }
         let e = self.history.current().clone();
         self.trim_peak = trim_peak(&self.processed, &e);
         self.predicted = None;
@@ -1041,6 +1060,7 @@ impl LimewaveApp {
         if let Some(FileEntry::Loaded(s)) = self.selected.and_then(|i| self.files.get_mut(i)) {
             s.undo(engine);
         }
+        self.clamp_ui_to_file();
     }
 
     pub fn redo(&mut self) {
@@ -1049,6 +1069,23 @@ impl LimewaveApp {
         if let Some(FileEntry::Loaded(s)) = self.selected.and_then(|i| self.files.get_mut(i)) {
             s.redo(engine);
         }
+        self.clamp_ui_to_file();
+    }
+
+    /// Keeps the selection and the play-from point inside the selected file, whose length a
+    /// splice step, or its undo, changes: each is cut to the file, or cleared when it lies
+    /// wholly past the end. Called after undo and redo, and every frame for the edits made
+    /// elsewhere (dialogs, the inspector).
+    fn clamp_ui_to_file(&mut self) {
+        let Some(frames) = self.selected_session().map(Session::frames) else {
+            return;
+        };
+        self.ui.selection = self
+            .ui
+            .selection
+            .filter(|&(first, _)| first < frames)
+            .map(|(first, last)| (first, last.min(frames - 1)));
+        self.ui.play_from = self.ui.play_from.filter(|&f| f < frames);
     }
 
     /// Moves finished background loads into the file list.
@@ -1170,6 +1207,7 @@ impl LimewaveApp {
         }
         self.handle_close_request(&ctx);
         self.handle_shortcuts(&ctx);
+        self.clamp_ui_to_file();
         self.sync_audio();
         self.handle_keyboard(&ctx);
         self.update_midi_learn();
@@ -1453,7 +1491,7 @@ impl LimewaveApp {
         ui.heading(entry.file_name());
         match entry {
             FileEntry::Loaded(s) => {
-                ui.label(format!("{} frames", s.doc.frames));
+                ui.label(format!("{} frames", s.frames()));
                 overview(ui, s, cursors);
                 ui.add_space(4.0);
                 egui::Panel::bottom("seam")
@@ -1522,7 +1560,7 @@ mod tests {
     use super::*;
     use limewave_core::document::load_wav_bytes;
     use limewave_core::edit::LoopMode;
-    use limewave_core::effects::{FadeCurve, MonoSource};
+    use limewave_core::effects::{FadeCurve, MonoSource, Splice, SpliceKind};
     use limewave_core::testwav::{sine, wav_bytes};
     use limewave_core::wav::SampleFormat;
 
@@ -1855,6 +1893,145 @@ mod tests {
         s.undo(None);
         assert!(s.apply_effect(Effect::Invert, None, None));
         assert_eq!(s.processed, full(&s));
+
+        // A splice in the list, with effects before and after it.
+        add_tail(&mut s, 7000, 1000);
+        assert_eq!(s.frames(), 9000);
+        assert_eq!(s.processed, full(&s));
+        assert!(s.apply_effect(GAIN_6, Some((8000, 8500)), None));
+        assert_eq!(s.processed, full(&s));
+        assert_eq!(s.processed_for, s.edit().effects);
+        s.undo(None);
+        assert_eq!(s.processed, full(&s));
+        s.undo(None);
+        assert_eq!(s.processed, full(&s));
+        assert_eq!(s.frames(), 8000);
+        s.redo(None);
+        s.redo(None);
+        assert_eq!(s.processed, full(&s));
+        assert_eq!(s.mono, mono_sum(&s.processed));
+    }
+
+    /// A 1000-frame mono sine.
+    fn short_session() -> Session {
+        let bytes = wav_bytes(
+            &[sine(220.0, 44100, 1000, 0.5)],
+            44100,
+            SampleFormat::Int { bits: 16 },
+            Vec::new(),
+        );
+        Session::new(load_wav_bytes(PathBuf::from("short.wav"), &bytes).unwrap())
+    }
+
+    /// A tail splice replacing `first` to the end of a file of `frames` frames and `channels`
+    /// channels with `frames - first + added` frames, the `added` ones generated.
+    fn tail(channels: usize, frames: usize, first: usize, added: usize) -> AppliedEffect {
+        let kept = frames - first;
+        let len = kept + added;
+        let audio = vec![(0..len).map(|i| (i as f32 * 0.05).sin() * 0.25).collect(); channels];
+        AppliedEffect {
+            op: Op::Splice(Arc::new(Splice {
+                kind: SpliceKind::Tail,
+                audio,
+                generated: (kept, len - 1),
+            })),
+            first,
+            last: frames - 1,
+        }
+    }
+
+    /// Applies a tail splice from `first` that adds `added` frames to `s`.
+    fn add_tail(s: &mut Session, first: usize, added: usize) {
+        let mut e = s.edit().clone();
+        e.effects
+            .push(tail(s.processed.len(), s.frames(), first, added));
+        s.apply(e, None);
+    }
+
+    fn harness_for(app: LimewaveApp) -> egui_kittest::Harness<'static, LimewaveApp> {
+        egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1100.0, 700.0))
+            // The seam readout uses an arrow that the test font set lacks.
+            .allow_missing_glyphs()
+            .build_ui_state(|ui, app: &mut LimewaveApp| app.show(ui), app)
+    }
+
+    #[test]
+    fn frames_follows_a_splice_and_its_undo() {
+        let mut s = short_session();
+        assert_eq!(s.frames(), 1000);
+        add_tail(&mut s, 900, 500);
+        assert_eq!(s.frames(), 1500);
+        assert_eq!(s.processed[0].len(), 1500);
+        assert_eq!(s.rendered[0].len(), 1500);
+        s.undo(None);
+        assert_eq!(s.frames(), 1000);
+        s.redo(None);
+        assert_eq!(s.frames(), 1500);
+    }
+
+    #[test]
+    fn undo_of_a_tail_clamps_view_selection_and_play_from() {
+        let mut s = short_session();
+        add_tail(&mut s, 900, 500);
+        s.view = Some(ViewTransform {
+            first: 1200.0,
+            frames_per_px: 0.25,
+        });
+        let mut app = LimewaveApp::for_test();
+        app.files = vec![FileEntry::Loaded(Box::new(s))];
+        app.select(0);
+        app.ui.selection = Some((1300, 1450));
+        app.ui.play_from = Some(1400);
+        app.undo();
+
+        let s = app.selected_session().unwrap();
+        assert_eq!(s.frames(), 1000);
+        let view = s.view.expect("the view is kept");
+        assert!((0.0..1000.0).contains(&view.first), "{view:?}");
+        assert_eq!(app.ui.selection, None, "wholly past the end");
+        assert_eq!(app.ui.play_from, None, "past the end");
+
+        // A selection reaching past the end is cut to it.
+        app.redo();
+        app.ui.selection = Some((900, 1450));
+        app.ui.play_from = Some(999);
+        app.undo();
+        assert_eq!(app.ui.selection, Some((900, 999)));
+        assert_eq!(app.ui.play_from, Some(999));
+
+        let mut h = harness_for(app);
+        h.step();
+        let s = h.state().selected_session().unwrap();
+        let view = s.view.unwrap();
+        assert!(view.first >= 0.0 && view.first < 1000.0, "{view:?}");
+    }
+
+    #[test]
+    fn generated_audio_is_tinted() {
+        let mut s = short_session();
+        assert!(s.tint_ranges().is_empty());
+        add_tail(&mut s, 900, 500);
+        assert_eq!(s.tint_ranges(), vec![(1000, 1499)]);
+        // A preview shows the tint of the edit it shows.
+        let mut e = s.edit().clone();
+        e.start = 10;
+        s.set_preview(e, None);
+        assert_eq!(s.tint_ranges(), vec![(1000, 1499)]);
+        s.commit_preview(None);
+
+        let mut app = LimewaveApp::for_test();
+        app.files = vec![FileEntry::Loaded(Box::new(s))];
+        app.select(0);
+        let mut h = harness_for(app);
+        h.step();
+        let FileEntry::Loaded(s) = &mut h.state_mut().files[0] else {
+            unreachable!()
+        };
+        s.undo(None);
+        s.undo(None);
+        assert!(s.tint_ranges().is_empty());
+        h.step();
     }
 
     #[test]
@@ -1911,6 +2088,18 @@ mod tests {
         };
         s.set_preview(e, None);
         assert_eq!(s.processed[0][0], 9.0);
+
+        // The same with a splice in the list.
+        s.commit_preview(None);
+        add_tail(&mut s, 7000, 2000);
+        s.processed[0][0] = 7.0;
+        let e = EditState {
+            end: 9500,
+            ..s.edit().clone()
+        };
+        s.set_preview(e, None);
+        assert_eq!(s.processed[0][0], 7.0);
+        assert_eq!(s.shown_edit().end, 9500, "End can sit in the tail");
     }
 
     #[test]
