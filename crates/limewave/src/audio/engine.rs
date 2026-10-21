@@ -52,9 +52,10 @@ pub struct Cursor {
 /// One slot per voice: the `f64` bits of the frame and the `f32` bits of the level, where a
 /// level of 0 marks an empty slot. The audio thread writes every slot once per callback with
 /// plain atomic stores (no allocation, no locks). The frame is stored `Relaxed` and the level
-/// with `Release`; [`Cursors::read`] loads the level with `Acquire` before the frame, so a
-/// cursor never pairs a new level with an older frame. Slots are independent: a read may mix
-/// slots from two consecutive callbacks, which at most moves one cursor by a few milliseconds.
+/// with `Release`; an empty slot stores only its level, keeping its last frame.
+/// [`Cursors::read`] loads the level with `Acquire` before the frame, so a cursor never pairs
+/// a new level with an older frame. Slots are independent: a read may mix slots from two
+/// consecutive callbacks, which at most moves one cursor by a few milliseconds.
 pub struct Cursors {
     frames: [AtomicU64; MAX_VOICES],
     levels: [AtomicU32; MAX_VOICES],
@@ -86,10 +87,12 @@ impl Cursors {
     /// Writes every slot from `voices`. Audio side; does not allocate.
     fn publish(&self, voices: &[Option<Voice>; MAX_VOICES]) {
         for (i, voice) in voices.iter().enumerate() {
-            let (frame, level) = voice
-                .as_ref()
-                .map_or((0.0, 0.0), |v| (v.position(), v.level()));
-            self.frames[i].store(frame.to_bits(), Ordering::Relaxed);
+            // An empty slot only clears its level: a reader that loaded the old level must
+            // not then load a frame of 0 and draw a cursor there.
+            let level = voice.as_ref().map_or(0.0, |v| {
+                self.frames[i].store(v.position().to_bits(), Ordering::Relaxed);
+                v.level()
+            });
             self.levels[i].store(level.to_bits(), Ordering::Release);
         }
     }
@@ -142,6 +145,7 @@ impl MixerState {
                 .for_each(Voice::release),
             Command::AllOff => self.voices.iter_mut().flatten().for_each(Voice::release),
             Command::SetEnvelope(a) => {
+                let a = a.clamped();
                 self.adsr = a;
                 for v in self.voices.iter_mut().flatten() {
                     v.set_release_ms(a.release_ms);
@@ -968,6 +972,48 @@ mod tests {
         // The 10 ms (480 frame) release is over.
         block_with(&mut state, &b, &mut rx, &cursors, 480);
         assert!(cursors.read().is_empty());
+    }
+
+    #[test]
+    fn an_emptied_slot_keeps_its_last_frame() {
+        // Only the level is cleared, so a reader that saw the old level never pairs it with a
+        // frame of 0.
+        let b = looping();
+        let (mut tx, mut rx) = rtrb::RingBuffer::new(256);
+        let mut state = MixerState::new();
+        let cursors = Cursors::new();
+        tx.push(Command::SetEnvelope(FLAT)).unwrap();
+        tx.push(Command::NoteOn {
+            note: 60,
+            from: 500,
+        })
+        .unwrap();
+        block_with(&mut state, &b, &mut rx, &cursors, 64);
+        tx.push(Command::AllOff).unwrap();
+        block_with(&mut state, &b, &mut rx, &cursors, 600);
+        assert!(cursors.read().is_empty());
+        let frames: Vec<f64> = cursors
+            .frames
+            .iter()
+            .map(|f| f64::from_bits(f.load(Ordering::Relaxed)))
+            .collect();
+        assert!(frames.iter().any(|f| *f > 500.0), "{frames:?}");
+    }
+
+    #[test]
+    fn set_envelope_is_clamped_by_the_mixer() {
+        let b = looping();
+        let (mut tx, mut rx) = rtrb::RingBuffer::new(256);
+        let mut state = MixerState::new();
+        let wild = Adsr {
+            attack_ms: -5.0,
+            decay_ms: f32::NAN,
+            sustain: 2.0,
+            release_ms: f32::INFINITY,
+        };
+        tx.push(Command::SetEnvelope(wild)).unwrap();
+        block(&mut state, &b, &mut rx, 16);
+        assert_eq!(state.adsr, wild.clamped());
     }
 
     #[test]
