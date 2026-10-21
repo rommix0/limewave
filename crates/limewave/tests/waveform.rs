@@ -12,7 +12,7 @@ use egui_kittest::kittest::Queryable;
 use limewave::app::{FileEntry, LimewaveApp, Session};
 use limewave::ui::waveform::flag_hit_point;
 use limewave_core::document::load_wav_bytes;
-use limewave_core::dsp::is_upward;
+use limewave_core::dsp::{Crossing, is_crossing, is_upward};
 use limewave_core::edit::{LoopMode, Marker};
 use limewave_core::effects::Effect;
 use limewave_core::riff::Chunk;
@@ -167,6 +167,29 @@ fn drag_loop_marker_snaps_and_is_one_undo_step() {
     s.undo(None);
     assert_eq!(*s.edit(), before, "one undo restores the original");
     assert!(!s.history.is_dirty(), "the drag was a single history entry");
+}
+
+#[test]
+fn backward_drag_snaps_to_downward_crossings() {
+    let mut h = looped_harness();
+    h.get_by_label("Backward").click();
+    h.run();
+    assert_eq!(session(&h).edit().loop_mode, LoopMode::Backward);
+
+    let from = frame_pos(&h, LOOP_END as usize);
+    drag(&mut h, from, from + eframe::egui::vec2(-60.0, 0.0));
+
+    let s = session(&h);
+    let moved = s.edit().loop_end;
+    assert!(
+        moved < LOOP_END as usize - 100,
+        "the marker followed the drag"
+    );
+    assert!(
+        is_crossing(&s.mono, moved + 1, Crossing::Downward),
+        "loop end + 1 = {} is not a downward zero crossing",
+        moved + 1
+    );
 }
 
 #[test]

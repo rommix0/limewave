@@ -4,7 +4,7 @@
 use eframe::egui::{
     self, Align2, Color32, FontId, Pos2, Rect, Role, Sense, Shape, Slider, Stroke, WidgetInfo, pos2,
 };
-use limewave_core::dsp::{mono_sum, step_upward};
+use limewave_core::dsp::{Crossing, loop_crossing, mono_sum, step_crossing};
 use limewave_core::edit::{EditState, LoopMode, Marker, move_marker};
 use limewave_core::render::{SeamData, seam_data};
 use limewave_core::wav::SampleFormat;
@@ -34,18 +34,30 @@ pub enum SeamChannel {
     Right,
 }
 
-/// One channel (or the channel average) over `from..to`. `to` must not exceed any channel.
-fn window(audio: &[Vec<f32>], channel: SeamChannel, from: usize, to: usize) -> Vec<f32> {
+/// One channel (or the channel average) over `from..to`, reversed when `reversed` is set.
+/// `to` must not exceed any channel.
+fn window(
+    audio: &[Vec<f32>],
+    channel: SeamChannel,
+    from: usize,
+    to: usize,
+    reversed: bool,
+) -> Vec<f32> {
     let part = |c: &Vec<f32>| c[from..to].to_vec();
     let channels: Vec<Vec<f32>> = match channel {
         SeamChannel::Sum => audio.iter().map(part).collect(),
         SeamChannel::Left => audio.first().map(part).into_iter().collect(),
         SeamChannel::Right => audio.last().map(part).into_iter().collect(),
     };
-    mono_sum(&channels)
+    let mut mono = mono_sum(&channels);
+    if reversed {
+        mono.reverse();
+    }
+    mono
 }
 
 /// The seam of `audio` for `channel`, reading only the samples around the two loop points.
+/// A backward `mode` gives the seam of the time-reversed audio, as `seam_data_backward` does.
 /// `None` when the loop points do not lie inside the audio.
 pub fn seam_window(
     audio: &[Vec<f32>],
@@ -53,6 +65,7 @@ pub fn seam_window(
     loop_start: usize,
     loop_end: usize,
     half: usize,
+    mode: LoopMode,
 ) -> Option<SeamData> {
     let len = audio.iter().map(Vec::len).min()?;
     if loop_start > loop_end || loop_end >= len {
@@ -64,15 +77,31 @@ pub fn seam_window(
     let end_to = (loop_end + 1 + half).min(len);
     let start_from = loop_start.saturating_sub(half);
     let start_to = (loop_start + half).min(len);
-    let around_end = window(audio, channel, end_from, end_to);
-    let around_start = window(audio, channel, start_from, start_to);
-    let at_end = seam_data(&around_end, loop_end - end_from, loop_end - end_from, half);
-    let at_start = seam_data(
-        &around_start,
-        loop_start - start_from,
-        loop_start - start_from,
-        half,
-    );
+    let (at_end, at_start) = if mode == LoopMode::Backward {
+        // Backward playback leaves the loop start and re-enters at the loop end, so the
+        // windows swap roles and run reversed: a sample at `i` of a window `from..to` sits at
+        // `to - 1 - i` once reversed.
+        let around_start = window(audio, channel, start_from, start_to, true);
+        let around_end = window(audio, channel, end_from, end_to, true);
+        let leaves = around_start.len() - 1 - (loop_start - start_from);
+        let enters = around_end.len() - 1 - (loop_end - end_from);
+        (
+            seam_data(&around_start, leaves, leaves, half),
+            seam_data(&around_end, enters, enters, half),
+        )
+    } else {
+        let around_end = window(audio, channel, end_from, end_to, false);
+        let around_start = window(audio, channel, start_from, start_to, false);
+        (
+            seam_data(&around_end, loop_end - end_from, loop_end - end_from, half),
+            seam_data(
+                &around_start,
+                loop_start - start_from,
+                loop_start - start_from,
+                half,
+            ),
+        )
+    };
     let jump = at_start.after_start.first()? - at_end.before_end.last()?;
     Some(SeamData {
         before_end: at_end.before_end,
@@ -120,14 +149,15 @@ fn nudged(s: &Session, ui_state: &UiState, marker: Marker, nudge: Nudge) -> Opti
         Marker::LoopStart => e.loop_start,
         _ => e.loop_end,
     };
+    let crossing = loop_crossing(e.loop_mode);
     let to = match nudge {
         Nudge::Step(d) => current.checked_add_signed(d)?,
         // The end marker is the last looped sample: the next sample (end + 1) is what lands
         // on the crossing.
         Nudge::Crossing(forward) if marker == Marker::LoopEnd => {
-            step_upward(&s.mono, current + 1, forward)? - 1
+            step_crossing(&s.mono, current + 1, forward, crossing)? - 1
         }
-        Nudge::Crossing(forward) => step_upward(&s.mono, current, forward)?,
+        Nudge::Crossing(forward) => step_crossing(&s.mono, current, forward, crossing)?,
     };
     let moved = move_marker(e, marker, to, ui_state.lock_length, s.doc.frames);
     (moved != *e).then_some(moved)
@@ -142,15 +172,23 @@ fn nudge_row(
     title: &str,
 ) {
     ui.label(title);
+    let direction = match loop_crossing(s.edit().loop_mode) {
+        Crossing::Upward => "upward",
+        Crossing::Downward => "downward",
+    };
     let buttons = [
         (
             "zc<",
-            "Previous upward zero crossing",
+            format!("Previous {direction} zero crossing"),
             Nudge::Crossing(false),
         ),
-        ("-1", "One sample earlier", Nudge::Step(-1)),
-        ("+1", "One sample later", Nudge::Step(1)),
-        ("zc>", "Next upward zero crossing", Nudge::Crossing(true)),
+        ("-1", "One sample earlier".to_owned(), Nudge::Step(-1)),
+        ("+1", "One sample later".to_owned(), Nudge::Step(1)),
+        (
+            "zc>",
+            format!("Next {direction} zero crossing"),
+            Nudge::Crossing(true),
+        ),
     ];
     for (label, hint, nudge) in buttons {
         if ui.button(label).on_hover_text(hint).clicked()
@@ -181,6 +219,7 @@ pub fn seam_view(
         e.loop_start,
         e.loop_end,
         ui_state.seam_half,
+        e.loop_mode,
     );
 
     ui.horizontal_wrapped(|ui| {
@@ -225,12 +264,14 @@ pub fn seam_view(
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 2.0, BACKGROUND);
     if let Some(seam) = &seam {
-        draw(&painter, rect, seam, ui_state.seam_half);
+        let backward = e.loop_mode == LoopMode::Backward;
+        draw(&painter, rect, seam, ui_state.seam_half, backward);
         draw_cursors(
             &painter,
             rect,
             ui_state.seam_half,
             (e.loop_start, e.loop_end),
+            backward,
             cursors,
         );
     }
@@ -238,12 +279,15 @@ pub fn seam_view(
 
 /// Cursors inside the window around the loop end (left half) or the loop start (right half), at
 /// the x of the sample they are on. A frame sits where `draw` puts that sample: the loop end
-/// next to the centre line on its left, the loop start next to it on its right.
+/// next to the centre line on its left, the loop start next to it on its right. A backward loop
+/// is drawn reversed: the loop start on the left and the loop end on the right, each running
+/// away from the centre in the direction of increasing (left) or decreasing (right) frames.
 fn draw_cursors(
     painter: &egui::Painter,
     rect: Rect,
     half: usize,
     (loop_start, loop_end): (usize, usize),
+    backward: bool,
     cursors: &[Cursor],
 ) {
     let centre = rect.center().x;
@@ -251,14 +295,21 @@ fn draw_cursors(
     let end = loop_end as f64 + 1.0;
     let start = loop_start as f64;
     for c in cursors {
-        let before_end = (end - half as f64..end).contains(&c.frame);
-        let after_start = (start..start + half as f64).contains(&c.frame);
         let mut xs = Vec::with_capacity(2);
-        if before_end {
-            xs.push(centre - spacing / 2.0 - ((end - 1.0 - c.frame) as f32) * spacing);
-        }
-        if after_start {
-            xs.push(centre + spacing / 2.0 + ((c.frame - start) as f32) * spacing);
+        if backward {
+            if (start..start + half as f64).contains(&c.frame) {
+                xs.push(centre - spacing / 2.0 - ((c.frame - start) as f32) * spacing);
+            }
+            if (end - half as f64..end).contains(&c.frame) {
+                xs.push(centre + spacing / 2.0 + ((end - 1.0 - c.frame) as f32) * spacing);
+            }
+        } else {
+            if (end - half as f64..end).contains(&c.frame) {
+                xs.push(centre - spacing / 2.0 - ((end - 1.0 - c.frame) as f32) * spacing);
+            }
+            if (start..start + half as f64).contains(&c.frame) {
+                xs.push(centre + spacing / 2.0 + ((c.frame - start) as f32) * spacing);
+            }
         }
         for x in xs {
             painter.vline(x, rect.y_range(), Stroke::new(1.0, cursor_color(c)));
@@ -291,7 +342,7 @@ fn draw_run(painter: &egui::Painter, points: &[Pos2], colour: Color32, dashed: b
     }
 }
 
-fn draw(painter: &egui::Painter, rect: Rect, seam: &SeamData, half: usize) {
+fn draw(painter: &egui::Painter, rect: Rect, seam: &SeamData, half: usize, backward: bool) {
     let centre = rect.center();
     let spacing = ((rect.width() / 2.0 - SIDE_MARGIN).max(1.0)) / half as f32;
     let peak = [
@@ -367,17 +418,22 @@ fn draw(painter: &egui::Painter, rect: Rect, seam: &SeamData, half: usize) {
     );
 
     let font = FontId::proportional(10.0);
+    let (up_to, from) = if backward {
+        ("down to loop start", "from loop end")
+    } else {
+        ("up to loop end", "from loop start")
+    };
     painter.text(
         rect.left_top() + egui::vec2(6.0, 4.0),
         Align2::LEFT_TOP,
-        "up to loop end",
+        up_to,
         font.clone(),
         colors::WAVE,
     );
     painter.text(
         rect.right_top() + egui::vec2(-6.0, 4.0),
         Align2::RIGHT_TOP,
-        "from loop start",
+        from,
         font,
         colors::LOOP,
     );
@@ -385,6 +441,8 @@ fn draw(painter: &egui::Painter, rect: Rect, seam: &SeamData, half: usize) {
 
 #[cfg(test)]
 mod tests {
+    use limewave_core::render::seam_data_backward;
+
     use super::*;
 
     #[test]
@@ -413,31 +471,50 @@ mod tests {
         let mono = mono_sum(&audio);
         for (ls, le, half) in [(100, 300, 32), (5, 10, 64), (0, 499, 16), (250, 251, 2048)] {
             let want = seam_data(&mono, ls, le, half);
-            let got = seam_window(&audio, SeamChannel::Sum, ls, le, half).unwrap();
+            let got =
+                seam_window(&audio, SeamChannel::Sum, ls, le, half, LoopMode::Forward).unwrap();
             assert_eq!(got, want, "loop {ls}..={le}, half {half}");
         }
     }
 
     #[test]
+    fn backward_seam_window_matches_seam_data_backward() {
+        let audio = ramp(500);
+        let mono = mono_sum(&audio);
+        // Includes loops at the file's first and last samples and a half wider than the file.
+        for (ls, le, half) in [(100, 300, 32), (5, 10, 64), (0, 499, 16), (250, 251, 2048)] {
+            let want = seam_data_backward(&mono, ls, le, half);
+            let got =
+                seam_window(&audio, SeamChannel::Sum, ls, le, half, LoopMode::Backward).unwrap();
+            assert_eq!(got, want, "loop {ls}..={le}, half {half}");
+        }
+        // Not a symmetric ramp: distinct values everywhere.
+        let wavy: Vec<f32> = (0..400).map(|i| ((i * i) % 97) as f32).collect();
+        let want = seam_data_backward(&wavy, 40, 333, 50);
+        let got = seam_window(&[wavy], SeamChannel::Sum, 40, 333, 50, LoopMode::Backward).unwrap();
+        assert_eq!(got, want);
+    }
+
+    #[test]
     fn seam_window_picks_channels() {
         let audio = ramp(100);
-        let l = seam_window(&audio, SeamChannel::Left, 10, 50, 8).unwrap();
-        let r = seam_window(&audio, SeamChannel::Right, 10, 50, 8).unwrap();
+        let l = seam_window(&audio, SeamChannel::Left, 10, 50, 8, LoopMode::Forward).unwrap();
+        let r = seam_window(&audio, SeamChannel::Right, 10, 50, 8, LoopMode::Forward).unwrap();
         assert_eq!(l.before_end.last(), Some(&50.0));
         assert_eq!(r.before_end.last(), Some(&-50.0));
         assert_eq!(l.jump, -40.0);
         // A mono file has no right channel; it falls back to the one it has.
         let mono = vec![audio[0].clone()];
-        let m = seam_window(&mono, SeamChannel::Right, 10, 50, 8).unwrap();
+        let m = seam_window(&mono, SeamChannel::Right, 10, 50, 8, LoopMode::Forward).unwrap();
         assert_eq!(m, l);
     }
 
     #[test]
     fn seam_window_rejects_bad_points() {
         let audio = ramp(100);
-        assert!(seam_window(&audio, SeamChannel::Sum, 60, 50, 8).is_none());
-        assert!(seam_window(&audio, SeamChannel::Sum, 10, 100, 8).is_none());
-        assert!(seam_window(&[], SeamChannel::Sum, 0, 0, 8).is_none());
+        assert!(seam_window(&audio, SeamChannel::Sum, 60, 50, 8, LoopMode::Forward).is_none());
+        assert!(seam_window(&audio, SeamChannel::Sum, 10, 100, 8, LoopMode::Forward).is_none());
+        assert!(seam_window(&[], SeamChannel::Sum, 0, 0, 8, LoopMode::Forward).is_none());
     }
 
     #[test]
@@ -446,14 +523,22 @@ mod tests {
         x[2915] = 8331.0 / 32768.0;
         x[2532] = 7381.0 / 32768.0;
         x[2916] = 7473.0 / 32768.0;
-        let seam = seam_window(&[x.clone()], SeamChannel::Sum, 2532, 2915, 64).unwrap();
+        let seam = seam_window(
+            &[x.clone()],
+            SeamChannel::Sum,
+            2532,
+            2915,
+            64,
+            LoopMode::Forward,
+        )
+        .unwrap();
         let f = SampleFormat::Int { bits: 16 };
         assert_eq!(
             readout(&seam, f).unwrap(),
             "jump 8331 → 7381 · natural next 7473"
         );
         // At the last sample there is no natural next sample.
-        let seam = seam_window(&[x], SeamChannel::Sum, 2532, 2999, 64).unwrap();
+        let seam = seam_window(&[x], SeamChannel::Sum, 2532, 2999, 64, LoopMode::Forward).unwrap();
         assert!(
             readout(&seam, f)
                 .unwrap()

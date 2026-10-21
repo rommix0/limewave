@@ -293,12 +293,14 @@ fn loop_section(ui: &mut Ui, s: &mut Session, ui_state: &UiState, engine: Option
     let frames = s.doc.frames;
     let last = frames.saturating_sub(1);
     let loop_on = shown.loop_mode != LoopMode::Off;
+    let backward = shown.loop_mode == LoopMode::Backward;
 
     ui.horizontal(|ui| {
         for (mode, label) in [
             (LoopMode::Off, "Off"),
             (LoopMode::Forward, "Fwd"),
             (LoopMode::PingPong, "Ping-pong"),
+            (LoopMode::Backward, "Backward"),
         ] {
             if ui
                 .selectable_label(shown.loop_mode == mode, label)
@@ -339,7 +341,7 @@ fn loop_section(ui: &mut Ui, s: &mut Session, ui_state: &UiState, engine: Option
             position(ui, s, "Loop end", Marker::LoopEnd, shown.loop_end);
         });
 
-    ui.add_enabled_ui(loop_on, |ui| {
+    ui.add_enabled_ui(loop_on && !backward, |ui| {
         let rate = s.doc.format.sample_rate;
         let max = shown.max_crossfade();
         let mut ms = frames_to_ms(shown.crossfade, rate);
@@ -388,14 +390,21 @@ fn loop_section(ui: &mut Ui, s: &mut Session, ui_state: &UiState, engine: Option
                 }
             }
         });
-        ui.label(
-            RichText::new("Crossfade is mixed into the audio when you save (destructive).")
-                .color(colors::XFADE),
-        );
+        if !backward {
+            ui.label(
+                RichText::new("Crossfade is mixed into the audio when you save (destructive).")
+                    .color(colors::XFADE),
+            );
+        }
         if s.just_saved {
             ui.label(RichText::new("crossfade applied in saved file").color(colors::LIME));
         }
     });
+    if backward {
+        // The crossfade setting is kept, so switching back to a forward loop restores it.
+        ui.label(RichText::new("Crossfade is off for backward loops").color(colors::XFADE));
+        ui.weak("Some samplers ignore backward loops and play them forward.");
+    }
 }
 
 #[cfg(test)]

@@ -10,7 +10,10 @@ use eframe::egui::{
     text_edit::TextEditState,
     vec2,
 };
-use limewave_core::dsp::{PeakPyramid, snap_loop_end, snap_loop_start};
+use limewave_core::dsp::{
+    PeakPyramid, loop_crossing, snap_loop_end, snap_loop_end_with, snap_loop_start,
+    snap_loop_start_with,
+};
 use limewave_core::edit::{EditState, LoopMode, Marker, move_marker};
 
 use super::coords::{ViewTransform, flag_rect, hit_marker, pick_marker};
@@ -389,8 +392,9 @@ pub fn cursor_color(c: &Cursor) -> Color32 {
     )
 }
 
-/// The edit after dragging `marker` to the (fractional) frame `target`, snapped onto an
-/// upward zero crossing when `snap` is set and the marker is a loop marker.
+/// The edit after dragging `marker` to the (fractional) frame `target`, snapped onto a zero
+/// crossing when `snap` is set and the marker is a loop marker: upward, or downward for a
+/// backward loop.
 fn dragged_edit(
     s: &Session,
     ui_state: &UiState,
@@ -401,9 +405,10 @@ fn dragged_edit(
     let mut to = target.round().max(0.0) as usize;
     let window = snap_window(s.doc.format.sample_rate);
     if snap {
+        let crossing = loop_crossing(s.edit().loop_mode);
         match marker {
-            Marker::LoopStart => to = snap_loop_start(&s.mono, to, window),
-            Marker::LoopEnd => to = snap_loop_end(&s.mono, to, window),
+            Marker::LoopStart => to = snap_loop_start_with(&s.mono, to, window, crossing),
+            Marker::LoopEnd => to = snap_loop_end_with(&s.mono, to, window, crossing),
             Marker::Start | Marker::End => {}
         }
     }

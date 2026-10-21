@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use eframe::egui::{Key, vec2};
 use egui_kittest::Harness;
-use egui_kittest::kittest::Queryable;
+use egui_kittest::kittest::{NodeT, Queryable};
 use limewave::app::{FileEntry, LimewaveApp, Session};
 use limewave_core::document::load_wav_bytes;
 use limewave_core::edit::LoopMode;
@@ -224,10 +224,17 @@ fn crossfade_field_in_ms_makes_the_seam_continuous() {
     let jump = |h: &Harness<'static, LimewaveApp>| {
         let s = session(h);
         let e = s.edit();
-        seam_window(&s.rendered, SeamChannel::Sum, e.loop_start, e.loop_end, 64)
-            .unwrap()
-            .jump
-            .abs()
+        seam_window(
+            &s.rendered,
+            SeamChannel::Sum,
+            e.loop_start,
+            e.loop_end,
+            64,
+            LoopMode::Forward,
+        )
+        .unwrap()
+        .jump
+        .abs()
     };
     let before = jump(&h);
     assert!(
@@ -254,4 +261,79 @@ fn crossfade_field_in_ms_makes_the_seam_continuous() {
         after <= max_step + 1e-4,
         "crossfaded seam jumps {after}, steps are up to {max_step}"
     );
+}
+
+#[test]
+fn backward_mode_disables_the_crossfade_and_keeps_it() {
+    let mut h = harness(&looped());
+    // 50 frames at 44100 Hz. The field is the second widget named "Crossfade".
+    h.get_all_by_label("Crossfade")
+        .nth(1)
+        .unwrap()
+        .set_value_accesskit(50.0 * 1000.0 / 44100.0);
+    h.run();
+    assert_eq!(session(&h).edit().crossfade, 50);
+    assert!(
+        h.query_by_label("Crossfade is off for backward loops")
+            .is_none()
+    );
+
+    h.get_by_label("Backward").click();
+    h.run();
+    assert_eq!(session(&h).edit().loop_mode, LoopMode::Backward);
+    assert_eq!(session(&h).edit().crossfade, 50, "the setting is kept");
+    h.get_by_label("Crossfade is off for backward loops");
+    h.get_by_label("Some samplers ignore backward loops and play them forward.");
+    assert!(
+        h.get_all_by_label("Crossfade")
+            .all(|n| n.accesskit_node().is_disabled()),
+        "slider and field are disabled"
+    );
+    assert!(h.get_by_label("Linear").accesskit_node().is_disabled());
+    assert!(h.get_by_label("Equal power").accesskit_node().is_disabled());
+
+    h.get_by_label("Fwd").click();
+    h.run();
+    assert_eq!(session(&h).edit().loop_mode, LoopMode::Forward);
+    assert_eq!(session(&h).edit().crossfade, 50);
+    assert!(
+        h.query_by_label("Crossfade is off for backward loops")
+            .is_none()
+    );
+}
+
+#[test]
+fn backward_seam_readout() {
+    let mut h = harness(&bad_splice());
+    h.get_by_label("Backward").click();
+    h.run();
+    // x[ls] = 7381, x[le] = 8331, x[ls - 1] = 0: playing backward leaves the loop start for
+    // the sample before it, and jumps from there to the loop end.
+    h.get_by_label("jump 7381 → 8331 · natural next 0");
+}
+
+#[test]
+fn backward_crossing_nudge_puts_the_next_sample_on_a_downward_crossing() {
+    use limewave_core::dsp::{Crossing, is_crossing};
+    let mut h = harness(&looped());
+    h.get_by_label("Backward").click();
+    h.run();
+    h.get_all_by_label("zc>").nth(1).unwrap().click();
+    h.run();
+    let s = session(&h);
+    assert!(s.edit().loop_end > 5000);
+    assert!(is_crossing(
+        &s.mono,
+        s.edit().loop_end + 1,
+        Crossing::Downward
+    ));
+    h.get_all_by_label("zc<").next().unwrap().click();
+    h.run();
+    let s = session(&h);
+    assert!(s.edit().loop_start < 1000);
+    assert!(is_crossing(
+        &s.mono,
+        s.edit().loop_start,
+        Crossing::Downward
+    ));
 }
