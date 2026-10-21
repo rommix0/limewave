@@ -3,10 +3,59 @@
 use limewave_core::edit::{EditState, LoopMode};
 use limewave_core::render::render;
 
-/// Release fade length in milliseconds.
-pub const RELEASE_MS: f32 = 10.0;
 /// Maximum simultaneous audition voices.
 pub const MAX_VOICES: usize = 8;
+/// Longest attack, decay or release time in milliseconds.
+const MAX_STAGE_MS: f32 = 10_000.0;
+
+/// The audition amplitude envelope, one for the whole session (v0.2 §4.5).
+///
+/// Every stage is a linear segment counted in output frames: attack rises 0 → 1, decay falls
+/// 1 → `sustain`, which then holds, and release falls from whatever level was reached to 0 in
+/// `release_ms`. A zero-length stage is skipped. Linear decay and release are the builder's
+/// choice under §4.5.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Adsr {
+    pub attack_ms: f32,
+    pub decay_ms: f32,
+    /// Sustain level, 0 to 1.
+    pub sustain: f32,
+    pub release_ms: f32,
+}
+
+impl Adsr {
+    /// Attack 2 ms, decay 0 ms, sustain 100 %, release 30 ms.
+    pub const DEFAULT: Adsr = Adsr {
+        attack_ms: 2.0,
+        decay_ms: 0.0,
+        sustain: 1.0,
+        release_ms: 30.0,
+    };
+
+    /// Times limited to 0…10 000 ms and sustain to 0…1; a NaN field takes its default value.
+    pub fn clamped(self) -> Adsr {
+        let fix = |v: f32, default: f32, max: f32| {
+            if v.is_nan() {
+                default
+            } else {
+                v.clamp(0.0, max)
+            }
+        };
+        let d = Adsr::DEFAULT;
+        Adsr {
+            attack_ms: fix(self.attack_ms, d.attack_ms, MAX_STAGE_MS),
+            decay_ms: fix(self.decay_ms, d.decay_ms, MAX_STAGE_MS),
+            sustain: fix(self.sustain, d.sustain, 1.0),
+            release_ms: fix(self.release_ms, d.release_ms, MAX_STAGE_MS),
+        }
+    }
+}
+
+/// Output frames an envelope stage of `ms` lasts at `rate`.
+fn stage_frames(ms: f32, rate: u32) -> u32 {
+    // `as` saturates, so a negative or NaN time is 0 frames.
+    (f64::from(ms) * f64::from(rate) / 1000.0).round() as u32
+}
 
 /// A rendered sample (crossfade applied) plus the markers needed to play it.
 #[derive(Clone, Debug)]
@@ -20,9 +69,12 @@ pub struct PlayBuffer {
     pub loop_end: usize,
     pub root: u8,
     pub cents: f32,
+    /// Which session the audio comes from (0 for the empty buffer). Voices only ever play the
+    /// source they started on, so a voice released on one file finishes on that file's audio.
+    pub source: u64,
 }
 
-pub fn play_buffer(doc_audio: &[Vec<f32>], rate: u32, e: &EditState) -> PlayBuffer {
+pub fn play_buffer(doc_audio: &[Vec<f32>], rate: u32, e: &EditState, source: u64) -> PlayBuffer {
     PlayBuffer {
         audio: render(doc_audio, e),
         rate,
@@ -33,6 +85,7 @@ pub fn play_buffer(doc_audio: &[Vec<f32>], rate: u32, e: &EditState) -> PlayBuff
         loop_end: e.loop_end,
         root: e.root,
         cents: e.cents,
+        source,
     }
 }
 
@@ -56,7 +109,8 @@ pub fn hermite(xm1: f32, x0: f32, x1: f32, x2: f32, t: f32) -> f32 {
 struct LoopPoints {
     start: usize,
     end: usize,
-    ping_pong: bool,
+    /// Forward, PingPong or Backward; never Off.
+    mode: LoopMode,
 }
 
 impl LoopPoints {
@@ -64,10 +118,11 @@ impl LoopPoints {
         self.end - self.start + 1
     }
 
-    /// Folds an unwrapped index into the loop. Forward loops wrap, ping-pong loops reflect.
-    fn map(&self, i: isize) -> usize {
+    /// Folds an unwrapped index into the loop: reflecting at both ends when `reflect`, else
+    /// wrapping modulo the loop length.
+    fn map(&self, i: isize, reflect: bool) -> usize {
         let d = i - self.start as isize;
-        if self.ping_pong {
+        if reflect {
             let span = (self.end - self.start) as isize;
             let u = d.rem_euclid(2 * span);
             self.start + (if u > span { 2 * span - u } else { u }) as usize
@@ -86,11 +141,20 @@ struct Region<'a> {
 }
 
 impl<'a> Region<'a> {
-    /// `None` when the buffer has no frames to play.
-    fn new(buf: &'a PlayBuffer) -> Option<Region<'a>> {
+    /// `None` when the buffer has no frames to play. A play range (`range`) ignores the loop
+    /// and the Start and End markers: it can read the whole audio.
+    fn new(buf: &'a PlayBuffer, range: bool) -> Option<Region<'a>> {
         let len = buf.audio.iter().map(Vec::len).min()?;
         if len == 0 {
             return None;
+        }
+        if range {
+            return Some(Region {
+                chans: &buf.audio,
+                start: 0,
+                end: len - 1,
+                looping: None,
+            });
         }
         let end = buf.end.min(len - 1);
         let loop_end = buf.loop_end.min(len - 1);
@@ -98,7 +162,7 @@ impl<'a> Region<'a> {
             (buf.loop_mode != LoopMode::Off && buf.loop_start < loop_end).then_some(LoopPoints {
                 start: buf.loop_start,
                 end: loop_end,
-                ping_pong: buf.loop_mode == LoopMode::PingPong,
+                mode: buf.loop_mode,
             });
         Some(Region {
             chans: &buf.audio,
@@ -109,13 +173,21 @@ impl<'a> Region<'a> {
     }
 
     /// The source index read for tap `i`, or `None` for silence past the end of a one-shot.
-    /// `in_loop` says the voice is inside the loop, so taps outside it fold back in.
-    fn tap(&self, i: isize, in_loop: bool) -> Option<usize> {
+    /// `in_loop` says the voice is inside the loop and `forward` which way it is going, so
+    /// taps outside the loop fold back in the order the loop plays.
+    fn tap(&self, i: isize, in_loop: bool, forward: bool) -> Option<usize> {
         if let Some(lp) = self.looping {
             let past_end = i > lp.end as isize;
-            let before_start = i < lp.start as isize && in_loop && lp.ping_pong;
-            if past_end || before_start {
-                return Some(lp.map(i));
+            let before_start = i < lp.start as isize && in_loop;
+            match lp.mode {
+                LoopMode::PingPong if past_end || before_start => return Some(lp.map(i, true)),
+                // Backward loops reflect at the end on the way in, then wrap while backward.
+                LoopMode::Backward if past_end && forward => return Some(lp.map(i, true)),
+                LoopMode::Backward if (past_end || before_start) && !forward => {
+                    return Some(lp.map(i, false));
+                }
+                LoopMode::Forward if past_end => return Some(lp.map(i, false)),
+                _ => {}
             }
         } else if i > self.end as isize {
             return None;
@@ -123,52 +195,110 @@ impl<'a> Region<'a> {
         Some(i.max(self.start as isize) as usize)
     }
 
-    fn sample(&self, ch: &[f32], pos: f64) -> f32 {
+    fn sample(&self, ch: &[f32], pos: f64, forward: bool) -> f32 {
         let floor = pos.floor();
         let idx = floor as isize;
         let t = (pos - floor) as f32;
         let in_loop = self.looping.is_some_and(|lp| pos >= lp.start as f64);
-        let at = |i: isize| self.tap(i, in_loop).map_or(0.0, |j| ch[j]);
+        let at = |i: isize| self.tap(i, in_loop, forward).map_or(0.0, |j| ch[j]);
         hermite(at(idx - 1), at(idx), at(idx + 1), at(idx + 2), t)
     }
 }
 
-/// One playing note: a fractional read position, direction and release state.
+/// Where a voice is in its [`Adsr`].
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Stage {
+    Attack,
+    Decay,
+    Sustain,
+    Release,
+}
+
+/// One playing note: a fractional read position, direction and envelope state.
 pub struct Voice {
     note: u8,
+    /// The [`PlayBuffer::source`] this voice started on; it only plays that audio.
+    source: u64,
     pos: f64,
     step: f64,
     forward: bool,
     dead: bool,
-    releasing: bool,
-    /// Output frames of release fade (set on the first render after `release`) and how many remain.
-    release_total: u32,
-    release_left: u32,
+    /// Play range: release on reaching this frame, ignoring the loop and End.
+    stop_at: Option<usize>,
+    adsr: Adsr,
+    stage: Stage,
+    /// Output frames played in `stage` so far.
+    stage_pos: u32,
+    /// The level the release started from.
+    release_from: f32,
+    /// The envelope level of the last frame played.
+    level: f32,
 }
 
 impl Voice {
-    pub fn new(note: u8, from: usize, buf: &PlayBuffer, device_rate: u32) -> Voice {
-        let region = Region::new(buf);
+    /// A voice for `note` starting at frame `from`, clamped into what it may play. With
+    /// `stop_at`, it ignores the loop and End and releases on reaching that frame.
+    pub fn new(
+        note: u8,
+        from: usize,
+        buf: &PlayBuffer,
+        device_rate: u32,
+        adsr: Adsr,
+        stop_at: Option<usize>,
+    ) -> Voice {
+        let region = Region::new(buf, stop_at.is_some());
         let pos = region.as_ref().map_or(0, |r| from.clamp(r.start, r.end));
         Voice {
             note,
+            source: buf.source,
             pos: pos as f64,
             step: playback_step(note, buf.root, buf.cents, buf.rate, device_rate),
             forward: true,
             dead: region.is_none(),
-            releasing: false,
-            release_total: 0,
-            release_left: 0,
+            stop_at,
+            adsr,
+            stage: Stage::Attack,
+            stage_pos: 0,
+            release_from: 0.0,
+            level: 0.0,
         }
     }
 
-    /// Starts the linear fade-out; it takes effect on the next `render_add`.
+    /// Starts the release from the current level; it takes effect on the next `render_add`.
     pub fn release(&mut self) {
-        self.releasing = true;
+        if self.stage != Stage::Release {
+            self.stage = Stage::Release;
+            self.stage_pos = 0;
+            self.release_from = self.level;
+        }
+    }
+
+    /// Changes the release time. A voice already releasing carries on from the level it has
+    /// reached, taking the new time to reach 0, so there is no jump.
+    pub fn set_release_ms(&mut self, ms: f32) {
+        self.adsr.release_ms = ms;
+        if self.stage == Stage::Release {
+            self.stage_pos = 0;
+            self.release_from = self.level;
+        }
     }
 
     pub fn note(&self) -> u8 {
         self.note
+    }
+
+    pub fn source(&self) -> u64 {
+        self.source
+    }
+
+    /// The envelope level of the last frame played.
+    pub fn level(&self) -> f32 {
+        self.level
+    }
+
+    /// The read position in file frames.
+    pub fn position(&self) -> f64 {
+        self.pos
     }
 
     /// Mixes this voice into interleaved `out`. Returns whether the voice is still alive.
@@ -183,7 +313,7 @@ impl Voice {
         if self.dead {
             return false;
         }
-        let Some(region) = Region::new(buf) else {
+        let Some(region) = Region::new(buf, self.stop_at.is_some()) else {
             self.dead = true;
             return false;
         };
@@ -191,18 +321,13 @@ impl Voice {
             return true;
         }
         self.step = playback_step(self.note, buf.root, buf.cents, buf.rate, device_rate);
-        if self.releasing && self.release_total == 0 {
-            let frames = (RELEASE_MS * device_rate as f32 / 1000.0).ceil().max(1.0) as u32;
-            self.release_total = frames;
-            self.release_left = frames;
-        }
         match region.looping {
             // The loop moved under a live voice: restart from its beginning.
             Some(lp) if self.pos > (lp.end + 1) as f64 => {
                 self.pos = lp.start as f64;
                 self.forward = true;
             }
-            Some(lp) if !lp.ping_pong => self.forward = true,
+            Some(lp) if lp.mode == LoopMode::Forward => self.forward = true,
             Some(_) => {}
             None => {
                 self.forward = true;
@@ -214,14 +339,14 @@ impl Voice {
         }
         let stereo = region.chans.len() > 1;
         for frame in out.chunks_exact_mut(out_channels) {
-            let gain = if self.releasing {
-                self.release_left as f32 / self.release_total as f32
-            } else {
-                1.0
-            };
-            let l = region.sample(&region.chans[0], self.pos);
+            if self.release_over(device_rate) {
+                self.dead = true;
+                return false;
+            }
+            let gain = self.next_level(device_rate);
+            let l = region.sample(&region.chans[0], self.pos, self.forward);
             let r = if stereo {
-                region.sample(&region.chans[1], self.pos)
+                region.sample(&region.chans[1], self.pos, self.forward)
             } else {
                 l
             };
@@ -236,19 +361,62 @@ impl Voice {
                     }
                 }
             }
-            if self.releasing {
-                self.release_left -= 1;
-                if self.release_left == 0 {
-                    self.dead = true;
-                    return false;
-                }
-            }
             if !self.advance(&region) {
                 self.dead = true;
                 return false;
             }
+            if self.stop_at.is_some_and(|to| self.pos >= to as f64) {
+                self.release();
+            }
+        }
+        // Report the end of a release at once rather than on the next call.
+        if self.release_over(device_rate) {
+            self.dead = true;
+            return false;
         }
         true
+    }
+
+    /// Whether the release has played all its frames.
+    fn release_over(&self, rate: u32) -> bool {
+        self.stage == Stage::Release && self.stage_pos >= stage_frames(self.adsr.release_ms, rate)
+    }
+
+    /// Moves the envelope on by one output frame and returns that frame's level. Attack and
+    /// decay frames end on their target level; release frames start from the level reached.
+    fn next_level(&mut self, rate: u32) -> f32 {
+        let a = self.adsr;
+        loop {
+            let (ms, next) = match self.stage {
+                Stage::Attack => (a.attack_ms, Stage::Decay),
+                Stage::Decay => (a.decay_ms, Stage::Sustain),
+                Stage::Sustain => {
+                    self.level = a.sustain;
+                    return self.level;
+                }
+                Stage::Release => {
+                    let len = stage_frames(a.release_ms, rate).max(1);
+                    let t = self.stage_pos as f32 / len as f32;
+                    self.level = self.release_from * (1.0 - t).max(0.0);
+                    self.stage_pos = self.stage_pos.saturating_add(1);
+                    return self.level;
+                }
+            };
+            let len = stage_frames(ms, rate);
+            if self.stage_pos < len {
+                self.stage_pos += 1;
+                let t = self.stage_pos as f32 / len as f32;
+                self.level = if self.stage == Stage::Attack {
+                    t
+                } else {
+                    1.0 + (a.sustain - 1.0) * t
+                };
+                return self.level;
+            }
+            // Finished, or zero-length: move straight on.
+            self.stage = next;
+            self.stage_pos = 0;
+        }
     }
 
     /// Moves one output frame along; `false` when a one-shot has run past its end.
@@ -258,16 +426,12 @@ impl Voice {
         } else {
             self.pos -= self.step;
         }
-        match region.looping {
-            None => self.pos <= region.end as f64,
-            Some(lp) if !lp.ping_pong => {
-                if self.pos >= (lp.end + 1) as f64 {
-                    self.pos = lp.start as f64 + (self.pos - lp.start as f64) % lp.len() as f64;
-                }
-                true
-            }
-            Some(lp) => {
-                let (ls, le) = (lp.start as f64, lp.end as f64);
+        let Some(lp) = region.looping else {
+            return self.pos <= region.end as f64;
+        };
+        let (ls, le) = (lp.start as f64, lp.end as f64);
+        match lp.mode {
+            LoopMode::PingPong => {
                 if self.pos > le || (!self.forward && self.pos < ls) {
                     // Unfold to a coordinate that always advances, then fold back into the loop.
                     let span = le - ls;
@@ -282,9 +446,25 @@ impl Voice {
                         self.forward = true;
                     }
                 }
-                true
+            }
+            LoopMode::Backward => {
+                // Past the end on the way in: reflect and play backward from then on.
+                if self.forward && self.pos > le {
+                    self.pos = 2.0 * le - self.pos;
+                    self.forward = false;
+                }
+                // Below the start while backward: jump up by the loop length.
+                if !self.forward && self.pos < ls {
+                    self.pos = ls + (self.pos - ls).rem_euclid(lp.len() as f64);
+                }
+            }
+            _ => {
+                if self.pos >= le + 1.0 {
+                    self.pos = ls + (self.pos - ls) % lp.len() as f64;
+                }
             }
         }
+        true
     }
 }
 
@@ -293,6 +473,13 @@ mod tests {
     use super::*;
 
     const RATE: u32 = 48_000;
+    /// No attack or decay, so the samples come out unchanged until the release.
+    const FLAT: Adsr = Adsr {
+        attack_ms: 0.0,
+        decay_ms: 0.0,
+        sustain: 1.0,
+        release_ms: 10.0,
+    };
 
     fn buf(audio: Vec<Vec<f32>>, mode: LoopMode, loop_start: usize, loop_end: usize) -> PlayBuffer {
         let frames = audio.first().map_or(0, Vec::len);
@@ -306,6 +493,21 @@ mod tests {
             loop_end,
             root: 60,
             cents: 0.0,
+            source: 1,
+        }
+    }
+
+    /// A constant 1.0 mono buffer, so the output is the envelope level.
+    fn ones(frames: usize, mode: LoopMode, loop_start: usize, loop_end: usize) -> PlayBuffer {
+        buf(vec![vec![1.0; frames]], mode, loop_start, loop_end)
+    }
+
+    fn adsr(attack_ms: f32, decay_ms: f32, sustain: f32, release_ms: f32) -> Adsr {
+        Adsr {
+            attack_ms,
+            decay_ms,
+            sustain,
+            release_ms,
         }
     }
 
@@ -355,7 +557,7 @@ mod tests {
     #[test]
     fn forward_loop_stays_in_loop() {
         let b = buf(ramp(2000), LoopMode::Forward, 1000, 1099);
-        let mut v = Voice::new(60, 0, &b, RATE);
+        let mut v = Voice::new(60, 0, &b, RATE, FLAT, None);
         let (_, alive) = render_frames(&mut v, &b, 1000 + 1000);
         assert!(alive);
         assert!(v.pos >= 1000.0 && v.pos < 1100.0, "pos {}", v.pos);
@@ -371,7 +573,7 @@ mod tests {
             .map(|w| (w[1] - w[0]).abs())
             .fold(0.0f32, f32::max);
         let b = buf(vec![sine], LoopMode::Forward, 1000, 1099);
-        let mut v = Voice::new(60, 1000, &b, RATE);
+        let mut v = Voice::new(60, 1000, &b, RATE, FLAT, None);
         let (out, alive) = render_frames(&mut v, &b, 500);
         assert!(alive);
         let worst = out
@@ -384,7 +586,7 @@ mod tests {
     #[test]
     fn one_shot_ends() {
         let b = buf(ramp(100), LoopMode::Off, 0, 0);
-        let mut v = Voice::new(60, 0, &b, RATE);
+        let mut v = Voice::new(60, 0, &b, RATE, FLAT, None);
         let (out, alive) = render_frames(&mut v, &b, 99);
         assert!(alive);
         assert_eq!(out[0], 1.0);
@@ -400,14 +602,14 @@ mod tests {
     #[test]
     fn pingpong_reverses() {
         let b = buf(ramp(2000), LoopMode::PingPong, 1000, 1099);
-        let mut v = Voice::new(60, 1090, &b, RATE);
+        let mut v = Voice::new(60, 1090, &b, RATE, FLAT, None);
         let (out, _) = render_frames(&mut v, &b, 30);
         // Frames 1090..=1099 forward, then back down.
         assert_eq!(out[9], 1100.0);
         assert!(out[10] < out[9] && out[11] < out[10], "{:?}", &out[8..14]);
         assert!(v.pos < 1099.0);
         // Runs to the bottom and reflects forward again without leaving the loop.
-        let mut v = Voice::new(60, 1010, &b, RATE);
+        let mut v = Voice::new(60, 1010, &b, RATE, FLAT, None);
         let (out, _) = render_frames(&mut v, &b, 40);
         assert!(out.iter().all(|s| *s >= 1001.0 && *s <= 1100.0));
         assert!(out[39] > out[30], "forward again after the bottom");
@@ -416,10 +618,10 @@ mod tests {
     #[test]
     fn release_fades_to_silence() {
         let b = buf(vec![vec![1.0; 2000]], LoopMode::Forward, 100, 1900);
-        let mut v = Voice::new(60, 0, &b, RATE);
+        let mut v = Voice::new(60, 0, &b, RATE, FLAT, None);
         render_frames(&mut v, &b, 50);
         v.release();
-        let n = (RELEASE_MS / 1000.0 * RATE as f32).ceil() as usize + 1;
+        let n = 480 + 1;
         let (out, alive) = render_frames(&mut v, &b, n);
         assert!(!alive);
         assert!(out[0] > 0.9, "starts near full gain, got {}", out[0]);
@@ -431,7 +633,7 @@ mod tests {
     #[test]
     fn loop_change_wraps_voice() {
         let b = buf(ramp(1000), LoopMode::Forward, 100, 800);
-        let mut v = Voice::new(60, 500, &b, RATE);
+        let mut v = Voice::new(60, 500, &b, RATE, FLAT, None);
         render_frames(&mut v, &b, 10);
         let mut changed = b.clone();
         changed.loop_start = 200;
@@ -444,12 +646,12 @@ mod tests {
     #[test]
     fn zero_frame_buffer_is_silent() {
         let b = buf(vec![Vec::new()], LoopMode::Off, 0, 0);
-        let mut v = Voice::new(60, 0, &b, RATE);
+        let mut v = Voice::new(60, 0, &b, RATE, FLAT, None);
         let mut out = vec![0.0; 8];
         assert!(!v.render_add(&b, &mut out, 2, RATE));
         assert!(out.iter().all(|s| *s == 0.0));
         let b = buf(Vec::new(), LoopMode::Off, 0, 0);
-        let mut v = Voice::new(60, 0, &b, RATE);
+        let mut v = Voice::new(60, 0, &b, RATE, FLAT, None);
         assert!(!v.render_add(&b, &mut out, 2, RATE));
     }
 
@@ -457,21 +659,21 @@ mod tests {
     fn channel_mapping() {
         let stereo = vec![vec![0.5; 50], vec![-0.5; 50]];
         let b = buf(stereo, LoopMode::Off, 0, 0);
-        let mut v = Voice::new(60, 0, &b, RATE);
+        let mut v = Voice::new(60, 0, &b, RATE, FLAT, None);
         let mut out = vec![0.0; 8]; // 4 frames x 2 channels
         v.render_add(&b, &mut out, 2, RATE);
         assert_eq!(&out[..4], &[0.5, -0.5, 0.5, -0.5]);
-        let mut v = Voice::new(60, 0, &b, RATE);
+        let mut v = Voice::new(60, 0, &b, RATE, FLAT, None);
         let mut out = vec![0.0; 6]; // 2 frames x 3 channels
         v.render_add(&b, &mut out, 3, RATE);
         assert_eq!(&out[..3], &[0.5, -0.5, 0.0]);
-        let mut v = Voice::new(60, 0, &b, RATE);
+        let mut v = Voice::new(60, 0, &b, RATE, FLAT, None);
         let mut out = vec![0.0; 2]; // mono output averages
         v.render_add(&b, &mut out, 1, RATE);
         assert_eq!(out, [0.0, 0.0]);
 
         let mono = buf(vec![vec![0.25; 50]], LoopMode::Off, 0, 0);
-        let mut v = Voice::new(60, 0, &mono, RATE);
+        let mut v = Voice::new(60, 0, &mono, RATE, FLAT, None);
         let mut out = vec![0.0; 6];
         v.render_add(&mono, &mut out, 3, RATE);
         assert_eq!(&out[..3], &[0.25, 0.25, 0.25]);
@@ -481,7 +683,7 @@ mod tests {
     fn mono_output_averages_stereo() {
         let stereo = vec![vec![0.75; 50], vec![0.25; 50]];
         let b = buf(stereo, LoopMode::Off, 0, 0);
-        let mut v = Voice::new(60, 0, &b, RATE);
+        let mut v = Voice::new(60, 0, &b, RATE, FLAT, None);
         let mut out = vec![0.0; 2];
         v.render_add(&b, &mut out, 1, RATE);
         assert_eq!(out, [0.5, 0.5]);
@@ -490,7 +692,7 @@ mod tests {
     #[test]
     fn render_adds_into_existing_output() {
         let b = buf(vec![vec![0.25; 50]], LoopMode::Off, 0, 0);
-        let mut v = Voice::new(60, 0, &b, RATE);
+        let mut v = Voice::new(60, 0, &b, RATE, FLAT, None);
         let mut out = vec![1.0; 4];
         v.render_add(&b, &mut out, 1, RATE);
         assert_eq!(out, [1.25; 4]);
@@ -501,10 +703,10 @@ mod tests {
         let mut b = buf(ramp(100), LoopMode::Off, 0, 0);
         b.start = 10;
         b.end = 20;
-        let mut v = Voice::new(60, 5, &b, RATE);
+        let mut v = Voice::new(60, 5, &b, RATE, FLAT, None);
         let (out, _) = render_frames(&mut v, &b, 1);
         assert_eq!(out[0], 11.0);
-        let mut v = Voice::new(60, 50, &b, RATE);
+        let mut v = Voice::new(60, 50, &b, RATE, FLAT, None);
         let (out, _) = render_frames(&mut v, &b, 1);
         assert_eq!(out[0], 21.0);
     }
@@ -521,11 +723,24 @@ mod tests {
         for _ in 0..300 {
             let frames = 1 + next(40) as usize;
             let audio = vec![vec![0.5; frames], vec![-0.5; frames]];
-            let mode = [LoopMode::Off, LoopMode::Forward, LoopMode::PingPong][next(3) as usize];
+            let mode = [
+                LoopMode::Off,
+                LoopMode::Forward,
+                LoopMode::PingPong,
+                LoopMode::Backward,
+            ][next(4) as usize];
             let mut b = buf(audio, mode, next(45) as usize, next(45) as usize);
             b.start = next(45) as usize;
             b.end = next(45) as usize;
-            let mut v = Voice::new(next(128) as u8, next(60) as usize, &b, RATE);
+            let stop_at = (next(2) == 0).then(|| next(60) as usize);
+            let mut v = Voice::new(
+                next(128) as u8,
+                next(60) as usize,
+                &b,
+                RATE,
+                Adsr::DEFAULT,
+                stop_at,
+            );
             for _ in 0..4 {
                 let mut out = vec![0.0; 2 * 64];
                 v.render_add(&b, &mut out, 2, RATE);
@@ -537,7 +752,7 @@ mod tests {
     #[test]
     fn pingpong_reflects_with_octave_step() {
         let b = buf(ramp(2000), LoopMode::PingPong, 1000, 1099);
-        let mut v = Voice::new(72, 1000, &b, RATE);
+        let mut v = Voice::new(72, 1000, &b, RATE, FLAT, None);
         render_frames(&mut v, &b, 1000);
         assert!(v.pos >= 1000.0 && v.pos <= 1099.0, "pos {}", v.pos);
     }
@@ -548,9 +763,187 @@ mod tests {
         let mut e = EditState::default_for(100);
         e.root = 64;
         e.cents = 7.0;
-        let p = play_buffer(&audio, 44100, &e);
-        assert_eq!((p.rate, p.root, p.cents), (44100, 64, 7.0));
+        let p = play_buffer(&audio, 44100, &e, 9);
+        assert_eq!((p.rate, p.root, p.cents, p.source), (44100, 64, 7.0, 9));
         assert_eq!((p.start, p.end), (e.start, e.end));
         assert_eq!(p.audio[0].len(), 100);
+    }
+
+    #[test]
+    fn attack_ramps_linearly() {
+        let b = ones(2000, LoopMode::Forward, 100, 1999);
+        let mut v = Voice::new(60, 0, &b, RATE, adsr(10.0, 0.0, 1.0, 30.0), None);
+        let (out, alive) = render_frames(&mut v, &b, 600);
+        assert!(alive);
+        let tol = 1.0 / 480.0 + 1e-6;
+        assert!((out[240] - 0.5).abs() <= tol, "frame 240 {}", out[240]);
+        assert!((out[479] - 1.0).abs() <= tol, "frame 479 {}", out[479]);
+        assert!(
+            out[..480].windows(2).all(|w| w[1] > w[0]),
+            "rises every frame"
+        );
+        assert!(
+            out[480..].iter().all(|s| *s == 1.0),
+            "then holds full level"
+        );
+    }
+
+    #[test]
+    fn decay_reaches_sustain_and_holds() {
+        let b = ones(4000, LoopMode::Forward, 100, 3999);
+        let mut v = Voice::new(60, 0, &b, RATE, adsr(0.0, 10.0, 0.5, 30.0), None);
+        let (out, alive) = render_frames(&mut v, &b, 2001);
+        assert!(alive);
+        assert!(
+            out[..480].windows(2).all(|w| w[1] < w[0]),
+            "falls during decay"
+        );
+        assert!(
+            out[480..=2000].iter().all(|s| (*s - 0.5).abs() < 1e-6),
+            "holds sustain: {:?}",
+            &out[478..484]
+        );
+        assert!((v.level() - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn release_from_mid_attack_has_no_jump() {
+        let b = ones(4000, LoopMode::Forward, 100, 3999);
+        let mut v = Voice::new(60, 0, &b, RATE, adsr(10.0, 0.0, 1.0, 10.0), None);
+        let (before, _) = render_frames(&mut v, &b, 240);
+        let reached = before[239];
+        assert!(
+            (reached - 0.5).abs() <= 1.0 / 480.0 + 1e-6,
+            "mid attack {reached}"
+        );
+        v.release();
+        let (out, alive) = render_frames(&mut v, &b, 600);
+        assert!(!alive, "the voice died");
+        assert!(out[0] <= reached, "no jump up: {} after {reached}", out[0]);
+        assert!(out.windows(2).all(|w| w[1] <= w[0]), "never rises");
+        let silent = out.iter().position(|s| *s == 0.0).unwrap();
+        assert!(silent.abs_diff(480) <= 1, "reached 0 after {silent} frames");
+        assert!(out[silent..].iter().all(|s| *s == 0.0));
+    }
+
+    #[test]
+    fn zero_attack_starts_at_full_level() {
+        let b = ones(2000, LoopMode::Forward, 100, 1999);
+        let mut v = Voice::new(60, 0, &b, RATE, adsr(0.0, 0.0, 1.0, 30.0), None);
+        let (out, _) = render_frames(&mut v, &b, 4);
+        assert_eq!(out, [1.0; 4]);
+    }
+
+    #[test]
+    fn one_shot_ends_at_the_sample_end_despite_sustain() {
+        let b = ones(100, LoopMode::Off, 0, 0);
+        let mut v = Voice::new(60, 0, &b, RATE, adsr(0.0, 0.0, 1.0, 30.0), None);
+        let (out, alive) = render_frames(&mut v, &b, 200);
+        assert!(!alive, "a held one-shot still ends");
+        assert!(out[..100].iter().all(|s| *s == 1.0));
+        assert!(out[100..].iter().all(|s| *s == 0.0));
+    }
+
+    #[test]
+    fn backward_loop_plays_forward_then_backward_and_wraps() {
+        let x = vec![(0..400).map(|i| i as f32).collect::<Vec<f32>>()];
+        let b = buf(x, LoopMode::Backward, 100, 199);
+        let mut v = Voice::new(60, 0, &b, RATE, FLAT, None);
+        let mut positions = Vec::new();
+        for _ in 0..500 {
+            let pos = v.position();
+            positions.push(pos);
+            let (out, alive) = render_frames(&mut v, &b, 1);
+            assert!(alive);
+            // Whole-frame positions read the sample itself.
+            assert_eq!(f64::from(out[0]), pos);
+        }
+        let want: Vec<f64> = (0..=199)
+            .chain((100..=198).rev())
+            .chain((0..).flat_map(|_| (100..=199).rev()))
+            .take(500)
+            .map(f64::from)
+            .collect();
+        assert_eq!(positions, want);
+    }
+
+    #[test]
+    fn backward_loop_taps_follow_the_playing_order() {
+        let x: Vec<f32> = (0..400).map(|i| (i as f32 * 0.37).sin()).collect();
+        let b = buf(vec![x.clone()], LoopMode::Backward, 100, 199);
+        let region = Region::new(&b, false).unwrap();
+        // Going backward, the frame after loop_start is loop_end: the taps wrap.
+        let got = region.sample(&region.chans[0], 100.5, false);
+        let want = hermite(x[199], x[100], x[101], x[102], 0.5);
+        assert!((got - want).abs() < 1e-6, "backward: got {got} want {want}");
+        let got = region.sample(&region.chans[0], 199.5, false);
+        let want = hermite(x[198], x[199], x[100], x[101], 0.5);
+        assert!(
+            (got - want).abs() < 1e-6,
+            "after the jump: got {got} want {want}"
+        );
+        // On the first, forward pass the voice reflects at loop_end.
+        let got = region.sample(&region.chans[0], 198.5, true);
+        let want = hermite(x[197], x[198], x[199], x[198], 0.5);
+        assert!((got - want).abs() < 1e-6, "forward: got {got} want {want}");
+    }
+
+    #[test]
+    fn play_range_releases_at_the_selection_end() {
+        let b = ones(2000, LoopMode::Forward, 100, 150);
+        let mut v = Voice::new(60, 0, &b, RATE, FLAT, Some(199));
+        let mut positions = Vec::new();
+        let mut levels = Vec::new();
+        loop {
+            positions.push(v.position());
+            let (out, alive) = render_frames(&mut v, &b, 1);
+            levels.push(out[0]);
+            if !alive || positions.len() > 2000 {
+                break;
+            }
+        }
+        assert!(
+            positions.windows(2).all(|w| w[1] > w[0]),
+            "passes the loop end without wrapping"
+        );
+        let at_end = positions.iter().position(|p| *p == 199.0).unwrap();
+        assert!(
+            levels[..at_end].iter().all(|s| *s == 1.0),
+            "full level up to 199"
+        );
+        assert!(levels[at_end + 1] < 1.0, "releasing after 199");
+        let tail = positions.len() - at_end;
+        assert!(tail <= 480, "died {tail} frames after 199");
+        assert!(tail >= 470, "the release ran its course: {tail}");
+    }
+
+    #[test]
+    fn adsr_clamped_limits_ranges_and_replaces_nan() {
+        let a = Adsr {
+            attack_ms: -5.0,
+            decay_ms: 20_000.0,
+            sustain: f32::NAN,
+            release_ms: f32::NAN,
+        }
+        .clamped();
+        assert_eq!(
+            a,
+            Adsr {
+                attack_ms: 0.0,
+                decay_ms: 10_000.0,
+                sustain: 1.0,
+                release_ms: 30.0,
+            }
+        );
+        assert_eq!(
+            Adsr {
+                sustain: 1.5,
+                ..Adsr::DEFAULT
+            }
+            .clamped()
+            .sustain,
+            1.0
+        );
+        assert_eq!(Adsr::DEFAULT.clamped(), Adsr::DEFAULT);
     }
 }

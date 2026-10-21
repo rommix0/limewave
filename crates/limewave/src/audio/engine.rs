@@ -11,7 +11,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, I24, SampleFormat, SizedSample, StreamConfig, U24};
 use limewave_core::edit::LoopMode;
 
-use super::voice::{MAX_VOICES, PlayBuffer, Voice};
+use super::voice::{Adsr, MAX_VOICES, PlayBuffer, Voice};
 
 /// Capacity of each command ring buffer.
 const COMMAND_CAPACITY: usize = 256;
@@ -19,11 +19,24 @@ const COMMAND_CAPACITY: usize = 256;
 const SCRATCH_FRAMES: usize = 16_384;
 
 /// A message from the UI or MIDI thread to the audio callback.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Command {
-    NoteOn { note: u8, from: usize },
-    NoteOff { note: u8 },
+    NoteOn {
+        note: u8,
+        from: usize,
+    },
+    NoteOff {
+        note: u8,
+    },
     AllOff,
+    /// Replaces the envelope for new voices and the release time of sounding ones.
+    SetEnvelope(Adsr),
+    /// Plays `from` until the voice reaches `to`, ignoring the loop and End, then releases.
+    PlayRange {
+        note: u8,
+        from: usize,
+        to: usize,
+    },
 }
 
 /// Voice slots owned by the audio callback.
@@ -31,6 +44,8 @@ pub struct MixerState {
     voices: [Option<Voice>; MAX_VOICES],
     age: [u64; MAX_VOICES],
     counter: u64,
+    /// The envelope new voices start with.
+    adsr: Adsr,
 }
 
 impl MixerState {
@@ -39,12 +54,16 @@ impl MixerState {
             voices: [const { None }; MAX_VOICES],
             age: [0; MAX_VOICES],
             counter: 0,
+            adsr: Adsr::DEFAULT,
         }
     }
 
     fn apply(&mut self, cmd: Command, buf: &PlayBuffer, device_rate: u32) {
         match cmd {
-            Command::NoteOn { note, from } => self.note_on(note, from, buf, device_rate),
+            Command::NoteOn { note, from } => self.note_on(note, from, None, buf, device_rate),
+            Command::PlayRange { note, from, to } => {
+                self.note_on(note, from, Some(to), buf, device_rate);
+            }
             Command::NoteOff { note } => self
                 .voices
                 .iter_mut()
@@ -52,12 +71,25 @@ impl MixerState {
                 .filter(|v| v.note() == note)
                 .for_each(Voice::release),
             Command::AllOff => self.voices.iter_mut().flatten().for_each(Voice::release),
+            Command::SetEnvelope(a) => {
+                self.adsr = a;
+                for v in self.voices.iter_mut().flatten() {
+                    v.set_release_ms(a.release_ms);
+                }
+            }
         }
     }
 
     /// Releases any voice already playing `note`, then starts a new one in a free slot. With no
     /// free slot the sounding voice is restarted in place, or else the oldest voice is stolen.
-    fn note_on(&mut self, note: u8, from: usize, buf: &PlayBuffer, device_rate: u32) {
+    fn note_on(
+        &mut self,
+        note: u8,
+        from: usize,
+        stop_at: Option<usize>,
+        buf: &PlayBuffer,
+        device_rate: u32,
+    ) {
         let mut existing = None;
         for (i, slot) in self.voices.iter_mut().enumerate() {
             if let Some(v) = slot.as_mut().filter(|v| v.note() == note) {
@@ -71,7 +103,7 @@ impl MixerState {
             .position(Option::is_none)
             .or(existing)
             .unwrap_or_else(|| self.oldest());
-        self.voices[slot] = Some(Voice::new(note, from, buf, device_rate));
+        self.voices[slot] = Some(Voice::new(note, from, buf, device_rate, self.adsr, stop_at));
         self.age[slot] = self.counter;
         self.counter += 1;
     }
@@ -87,27 +119,32 @@ impl Default for MixerState {
     }
 }
 
-/// The body of the audio callback: applies pending commands, then fills interleaved `out`
-/// (cleared first) with the mixed voices, clamped to [-1, 1]. Does not allocate.
+/// The body of the audio callback: applies pending commands (new notes play `current`), then
+/// fills interleaved `out` (cleared first) with the mixed voices, clamped to [-1, 1]. Each
+/// voice plays whichever of `current` and `previous` has its source; a voice whose source is
+/// in neither is dropped. Does not allocate.
 pub fn process(
     state: &mut MixerState,
-    buf: &PlayBuffer,
+    current: &PlayBuffer,
+    previous: &PlayBuffer,
     cmds: &mut rtrb::Consumer<Command>,
     out: &mut [f32],
     channels: usize,
     device_rate: u32,
 ) {
     while let Ok(cmd) = cmds.pop() {
-        state.apply(cmd, buf, device_rate);
+        state.apply(cmd, current, device_rate);
     }
     out.fill(0.0);
     if channels == 0 {
         return;
     }
     for slot in &mut state.voices {
-        if let Some(v) = slot
-            && !v.render_add(buf, out, channels, device_rate)
-        {
+        let Some(v) = slot else { continue };
+        let buf = [current, previous]
+            .into_iter()
+            .find(|b| b.source == v.source());
+        if !buf.is_some_and(|b| v.render_add(b, out, channels, device_rate)) {
             *slot = None;
         }
     }
@@ -120,6 +157,14 @@ pub fn process(
 struct Callback {
     state: MixerState,
     buffer: Arc<ArcSwap<PlayBuffer>>,
+    /// The buffer last loaded, and the one from a different source before it, which voices
+    /// released on the previous file finish on.
+    ///
+    /// The callback never frees a buffer: everything it holds came from `buffer`, and
+    /// `AudioEngine::set_buffer` keeps each buffer it swaps out in its `retired` list until
+    /// only that list holds it. So dropping one of these here is never the last reference.
+    current: Arc<PlayBuffer>,
+    previous: Arc<PlayBuffer>,
     ui_rx: rtrb::Consumer<Command>,
     midi_rx: rtrb::Consumer<Command>,
     channels: usize,
@@ -127,14 +172,42 @@ struct Callback {
 }
 
 impl Callback {
+    fn new(
+        buffer: Arc<ArcSwap<PlayBuffer>>,
+        ui_rx: rtrb::Consumer<Command>,
+        midi_rx: rtrb::Consumer<Command>,
+        channels: usize,
+        device_rate: u32,
+    ) -> Callback {
+        let current = buffer.load_full();
+        Callback {
+            state: MixerState::new(),
+            previous: Arc::clone(&current),
+            current,
+            buffer,
+            ui_rx,
+            midi_rx,
+            channels,
+            device_rate,
+        }
+    }
+
     fn render(&mut self, out: &mut [f32]) {
-        let buf = self.buffer.load();
+        // `load_full` only bumps a reference count. A buffer from another source pushes the
+        // old one to `previous`; the same source replaces it, so live edits are heard at once.
+        let loaded = self.buffer.load_full();
+        if loaded.source == self.current.source {
+            self.current = loaded;
+        } else {
+            self.previous = std::mem::replace(&mut self.current, loaded);
+        }
         while let Ok(cmd) = self.midi_rx.pop() {
-            self.state.apply(cmd, &buf, self.device_rate);
+            self.state.apply(cmd, &self.current, self.device_rate);
         }
         process(
             &mut self.state,
-            &buf,
+            &self.current,
+            &self.previous,
             &mut self.ui_rx,
             out,
             self.channels,
@@ -176,14 +249,13 @@ impl AudioEngine {
         let buffer = Arc::new(ArcSwap::from_pointee(empty_buffer(device_rate)));
         let (ui_tx, ui_rx) = rtrb::RingBuffer::new(COMMAND_CAPACITY);
         let (midi_tx, midi_rx) = rtrb::RingBuffer::new(COMMAND_CAPACITY);
-        let cb = Callback {
-            state: MixerState::new(),
-            buffer: Arc::clone(&buffer),
+        let cb = Callback::new(
+            Arc::clone(&buffer),
             ui_rx,
             midi_rx,
-            channels: usize::from(config.channels),
+            usize::from(config.channels),
             device_rate,
-        };
+        );
         let stream = match format {
             SampleFormat::F32 => build_f32(&device, config, cb),
             SampleFormat::F64 => build_converted::<f64>(&device, config, cb),
@@ -231,8 +303,13 @@ impl AudioEngine {
         let _ = self.ui_tx.push(c);
     }
 
-    /// Releases every note and swaps in an empty buffer, so nothing from the previous file can
-    /// keep sounding.
+    /// Sets the envelope for new notes and the release of sounding ones (clamped first).
+    pub fn set_envelope(&mut self, a: Adsr) {
+        self.send(Command::SetEnvelope(a.clamped()));
+    }
+
+    /// Releases every note and swaps in an empty buffer, so no new note can start from the
+    /// previous file. Released voices finish their envelope on that file's audio.
     pub fn silence(&mut self) {
         self.send(Command::AllOff);
         self.set_buffer(empty_buffer(self.device_rate));
@@ -255,6 +332,7 @@ fn empty_buffer(rate: u32) -> PlayBuffer {
         loop_end: 0,
         root: 60,
         cents: 0.0,
+        source: 0,
     }
 }
 
@@ -306,16 +384,23 @@ fn report_stream_error(e: cpal::Error) {
 
 #[cfg(test)]
 mod tests {
-    use super::super::voice::RELEASE_MS;
+    use super::super::voice::Adsr;
     use super::*;
     use limewave_core::edit::LoopMode;
 
     const RATE: u32 = 48_000;
+    /// No attack or decay, so a voice plays at full level until its 10 ms (480 frame) release.
+    const FLAT: Adsr = Adsr {
+        attack_ms: 0.0,
+        decay_ms: 0.0,
+        sustain: 1.0,
+        release_ms: 10.0,
+    };
 
-    /// A looping stereo buffer of constant 0.25, so every voice keeps sounding.
-    fn looping() -> PlayBuffer {
+    /// A looping stereo buffer of constant `value`, so every voice keeps sounding.
+    fn constant(source: u64, value: f32) -> PlayBuffer {
         PlayBuffer {
-            audio: vec![vec![0.25; 4000], vec![0.25; 4000]],
+            audio: vec![vec![value; 4000], vec![value; 4000]],
             rate: RATE,
             start: 0,
             end: 3999,
@@ -324,7 +409,12 @@ mod tests {
             loop_end: 2999,
             root: 60,
             cents: 0.0,
+            source,
         }
+    }
+
+    fn looping() -> PlayBuffer {
+        constant(1, 0.25)
     }
 
     fn active(state: &MixerState) -> Vec<u8> {
@@ -338,7 +428,29 @@ mod tests {
         frames: usize,
     ) -> Vec<f32> {
         let mut out = vec![0.7; frames * 2];
-        process(state, b, rx, &mut out, 2, RATE);
+        process(state, b, b, rx, &mut out, 2, RATE);
+        out
+    }
+
+    /// The left channel of interleaved stereo `out`.
+    fn left(out: &[f32]) -> Vec<f32> {
+        out.iter().step_by(2).copied().collect()
+    }
+
+    /// A callback reading `first` from its own [`ArcSwap`], with the UI command queue.
+    fn callback(
+        first: PlayBuffer,
+    ) -> (Callback, Arc<ArcSwap<PlayBuffer>>, rtrb::Producer<Command>) {
+        let swap = Arc::new(ArcSwap::from_pointee(first));
+        let (tx, rx) = rtrb::RingBuffer::new(256);
+        let (_, midi_rx) = rtrb::RingBuffer::new(256);
+        let cb = Callback::new(Arc::clone(&swap), rx, midi_rx, 2, RATE);
+        (cb, swap, tx)
+    }
+
+    fn render(cb: &mut Callback, frames: usize) -> Vec<f32> {
+        let mut out = vec![0.7; frames * 2];
+        cb.render(&mut out);
         out
     }
 
@@ -347,7 +459,7 @@ mod tests {
         let b = looping();
         let (mut tx, mut rx) = rtrb::RingBuffer::new(256);
         let mut state = MixerState::new();
-        let release_frames = (RELEASE_MS * RATE as f32 / 1000.0).ceil() as usize;
+        tx.push(Command::SetEnvelope(FLAT)).unwrap();
 
         // Nothing playing: the stale output is cleared to silence.
         let out = block(&mut state, &b, &mut rx, 64);
@@ -362,8 +474,8 @@ mod tests {
         );
 
         tx.push(Command::NoteOff { note: 60 }).unwrap();
-        block(&mut state, &b, &mut rx, release_frames);
-        let out = block(&mut state, &b, &mut rx, release_frames);
+        block(&mut state, &b, &mut rx, 480);
+        let out = block(&mut state, &b, &mut rx, 480);
         assert!(out.iter().all(|s| *s == 0.0));
         assert!(active(&state).is_empty());
 
@@ -377,10 +489,67 @@ mod tests {
         assert_eq!(notes, (61..69).collect::<Vec<u8>>());
         // Eight voices of 0.25 sum to 2.0; the output is clamped.
         assert!(out.iter().all(|s| *s == 1.0));
+    }
+
+    #[test]
+    fn all_off_releases_through_the_envelope() {
+        let b = looping();
+        let (mut tx, mut rx) = rtrb::RingBuffer::new(256);
+        let mut state = MixerState::new();
+        // The default envelope: a 2 ms attack and a 30 ms (1440 frame) release.
+        tx.push(Command::NoteOn { note: 60, from: 0 }).unwrap();
+        tx.push(Command::NoteOn { note: 64, from: 0 }).unwrap();
+        let out = block(&mut state, &b, &mut rx, 200);
+        assert!(out[0] < 0.1, "the attack starts near silence");
+        assert!(
+            (out[2 * 199] - 0.5).abs() < 1e-6,
+            "two voices at full level"
+        );
 
         tx.push(Command::AllOff).unwrap();
-        block(&mut state, &b, &mut rx, release_frames);
-        assert!(active(&state).is_empty());
+        let out = left(&block(&mut state, &b, &mut rx, 1439));
+        assert_eq!(active(&state).len(), 2, "still releasing");
+        assert!(out[0] <= 0.5 && out[0] > 0.49, "no jump: {}", out[0]);
+        assert!(out.windows(2).all(|w| w[1] < w[0]), "fades every frame");
+        assert!(out[1438] < 0.01);
+        let out = block(&mut state, &b, &mut rx, 1);
+        assert!(out[0] < 0.001);
+        assert!(active(&state).is_empty(), "released after 30 ms");
+    }
+
+    #[test]
+    fn set_envelope_reaches_new_and_sounding_voices() {
+        let b = looping();
+        let (mut tx, mut rx) = rtrb::RingBuffer::new(256);
+        let mut state = MixerState::new();
+        tx.push(Command::NoteOn { note: 60, from: 0 }).unwrap();
+        block(&mut state, &b, &mut rx, 500);
+        let quick = Adsr {
+            attack_ms: 10.0,
+            decay_ms: 0.0,
+            sustain: 1.0,
+            release_ms: 5.0,
+        };
+        tx.push(Command::SetEnvelope(quick)).unwrap();
+        let out = block(&mut state, &b, &mut rx, 10);
+        assert!(
+            out.iter().all(|s| (*s - 0.25).abs() < 1e-6),
+            "held voice keeps sounding"
+        );
+
+        tx.push(Command::NoteOff { note: 60 }).unwrap();
+        block(&mut state, &b, &mut rx, 240);
+        assert!(active(&state).is_empty(), "the new 5 ms release applied");
+
+        tx.push(Command::NoteOn { note: 60, from: 0 }).unwrap();
+        let out = left(&block(&mut state, &b, &mut rx, 600));
+        let tol = 0.25 / 480.0 + 1e-6;
+        assert!(
+            (out[240] - 0.125).abs() <= tol,
+            "10 ms attack: {}",
+            out[240]
+        );
+        assert!((out[479] - 0.25).abs() <= tol, "{}", out[479]);
     }
 
     #[test]
@@ -388,14 +557,14 @@ mod tests {
         let b = looping();
         let (mut tx, mut rx) = rtrb::RingBuffer::new(256);
         let mut state = MixerState::new();
+        tx.push(Command::SetEnvelope(FLAT)).unwrap();
         tx.push(Command::NoteOn { note: 60, from: 0 }).unwrap();
         block(&mut state, &b, &mut rx, 64);
         // A free slot exists: the old voice fades while the new one starts.
         tx.push(Command::NoteOn { note: 60, from: 0 }).unwrap();
         block(&mut state, &b, &mut rx, 1);
         assert_eq!(active(&state), [60, 60]);
-        let release_frames = (RELEASE_MS * RATE as f32 / 1000.0).ceil() as usize;
-        block(&mut state, &b, &mut rx, release_frames);
+        block(&mut state, &b, &mut rx, 480);
         assert_eq!(active(&state), [60]);
 
         // All slots busy: retriggering restarts the note in place instead of stealing.
@@ -410,11 +579,90 @@ mod tests {
     }
 
     #[test]
+    fn play_range_starts_a_voice_that_stops_at_the_end() {
+        let b = looping();
+        let (mut tx, mut rx) = rtrb::RingBuffer::new(256);
+        let mut state = MixerState::new();
+        tx.push(Command::SetEnvelope(FLAT)).unwrap();
+        tx.push(Command::PlayRange {
+            note: 60,
+            from: 100,
+            to: 199,
+        })
+        .unwrap();
+        let out = block(&mut state, &b, &mut rx, 100);
+        assert!(out.iter().all(|s| (*s - 0.25).abs() < 1e-6));
+        block(&mut state, &b, &mut rx, 480);
+        assert!(active(&state).is_empty(), "released at frame 199");
+    }
+
+    #[test]
+    fn switching_files_lets_released_voices_finish_on_their_own_audio() {
+        // Starts like the engine, on the empty buffer, then opens file A.
+        let (mut cb, swap, mut tx) = callback(empty_buffer(RATE));
+        // Stands in for the UI's `retired` list: it keeps every swapped-out buffer alive.
+        let mut retired = vec![swap.swap(Arc::new(constant(1, 0.25)))];
+        tx.push(Command::SetEnvelope(FLAT)).unwrap();
+        tx.push(Command::NoteOn { note: 60, from: 0 }).unwrap();
+        let out = render(&mut cb, 64);
+        assert!(out.iter().all(|s| (*s - 0.25).abs() < 1e-6));
+
+        tx.push(Command::AllOff).unwrap();
+        retired.push(swap.swap(Arc::new(constant(2, -0.5))));
+        let out = left(&render(&mut cb, 600));
+        assert!(out.iter().all(|s| *s >= 0.0), "the tail never reads B");
+        assert!(
+            (out[0] - 0.25).abs() < 1e-6,
+            "the tail starts from A: {}",
+            out[0]
+        );
+        assert!(out[479] > 0.0 && out[479] < 0.001);
+        assert!(out[480..].iter().all(|s| *s == 0.0), "and falls to 0");
+        assert!(active(&cb.state).is_empty());
+
+        // A new note plays the new file.
+        tx.push(Command::NoteOn { note: 60, from: 0 }).unwrap();
+        let out = render(&mut cb, 4);
+        assert!(out.iter().all(|s| (*s + 0.5).abs() < 1e-6), "{out:?}");
+    }
+
+    #[test]
+    fn live_edit_of_the_same_file_is_heard_at_once() {
+        let (mut cb, swap, mut tx) = callback(constant(1, 0.25));
+        let mut retired = Vec::new();
+        tx.push(Command::SetEnvelope(FLAT)).unwrap();
+        tx.push(Command::NoteOn { note: 60, from: 0 }).unwrap();
+        render(&mut cb, 64);
+        retired.push(swap.swap(Arc::new(constant(1, 0.75))));
+        let out = render(&mut cb, 4);
+        assert!(out.iter().all(|s| (*s - 0.75).abs() < 1e-6), "{out:?}");
+    }
+
+    #[test]
+    fn a_voice_from_neither_buffer_is_dropped() {
+        let (mut cb, swap, mut tx) = callback(constant(1, 0.25));
+        let mut retired = Vec::new();
+        tx.push(Command::NoteOn { note: 60, from: 0 }).unwrap();
+        render(&mut cb, 200);
+        tx.push(Command::AllOff).unwrap();
+        retired.push(swap.swap(Arc::new(constant(2, -0.5))));
+        let out = render(&mut cb, 10);
+        assert!(
+            out.iter().all(|s| *s > 0.0),
+            "A's 30 ms release is sounding"
+        );
+        retired.push(swap.swap(Arc::new(constant(3, -0.5))));
+        let out = render(&mut cb, 10);
+        assert!(out.iter().all(|s| *s == 0.0));
+        assert!(active(&cb.state).is_empty());
+    }
+
+    #[test]
     fn engine_zero_channels_does_not_panic() {
         let b = looping();
         let (mut tx, mut rx) = rtrb::RingBuffer::new(256);
         let mut state = MixerState::new();
         tx.push(Command::NoteOn { note: 60, from: 0 }).unwrap();
-        process(&mut state, &b, &mut rx, &mut [], 0, RATE);
+        process(&mut state, &b, &b, &mut rx, &mut [], 0, RATE);
     }
 }

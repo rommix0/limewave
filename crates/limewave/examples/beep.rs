@@ -29,6 +29,7 @@ fn main() {
         loop_end: 0,
         root: 60,
         cents: 0.0,
+        source: 1,
     });
     engine.send(Command::NoteOn { note: 60, from: 0 });
     sleep(Duration::from_millis(1000));

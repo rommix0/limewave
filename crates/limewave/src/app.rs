@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
@@ -45,6 +45,9 @@ const SEAM_PANEL_HEIGHT: f32 = 300.0;
 
 type LoadResult = (usize, Result<WavDocument, String>);
 
+/// The next [`Session::source`]. Starts at 1: source 0 is the engine's empty buffer.
+static NEXT_SOURCE: AtomicU64 = AtomicU64::new(1);
+
 /// One open file: the decoded document, its edit history and the data derived from it.
 pub struct Session {
     pub doc: WavDocument,
@@ -67,6 +70,9 @@ pub struct Session {
     last_preview_push: Option<Instant>,
     /// The drag preview was throttled and is not yet in `rendered` or the engine.
     preview_held: bool,
+    /// Identifies this session's play buffers, so voices released on another file finish on
+    /// that file's audio. Unique per session: one rebased after a save gets a new id.
+    pub source: u64,
 }
 
 impl Session {
@@ -87,6 +93,7 @@ impl Session {
             preview: None,
             last_preview_push: None,
             preview_held: false,
+            source: NEXT_SOURCE.fetch_add(1, Ordering::Relaxed),
         }
     }
 
@@ -101,7 +108,12 @@ impl Session {
 
     /// The buffer the audio engine plays for the current edit.
     pub fn play_buffer(&self) -> PlayBuffer {
-        play_buffer(&self.doc.audio, self.doc.format.sample_rate, self.edit())
+        play_buffer(
+            &self.doc.audio,
+            self.doc.format.sample_rate,
+            self.edit(),
+            self.source,
+        )
     }
 
     /// Records `e` (clamped to the file) as the new current edit.
@@ -189,7 +201,8 @@ impl Session {
     fn publish(&mut self, e: &EditState, engine: Option<&AudioEngine>) {
         match engine {
             Some(engine) => {
-                let buffer = play_buffer(&self.doc.audio, self.doc.format.sample_rate, e);
+                let buffer =
+                    play_buffer(&self.doc.audio, self.doc.format.sample_rate, e, self.source);
                 self.rendered.clone_from(&buffer.audio);
                 engine.set_buffer(buffer);
             }
