@@ -11,6 +11,16 @@ pub enum FadeCurve {
     SCurve,
 }
 
+/// What Stereo to mono keeps: the left channel, the right channel, or the average of all
+/// the channels.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum MonoSource {
+    Left,
+    Right,
+    #[default]
+    Mix,
+}
+
 /// An effect as the user picks it, before it is resolved against the audio.
 #[derive(Clone, PartialEq, Debug)]
 pub enum Effect {
@@ -21,7 +31,7 @@ pub enum Effect {
     Invert,
     RemoveDc,
     Reverse,
-    StereoToMono,
+    StereoToMono(MonoSource),
     SwapChannels,
     MonoToStereo,
 }
@@ -40,7 +50,7 @@ pub enum Op {
     Reverse {
         mirror_markers: bool,
     },
-    StereoToMono,
+    StereoToMono(MonoSource),
     SwapChannels,
     MonoToStereo,
 }
@@ -129,10 +139,10 @@ pub fn plan_effect(
             },
             selected.unwrap_or(trim),
         ),
-        Effect::StereoToMono if channels >= 2 => (Op::StereoToMono, whole),
+        Effect::StereoToMono(pick) if channels >= 2 => (Op::StereoToMono(pick), whole),
         Effect::SwapChannels if channels >= 2 => (Op::SwapChannels, whole),
         Effect::MonoToStereo if channels == 1 => (Op::MonoToStereo, whole),
-        Effect::StereoToMono | Effect::SwapChannels | Effect::MonoToStereo => return None,
+        Effect::StereoToMono(_) | Effect::SwapChannels | Effect::MonoToStereo => return None,
     };
     Some(AppliedEffect { op, first, last })
 }
@@ -170,19 +180,25 @@ pub fn fade_gain(curve: FadeCurve, t: f32) -> f32 {
 /// ignore it. Every effect keeps the frame count.
 pub fn apply_effect(audio: &mut Vec<Vec<f32>>, a: &AppliedEffect) {
     match &a.op {
-        Op::StereoToMono => {
+        Op::StereoToMono(pick) => {
             if audio.len() >= 2 {
-                let n = audio.len() as f32;
-                let mixed = (0..frame_count(audio))
-                    .map(|i| {
-                        audio
-                            .iter()
-                            .map(|ch| ch.get(i).copied().unwrap_or(0.0))
-                            .sum::<f32>()
-                            / n
-                    })
-                    .collect();
-                *audio = vec![mixed];
+                let kept = match pick {
+                    MonoSource::Left => audio.swap_remove(0),
+                    MonoSource::Right => audio.swap_remove(1),
+                    MonoSource::Mix => {
+                        let n = audio.len() as f32;
+                        (0..frame_count(audio))
+                            .map(|i| {
+                                audio
+                                    .iter()
+                                    .map(|ch| ch.get(i).copied().unwrap_or(0.0))
+                                    .sum::<f32>()
+                                    / n
+                            })
+                            .collect()
+                    }
+                };
+                *audio = vec![kept];
             }
         }
         Op::SwapChannels => {
@@ -234,7 +250,7 @@ fn apply_in_range(op: &Op, channel: usize, s: &mut [f32]) {
             .for_each(|(i, v)| *v *= fade_gain(*c, 1.0 - t(i))),
         Op::Invert => s.iter_mut().for_each(|v| *v = -*v),
         Op::Reverse { .. } => s.reverse(),
-        Op::StereoToMono | Op::SwapChannels | Op::MonoToStereo => {}
+        Op::StereoToMono(_) | Op::SwapChannels | Op::MonoToStereo => {}
     }
 }
 
@@ -476,7 +492,14 @@ mod tests {
         );
         assert_eq!(range(Effect::Reverse, &mono, None), (100, 899));
         assert_eq!(range(Effect::SwapChannels, &stereo, Some((5, 9))), (0, 999));
-        assert_eq!(range(Effect::StereoToMono, &stereo, Some((5, 9))), (0, 999));
+        assert_eq!(
+            range(
+                Effect::StereoToMono(MonoSource::Left),
+                &stereo,
+                Some((5, 9))
+            ),
+            (0, 999)
+        );
         // A selection is clamped to the file and put in order.
         assert_eq!(range(Effect::Invert, &mono, Some((2000, 20))), (20, 999));
     }
@@ -615,11 +638,25 @@ mod tests {
         let mono = vec![vec![0.1, 0.2, 0.3]];
         let e = EditState::default_for(3);
 
-        let y = applied(&stereo, &plan(Effect::StereoToMono, &stereo, &e, None));
+        let to_mono = |pick| {
+            applied(
+                &stereo,
+                &plan(Effect::StereoToMono(pick), &stereo, &e, None),
+            )
+        };
+        let y = to_mono(MonoSource::Mix);
         assert_eq!(y.len(), 1);
         for (got, want) in y[0].iter().zip([0.4, 0.2, -0.4]) {
             assert!((got - want).abs() < 1e-6);
         }
+        assert_eq!(to_mono(MonoSource::Left), vec![stereo[0].clone()]);
+        assert_eq!(to_mono(MonoSource::Right), vec![stereo[1].clone()]);
+        // With more than two channels, Mix averages them all and Left and Right pick the
+        // first two.
+        let three = vec![vec![0.3], vec![0.6], vec![0.9]];
+        let pick = |p| applied(&three, &plan(Effect::StereoToMono(p), &three, &e, None));
+        assert!((pick(MonoSource::Mix)[0][0] - 0.6).abs() < 1e-6);
+        assert_eq!(pick(MonoSource::Right), vec![vec![0.6]]);
 
         let y = applied(&stereo, &plan(Effect::SwapChannels, &stereo, &e, None));
         assert_eq!(y, vec![stereo[1].clone(), stereo[0].clone()]);
@@ -627,7 +664,10 @@ mod tests {
         let y = applied(&mono, &plan(Effect::MonoToStereo, &mono, &e, None));
         assert_eq!(y, vec![mono[0].clone(), mono[0].clone()]);
 
-        assert_eq!(plan_effect(Effect::StereoToMono, &mono, &e, None), None);
+        assert_eq!(
+            plan_effect(Effect::StereoToMono(MonoSource::Left), &mono, &e, None),
+            None
+        );
         assert_eq!(plan_effect(Effect::SwapChannels, &mono, &e, None), None);
         assert_eq!(plan_effect(Effect::MonoToStereo, &stereo, &e, None), None);
     }
@@ -655,7 +695,7 @@ mod tests {
             Effect::Invert,
             Effect::RemoveDc,
             Effect::Reverse,
-            Effect::StereoToMono,
+            Effect::StereoToMono(MonoSource::Mix),
             Effect::SwapChannels,
             Effect::MonoToStereo,
         ];

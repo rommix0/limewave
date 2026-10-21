@@ -1522,7 +1522,7 @@ mod tests {
     use super::*;
     use limewave_core::document::load_wav_bytes;
     use limewave_core::edit::LoopMode;
-    use limewave_core::effects::FadeCurve;
+    use limewave_core::effects::{FadeCurve, MonoSource};
     use limewave_core::testwav::{sine, wav_bytes};
     use limewave_core::wav::SampleFormat;
 
@@ -1805,7 +1805,7 @@ mod tests {
     fn nothing_to_do_adds_no_history_entry() {
         let mut s = session();
         // Mono-to-stereo on a stereo file does not apply; neither does stereo-to-mono on mono.
-        assert!(!s.apply_effect(Effect::StereoToMono, None, None));
+        assert!(!s.apply_effect(Effect::StereoToMono(MonoSource::Mix), None, None));
         assert!(!s.history.is_dirty());
     }
 
@@ -1917,7 +1917,7 @@ mod tests {
     fn channel_tool_changes_the_lane_count() {
         let mut s = stereo_session();
         assert_eq!((s.processed.len(), s.peaks.len()), (2, 2));
-        assert!(s.apply_effect(Effect::StereoToMono, None, None));
+        assert!(s.apply_effect(Effect::StereoToMono(MonoSource::Mix), None, None));
         assert_eq!((s.processed.len(), s.peaks.len()), (1, 1));
         assert_eq!(s.rendered.len(), 1);
         assert_eq!(s.doc.audio.len(), 2, "the original is untouched");

@@ -4,7 +4,7 @@ use eframe::egui::vec2;
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
 use limewave::app::{FileEntry, LimewaveApp, Session};
-use limewave_core::effects::{AppliedEffect, Effect, FadeCurve, Op, peak};
+use limewave_core::effects::{AppliedEffect, Effect, FadeCurve, MonoSource, Op, peak};
 use limewave_core::riff::Chunk;
 use limewave_core::smpl::{Smpl, SmplLoop};
 use limewave_core::testwav::{sine, wav_bytes};
@@ -244,16 +244,55 @@ fn dialog_predicts_clipping_for_integer_files() {
 fn channel_tools_follow_the_channel_count() {
     let mut h = looped_harness();
     let app = h.state();
-    assert!(!app.can_apply(Effect::StereoToMono));
+    assert!(!app.can_apply(Effect::StereoToMono(MonoSource::Mix)));
     assert!(!app.can_apply(Effect::SwapChannels));
     assert!(app.can_apply(Effect::MonoToStereo));
 
     menu_click(&mut h, "Mono to stereo");
     let app = h.state();
     assert_eq!(session(app).processed.len(), 2);
-    assert!(app.can_apply(Effect::StereoToMono));
+    assert!(app.can_apply(Effect::StereoToMono(MonoSource::Mix)));
     assert!(app.can_apply(Effect::SwapChannels));
     assert!(!app.can_apply(Effect::MonoToStereo));
+}
+
+#[test]
+fn stereo_to_mono_dialog_keeps_the_chosen_channel() {
+    let left = sine(440.0, 44100, 2000, 0.5);
+    let right = sine(220.0, 44100, 2000, 0.25);
+    let mut h = harness_for(app_with(&wav_bytes(
+        &[left, right],
+        44100,
+        SampleFormat::Int { bits: 16 },
+        Vec::new(),
+    )));
+    assert_eq!(h.state().ui.effect_params.mono_source, MonoSource::Mix);
+    for (label, pick, channel) in [
+        ("Right", MonoSource::Right, 1),
+        ("Left", MonoSource::Left, 0),
+    ] {
+        menu_click(&mut h, "Stereo to mono…");
+        h.get_by_label(label).click();
+        h.run();
+        h.get_by_label("Apply").click();
+        h.run();
+        assert_eq!(h.state().ui.effect_dialog, None);
+        assert_eq!(h.state().ui.effect_params.mono_source, pick, "remembered");
+        let s = session(h.state());
+        assert_eq!(s.processed, vec![s.doc.audio[channel].clone()], "{label}");
+        h.state_mut().undo();
+        h.run();
+    }
+
+    // Mix averages the two.
+    menu_click(&mut h, "Stereo to mono…");
+    h.get_by_label("Mix").click();
+    h.run();
+    h.get_by_label("Apply").click();
+    h.run();
+    let s = session(h.state());
+    let (l, r) = (&s.doc.audio[0], &s.doc.audio[1]);
+    assert!((s.processed[0][100] - (l[100] + r[100]) / 2.0).abs() < 1e-6);
 }
 
 #[test]

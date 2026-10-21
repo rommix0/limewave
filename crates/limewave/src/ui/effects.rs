@@ -4,7 +4,7 @@ use std::ops::RangeInclusive;
 
 use eframe::egui::{self, Button, DragValue};
 use limewave_core::edit::LoopMode;
-use limewave_core::effects::{Effect, FadeCurve};
+use limewave_core::effects::{Effect, FadeCurve, MonoSource};
 use limewave_core::wav::SampleFormat;
 
 use crate::app::{LimewaveApp, SELECT_ALL_SHORTCUT};
@@ -79,6 +79,7 @@ pub struct EffectParams {
     pub normalize_db: f32,
     pub fade_curve: FadeCurve,
     pub silence_db: f32,
+    pub mono_source: MonoSource,
 }
 
 impl Default for EffectParams {
@@ -88,6 +89,7 @@ impl Default for EffectParams {
             normalize_db: -0.1,
             fade_curve: FadeCurve::Linear,
             silence_db: -60.0,
+            mono_source: MonoSource::Mix,
         }
     }
 }
@@ -99,11 +101,12 @@ pub enum EffectDialog {
     Normalize,
     FadeIn,
     FadeOut,
+    StereoToMono,
     AutoTrim,
 }
 
-/// The toolbar's Effects menu. Gain, Normalize, the fades and Auto-trim open a dialog; the
-/// rest apply at once. A channel tool that does not fit the file is greyed out.
+/// The toolbar's Effects menu. Gain, Normalize, the fades, Stereo to mono and Auto-trim open
+/// a dialog; the rest apply at once. A channel tool that does not fit the file is greyed out.
 pub fn effects_menu(ui: &mut egui::Ui, app: &mut LimewaveApp) {
     let loaded = app.selected_session().is_some();
     ui.menu_button("Effects", |ui| {
@@ -127,8 +130,14 @@ pub fn effects_menu(ui: &mut egui::Ui, app: &mut LimewaveApp) {
             }
         }
         ui.separator();
+        let to_mono = app.can_apply(Effect::StereoToMono(MonoSource::Mix));
+        if ui
+            .add_enabled(to_mono, Button::new("Stereo to mono…"))
+            .clicked()
+        {
+            app.ui.effect_dialog = Some(EffectDialog::StereoToMono);
+        }
         for (label, effect) in [
-            ("Stereo to mono", Effect::StereoToMono),
             ("Swap left and right", Effect::SwapChannels),
             ("Mono to stereo", Effect::MonoToStereo),
         ] {
@@ -157,6 +166,7 @@ fn dialog_effect(dialog: EffectDialog, p: &EffectParams) -> Option<Effect> {
         }),
         EffectDialog::FadeIn => Some(Effect::FadeIn(p.fade_curve)),
         EffectDialog::FadeOut => Some(Effect::FadeOut(p.fade_curve)),
+        EffectDialog::StereoToMono => Some(Effect::StereoToMono(p.mono_source)),
         EffectDialog::AutoTrim => None,
     }
 }
@@ -206,6 +216,24 @@ pub fn effect_dialog(ctx: &egui::Context, app: &mut LimewaveApp) {
                         (FadeCurve::SCurve, "S-curve"),
                     ] {
                         ui.selectable_value(&mut p.fade_curve, curve, name);
+                    }
+                });
+            }
+            EffectDialog::StereoToMono => {
+                ui.heading("Stereo to mono");
+                ui.label("Keep");
+                ui.horizontal(|ui| {
+                    for (pick, name) in [
+                        (MonoSource::Left, "Left"),
+                        (MonoSource::Right, "Right"),
+                        (MonoSource::Mix, "Mix"),
+                    ] {
+                        ui.selectable_value(&mut p.mono_source, pick, name)
+                            .on_hover_text(match pick {
+                                MonoSource::Left => "Keep the left channel",
+                                MonoSource::Right => "Keep the right channel",
+                                MonoSource::Mix => "Average the channels",
+                            });
                     }
                 });
             }

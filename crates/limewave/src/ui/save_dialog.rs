@@ -512,7 +512,7 @@ mod tests {
 
     use limewave_core::document::load_wav;
     use limewave_core::edit::LoopMode;
-    use limewave_core::effects::Effect;
+    use limewave_core::effects::{Effect, MonoSource};
     use limewave_core::riff::Chunk;
     use limewave_core::smpl::{Smpl, SmplLoop};
     use limewave_core::testwav::{sine, wav_bytes};
@@ -892,7 +892,7 @@ mod tests {
         let mut app = app_with(std::slice::from_ref(&source));
         let s = session(&mut app, 0);
         let id = s.source;
-        assert!(s.apply_effect(Effect::StereoToMono, None, None));
+        assert!(s.apply_effect(Effect::StereoToMono(MonoSource::Mix), None, None));
         let results = perform_save(&mut app, folder_request(vec![0], &out));
         assert!(results[0].1.is_ok(), "{:?}", results[0].1);
         let s = session(&mut app, 0);

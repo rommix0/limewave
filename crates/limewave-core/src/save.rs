@@ -53,7 +53,7 @@ fn changed_ranges(
     let mut ranges: Vec<(usize, usize)> = effects
         .iter()
         .map(|a| match a.op {
-            Op::StereoToMono | Op::SwapChannels | Op::MonoToStereo => (0, last_frame),
+            Op::StereoToMono(_) | Op::SwapChannels | Op::MonoToStereo => (0, last_frame),
             _ => (a.first, a.last.min(last_frame)),
         })
         .chain(crossfade)
@@ -491,7 +491,9 @@ mod tests {
     use crate::cue::{CuePoint, cue_bytes, parse_cue};
     use crate::document::{load_wav, load_wav_bytes};
     use crate::edit::FadeShape;
-    use crate::effects::{AppliedEffect, Effect, Op, mirror_edit, plan_effect, process};
+    use crate::effects::{
+        AppliedEffect, Effect, MonoSource, Op, mirror_edit, plan_effect, process,
+    };
     use crate::meta::info_get;
     use crate::render::render;
     use crate::riff::{list_type, parse_riff};
@@ -1574,7 +1576,12 @@ mod tests {
     #[test]
     fn stereo_to_mono_rewrites_fmt() {
         let d = doc(&stereo_file());
-        let e = with_effect(&d, d.initial_edit(), Effect::StereoToMono, None);
+        let e = with_effect(
+            &d,
+            d.initial_edit(),
+            Effect::StereoToMono(MonoSource::Mix),
+            None,
+        );
         let out = build_wav_bytes(&d, &e);
 
         let f = parse_fmt(&fmt_of(&out)).unwrap();
@@ -1614,7 +1621,7 @@ mod tests {
             crossfade: 20,
             ..looped(&d, 1000, 2000)
         };
-        let e = with_effect(&d, e, Effect::StereoToMono, None);
+        let e = with_effect(&d, e, Effect::StereoToMono(MonoSource::Mix), None);
         let rendered = render(&process(&d.audio, &e.effects), &e);
         let back = doc(&build_wav_bytes(&d, &e));
         assert_eq!(back.audio.len(), 1);
@@ -1656,7 +1663,12 @@ mod tests {
         let d = doc(&write_riff(&riff));
         assert_eq!(d.format.channels, 2);
 
-        let e = with_effect(&d, d.initial_edit(), Effect::StereoToMono, None);
+        let e = with_effect(
+            &d,
+            d.initial_edit(),
+            Effect::StereoToMono(MonoSource::Mix),
+            None,
+        );
         let out = build_wav_bytes(&d, &e);
         let saved = fmt_of(&out);
         assert_eq!(saved.len(), 40);
@@ -1843,7 +1855,11 @@ mod tests {
                 last,
             });
         }
-        for op in [Op::SwapChannels, Op::MonoToStereo, Op::StereoToMono] {
+        for op in [
+            Op::SwapChannels,
+            Op::MonoToStereo,
+            Op::StereoToMono(MonoSource::Left),
+        ] {
             e.effects.push(AppliedEffect {
                 op,
                 first: 7,

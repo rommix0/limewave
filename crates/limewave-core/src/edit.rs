@@ -81,7 +81,10 @@ impl EditState {
         // Effect ranges end inside the file; an empty one, or one wholly past the end, does
         // nothing and is dropped. Channel tools ignore their range and are kept as they are.
         self.effects.retain_mut(|a| {
-            if matches!(a.op, Op::StereoToMono | Op::SwapChannels | Op::MonoToStereo) {
+            if matches!(
+                a.op,
+                Op::StereoToMono(_) | Op::SwapChannels | Op::MonoToStereo
+            ) {
                 return true;
             }
             a.last = a.last.min(last);
