@@ -8,6 +8,8 @@
 //!   so each partial stays one coherent tone. For a tonal source every peak is also snapped to
 //!   a harmonic of one refined fundamental, so the harmonics stay in step and the wave keeps
 //!   its shape.
+//! - **DC**: locked like a peak, so DC and the bins of its main lobe that no peak claims keep
+//!   their phase and never turn; a DC offset stays a steady offset.
 //! - **Noise**: every other bin gets a fresh seeded random phase each frame, with the same
 //!   offset in every channel, which keeps the stereo relationship.
 //! - **Synthesis**: overlap-add of Hann frames at the analysis hop, normalized by the summed
@@ -17,7 +19,8 @@
 //! - **Sustain** (§4.8): the body is exactly periodic in L, a whole number of hops. Every
 //!   frequency completes whole cycles in L, and the noise phases repeat every L / hop frames.
 //!   The release continues the periodic signal, and only frames starting after the loop end
-//!   fade, so the loop's own audio is never changed.
+//!   fade, timed from the loop end to their centres as in Decay, so the loop's own audio is
+//!   never changed.
 //!
 //! The analysis, the synthesis and the join are `pub(crate)` so the Harmonic method can reuse
 //! them for its partials, its rates and its noise layer.
@@ -239,6 +242,23 @@ pub(crate) fn peak_bins(mag: &[f32]) -> Vec<usize> {
             db[i] - window[window.len() / 2] > PEAK_ABOVE_MEDIAN_DB
         })
         .collect()
+}
+
+/// Whether the DC bin of a magnitude spectrum stands out as a peak would ([`peak_bins`]): at
+/// least as loud as bin 1, more than 12 dB above the median of the bins up to 8 above it, and
+/// within 70 dB of the loudest bin.
+fn dc_stands_out(mag: &[f32]) -> bool {
+    let db = |m: f32| (10.0 * (f64::from(m).powi(2)).max(TINY_ENERGY).log10()) as f32;
+    let Some(&dc) = mag.first() else {
+        return false;
+    };
+    let loudest = mag.iter().copied().fold(0.0f32, f32::max);
+    let mut window: Vec<f32> = mag.iter().take(MEDIAN_HALF + 1).map(|&m| db(m)).collect();
+    window.sort_unstable_by(f32::total_cmp);
+    let median = window[window.len() / 2];
+    mag.get(1).is_none_or(|&m| dc >= m)
+        && db(dc) - median > PEAK_ABOVE_MEDIAN_DB
+        && db(dc) > db(loudest) - PEAK_RANGE_DB
 }
 
 /// For each bin, the peak it is locked to: the nearest peak within 2 bins (the louder on a
@@ -470,7 +490,7 @@ fn plan(
 ) -> Result<Plan, TailError> {
     let sp = analyse_spectrum(audio, cut, a, s, rate)?;
     let loop_len = (sp.body > 0).then_some(sp.body);
-    let omega = bin_frequencies(&sp.raw, &sp.lock, sp.w0, loop_len);
+    let mut omega = bin_frequencies(&sp.raw, &sp.lock, sp.w0, loop_len);
     let count = sp.frames.iter().map(Vec::len).min().unwrap_or(0);
     let (prev, last) = (count - 2, count - 1);
     let bins = sp.mag_last.len();
@@ -485,7 +505,20 @@ fn plan(
         );
         phasor.push(ch[last].iter().copied().map(unit).collect());
     }
-    let noisy = sp.lock.iter().map(Option::is_none).collect();
+    let mut noisy: Vec<bool> = sp.lock.iter().map(Option::is_none).collect();
+    // DC is a steady offset, not noise: it keeps its phase and never turns. When it stands out
+    // as a peak would, the bins of its main lobe that no peak claims are locked to it too.
+    let lobe = if dc_stands_out(&sp.mag_last) {
+        LOCK_BINS.min(bins - 1)
+    } else {
+        0
+    };
+    for k in 0..=lobe {
+        if sp.lock[k].is_none() {
+            noisy[k] = false;
+            omega[k] = 0.0;
+        }
+    }
     Ok(Plan {
         frozen: Frozen {
             n: sp.n,
@@ -574,8 +607,11 @@ pub(crate) fn synthesize(
                     meas * (c.min(0.0) + half) + targ * c.max(0.0)
                 }
                 Some(_) => {
+                    // Frames starting after the loop end fade from it, measured at their
+                    // centres as in Decay; the frames that overlap the loop (the window is 0 at
+                    // a frame's first sample) keep its level, so the loop is never changed.
                     let past = if release && start > loop_end {
-                        (start - loop_end) as f64
+                        start as f64 + half - loop_end as f64
                     } else {
                         0.0
                     };
@@ -819,6 +855,73 @@ mod tests {
             ratio_db.abs() <= 3.0,
             "peak {ratio_db} dB from the source's"
         );
+    }
+
+    #[test]
+    fn smooth_keeps_a_dc_offset_steady() {
+        // A 98 Hz tone (a period of exactly 225 frames) on a DC offset of 0.2.
+        let dc = 0.2f32;
+        let x = vec![
+            (0..at(1.5))
+                .map(|i| dc + 0.3 * (std::f32::consts::TAU * i as f32 / 225.0).sin())
+                .collect::<Vec<f32>>(),
+        ];
+        let cut = at(1.2);
+        let (r, out) = run(&x, &cut_at(&x, cut), &sustain());
+        let (a, b) = (r.edit.loop_start, r.edit.loop_end);
+        // Means over four periods, where the tone cancels: the DC alone, without a random
+        // sub-20 Hz wander around it.
+        let block = 4 * 225;
+        let means: Vec<f32> = out[0][a..=b]
+            .chunks_exact(block)
+            .map(|c| c.iter().sum::<f32>() / block as f32)
+            .collect();
+        let mean = means.iter().sum::<f32>() / means.len() as f32;
+        assert!((mean - dc).abs() < 0.01, "mean {mean}, source DC {dc}");
+        let worst = means.iter().map(|m| (m - dc).abs()).fold(0.0f32, f32::max);
+        assert!(worst < 0.02, "the DC wanders by {worst}: {means:?}");
+    }
+
+    #[test]
+    fn smooth_release_starts_at_the_loop_end() {
+        // A steady tone with a 0.5 s release: 120 dB/s from the loop end (v0.3 §4.8). Each
+        // 10 ms window after the loop end is compared with the same window of the loop, which
+        // the release continues, so the tone's own ripple cancels.
+        let (x, cut) = steady_tone();
+        let s = TailSettings {
+            release_t60: Some(0.5),
+            ..sustain()
+        };
+        let (r, out) = run(&x, &cut_at(&x, cut), &s);
+        let (a, b) = (r.edit.loop_start, r.edit.loop_end);
+        let win = at(0.010);
+        let level = |first: usize| crate::dsp::envelope::level_db(&out, first, first + win - 1);
+        let fall = |d: usize| level(b + 1 + d) - level(a + d);
+        let expected = |d: usize| -120.0 * (d + win / 2) as f32 / RATE as f32;
+        // The frames that overlap the loop keep its level, so the first few milliseconds
+        // barely move; already below the body, never above it.
+        for d in [0, at(0.010)] {
+            assert!(
+                fall(d) <= 0.0,
+                "{} ms: {:+.2} dB",
+                d * 1000 / at(1.0),
+                fall(d)
+            );
+        }
+        // Half a frame (~45 ms) in, the release is well under way (a fade timed from each
+        // frame's start was still at the body level here).
+        let d = at(0.040);
+        assert!(fall(d) < -2.5, "40 ms: {:+.2} dB", fall(d));
+        // From one frame (~93 ms) on, it follows 120 dB/s from the loop end (a fade timed
+        // from each frame's start lagged about 6 dB behind).
+        for d in (at(0.095)..at(0.3)).step_by(win) {
+            let (got, want) = (fall(d), expected(d));
+            assert!(
+                (got - want).abs() <= 1.0,
+                "{} ms: {got:+.2} dB, expected {want:+.2}",
+                d * 1000 / at(1.0)
+            );
+        }
     }
 
     #[test]

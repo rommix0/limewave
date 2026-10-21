@@ -29,6 +29,7 @@ use std::sync::Arc;
 
 use thiserror::Error;
 
+use crate::dsp::envelope::all_finite;
 use crate::dsp::lsq::HarmonicFitter;
 use crate::dsp::pitch::character;
 use crate::dsp::rng::SplitMix64;
@@ -140,6 +141,8 @@ pub enum SpectrumLoopError {
     Silent,
     #[error("There is no audio to loop.")]
     NoAudio,
+    #[error("The audio contains invalid (non-finite) samples.")]
+    NonFinite,
 }
 
 /// Something the dialog points out without blocking Apply (v0.3 §5.2).
@@ -219,6 +222,9 @@ fn analyse(
     let len = last + 1 - a;
     if len < MIN_FFT {
         return Err(SpectrumLoopError::RangeTooShort);
+    }
+    if !all_finite(audio, a, last) {
+        return Err(SpectrumLoopError::NonFinite);
     }
     let energy: f64 = audio
         .iter()
@@ -878,6 +884,10 @@ fn render_parts(
         .round() as usize)
         .min((b - a) / 2);
     let tx = t.min(an.frames - b);
+    // The exit transition reads the original audio after the range.
+    if tx > 0 && !all_finite(audio, b, b + tx - 1) {
+        return Err(SpectrumLoopError::NonFinite);
+    }
     let detune = setting(s.detune_cents, 0.0, (0.0, MAX_DETUNE_CENTS));
 
     let mut warnings = Vec::new();
@@ -1645,6 +1655,44 @@ mod tests {
         assert_eq!(
             analyse_range(&tone(), &e, Some((100, 200)), RATE, None),
             Err(SpectrumLoopError::RangeTooShort)
+        );
+    }
+
+    #[test]
+    fn non_finite_audio_is_refused() {
+        let e = EditState::default_for(tone()[0].len());
+        let (a, b) = sel();
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            // In the range.
+            let mut x = tone();
+            x[0][(a + b) / 2] = bad;
+            assert_eq!(
+                analyse_range(&x, &e, Some(sel()), RATE, None),
+                Err(SpectrumLoopError::NonFinite),
+                "{bad}"
+            );
+            assert_eq!(
+                render_spectrum_loop(&x, &e, Some(sel()), RATE, &steady(1.0)),
+                Err(SpectrumLoopError::NonFinite),
+                "{bad}"
+            );
+            // Just after it, where the exit transition reads the original audio.
+            let mut x = tone();
+            x[0][b + 1] = bad;
+            assert_eq!(
+                render_spectrum_loop(&x, &e, Some(sel()), RATE, &steady(1.0)),
+                Err(SpectrumLoopError::NonFinite),
+                "{bad} after the range"
+            );
+            // Elsewhere in the file, it does not matter.
+            let mut x = tone();
+            let last = x[0].len() - 1;
+            x[0][last] = bad;
+            assert!(render_spectrum_loop(&x, &e, Some(sel()), RATE, &steady(1.0)).is_ok());
+        }
+        assert_eq!(
+            SpectrumLoopError::NonFinite.to_string(),
+            "The audio contains invalid (non-finite) samples."
         );
     }
 

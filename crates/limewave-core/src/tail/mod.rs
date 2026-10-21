@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use thiserror::Error;
 
-use crate::dsp::envelope::{DecayFit, decay_fit, level_db};
+use crate::dsp::envelope::{DecayFit, all_finite, decay_fit, level_db};
 use crate::dsp::pitch::{Character, character};
 use crate::edit::{EditState, LoopMode};
 use crate::effects::{AppliedEffect, Op, Splice, SpliceKind};
@@ -169,6 +169,8 @@ pub enum TailError {
     Silent,
     #[error("There is no audio to continue.")]
     NoAudio,
+    #[error("The audio contains invalid (non-finite) samples.")]
+    NonFinite,
 }
 
 /// Something the dialog points out without blocking Apply (v0.3 §7.1).
@@ -267,7 +269,8 @@ fn source_region(
 ///
 /// `audio` is the audio after `e`'s effects. Errors: `NoAudio` for no channels, fewer than two
 /// frames or a zero rate; `SourceTooShort` for a region under 30 ms, or under four periods of
-/// a tonal sound; `Silent` for a region quieter than −120 dBFS.
+/// a tonal sound; `NonFinite` for a NaN or infinite sample in the region or in the last second
+/// before the cut; `Silent` for a region quieter than −120 dBFS.
 pub fn analyse(
     audio: &[Vec<f32>],
     e: &EditState,
@@ -283,6 +286,14 @@ pub fn analyse(
     let n = last + 1 - first;
     if (n as f64) < MIN_SOURCE_S * f64::from(rate) {
         return Err(TailError::SourceTooShort);
+    }
+    // The source region, and the last second before the cut (the join and the level at the
+    // cut), but not before Start.
+    let near_cut = cut
+        .saturating_sub(secs_to_frames(SOURCE_S, rate))
+        .max(e.start.min(cut - 1));
+    if !all_finite(audio, first, last) || !all_finite(audio, near_cut, cut - 1) {
+        return Err(TailError::NonFinite);
     }
     if level_db(audio, first, last) < SILENT_DB {
         return Err(TailError::Silent);
@@ -716,6 +727,51 @@ mod tests {
                 assert!(sp.audio.iter().flatten().all(|v| v.is_finite()));
             }
         }
+    }
+
+    #[test]
+    fn non_finite_audio_is_refused() {
+        let (x, cut) = steady_tone();
+        let e = cut_at(&x, cut);
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            // In the source region (the last second before the cut), or just before the cut.
+            for at_frame in [cut - at(0.5), cut - 1] {
+                let mut y = x.clone();
+                y[0][at_frame] = bad;
+                assert_eq!(
+                    analyse(&y, &e, None, RATE),
+                    Err(TailError::NonFinite),
+                    "{bad} at {at_frame}"
+                );
+                for method in [
+                    TailMethod::Granular,
+                    TailMethod::Smooth,
+                    TailMethod::Harmonic,
+                ] {
+                    let s = TailSettings {
+                        method,
+                        ..TailSettings::default()
+                    };
+                    assert_eq!(
+                        render_tail(&y, &e, None, RATE, &s).unwrap_err(),
+                        TailError::NonFinite
+                    );
+                }
+            }
+            // A selected source elsewhere is checked too.
+            let mut y = x.clone();
+            y[0][at(0.5)] = bad;
+            let sel = Some((at(0.3), at(0.7)));
+            assert_eq!(analyse(&y, &e, sel, RATE), Err(TailError::NonFinite));
+            // After the cut, the audio is replaced, so it does not matter.
+            let mut y = x.clone();
+            y[0][cut + 10] = bad;
+            assert!(analyse(&y, &e, None, RATE).is_ok());
+        }
+        assert_eq!(
+            TailError::NonFinite.to_string(),
+            "The audio contains invalid (non-finite) samples."
+        );
     }
 
     #[test]

@@ -76,13 +76,23 @@ pub fn level_db(audio: &[Vec<f32>], first: usize, last: usize) -> f32 {
     }
 }
 
+/// Whether every sample of `first..=last` (clamped) is finite: no NaN or infinity, as a
+/// corrupt float file can hold. An empty range is finite.
+pub fn all_finite(audio: &[Vec<f32>], first: usize, last: usize) -> bool {
+    clamp_range(audio, first, last).is_none_or(|(first, last)| {
+        audio
+            .iter()
+            .all(|ch| ch[first..=last].iter().all(|v| v.is_finite()))
+    })
+}
+
 /// Least-squares slope in dB per second of a level envelope whose frames are `secs_per_frame`
 /// apart, using only frames above [`FIT_FLOOR_DB`]. 0 with fewer than three such frames.
 fn slope_db_s(db: &[f32], secs_per_frame: f64) -> f64 {
     let pts: Vec<(f64, f64)> = db
         .iter()
         .enumerate()
-        .filter(|&(_, &d)| d > FIT_FLOOR_DB)
+        .filter(|&(_, &d)| d > FIT_FLOOR_DB && d.is_finite())
         .map(|(i, &d)| (i as f64 * secs_per_frame, f64::from(d)))
         .collect();
     if pts.len() < 3 {
@@ -127,12 +137,15 @@ pub fn decay_fit(audio: &[Vec<f32>], first: usize, last: usize, rate: u32) -> De
         .max((RECENT_FRACTION * frames as f64).ceil() as usize)
         .min(frames);
     let recent = slope_db_s(&db[frames - keep..], secs).min(whole);
-    let rate_db_s = (-recent).max(0.0) as f32;
-    let is_steady = whole > STEADY_SLOPE_DB_S;
+    let rate_db_s = Some((-recent).max(0.0) as f32)
+        .filter(|r| r.is_finite())
+        .unwrap_or(0.0);
+    // A slope that is not a number (non-finite samples) reads as steady, as does no fall.
+    let is_steady = whole.is_nan() || whole > STEADY_SLOPE_DB_S || rate_db_s <= 0.0;
     DecayFit {
         steady: is_steady,
         rate_db_s,
-        // Not steady means rate_db_s >= 3, so this is finite.
+        // Not steady means rate_db_s is finite and above 0, so this is finite.
         t60: (!is_steady).then(|| 60.0 / rate_db_s),
     }
 }
@@ -190,6 +203,20 @@ mod tests {
         assert!((fit.rate_db_s - 120.0).abs() < 0.15 * 120.0, "{fit:?}");
         let t60 = fit.t60.unwrap();
         assert!((t60 - 0.5).abs() < 0.15 * 0.5, "t60 {t60}");
+    }
+
+    #[test]
+    fn decay_fit_never_reports_an_infinite_decay() {
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            for x in [tone(1.0, |_| 0.0), tone(1.0, |t| -60.0 * t / 1.2)] {
+                let mut x = x;
+                x[20_000] = bad;
+                let fit = decay_fit(std::slice::from_ref(&x), 0, x.len() - 1, RATE);
+                assert!(fit.rate_db_s.is_finite() && fit.rate_db_s >= 0.0, "{fit:?}");
+                assert!(fit.t60.is_none_or(|t| t.is_finite() && t > 0.0), "{fit:?}");
+                assert_eq!(fit.steady, fit.t60.is_none(), "{fit:?}");
+            }
+        }
     }
 
     #[test]
