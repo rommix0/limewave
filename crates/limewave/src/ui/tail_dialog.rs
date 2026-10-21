@@ -181,12 +181,20 @@ pub fn tail_dialog(ctx: &egui::Context, app: &mut LimewaveApp) {
         }));
     }
 
+    // A render whose worker died is not started again for the same key (a settings change
+    // tries again); say so instead of waiting for it.
+    let analysis_failed = d.analysis.failed(analysis_key);
+    let render_failed = d.render.failed(render_key);
     let before = d.settings;
     let mut clicks = Clicks::default();
     let modal = egui::Modal::new(egui::Id::unique("tail_dialog")).show(ctx, |ui| {
         ui.set_width(480.0);
         ui.heading("Generate tail");
         let a = match analysis {
+            None if analysis_failed => {
+                ui.colored_label(colors::END, "Analysis failed");
+                None
+            }
             None => {
                 ui.weak("Analysing…");
                 None
@@ -231,6 +239,10 @@ pub fn tail_dialog(ctx: &egui::Context, app: &mut LimewaveApp) {
                 Some(Err(err)) => {
                     plot(ui, None, cut);
                     ui.colored_label(colors::END, err.to_string());
+                }
+                None if render_failed => {
+                    plot(ui, None, cut);
+                    ui.colored_label(colors::END, "Rendering failed");
                 }
                 None => {
                     plot(ui, None, cut);
@@ -665,6 +677,45 @@ mod tests {
         // The default 30 ms release; 6000 frames of the file are still to play.
         out.render(48 * 40);
         assert!(out.voice_sources().is_empty(), "silenced on close");
+    }
+
+    #[test]
+    fn a_failed_render_shows_and_is_not_restarted() {
+        use egui_kittest::Harness;
+        use egui_kittest::kittest::{NodeT, Queryable};
+        let mut app = tone_app();
+        app.ui.render_debounce = Duration::ZERO;
+        let ctx = egui::Context::default();
+        let mut d = TailDialogState {
+            suggested_taken: true,
+            ..TailDialogState::default()
+        };
+        // The analysis has worked; the render for the current settings died.
+        let akey = app.render_key(selection_hash(None)).unwrap();
+        let s = app.selected_session().unwrap();
+        let (audio, e) = (s.processed.clone(), s.edit().clone());
+        d.analysis.start(spawn_render(akey, ctx.clone(), move || {
+            analyse(&audio, &e, None, 44100)
+        }));
+        d.analysis.finish(Some(akey), true);
+        let rkey = app.render_key(settings_hash(&d.settings, None)).unwrap();
+        d.render
+            .start(spawn_render(rkey, ctx, || panic!("render failed")));
+        d.render.finish(Some(rkey), true);
+        assert!(d.render.failed(Some(rkey)));
+        app.ui.tail_dialog = Some(d);
+
+        let mut h = Harness::builder()
+            .with_size(egui::vec2(800.0, 700.0))
+            .build_ui_state(|ui, app: &mut LimewaveApp| tail_dialog(ui.ctx(), app), app);
+        h.run();
+        h.get_by_label("Rendering failed");
+        let d = h.state().ui.tail_dialog.as_ref().expect("still open");
+        assert!(!d.render.is_rendering(), "not started again");
+        assert!(
+            h.get_by_label("Apply").accesskit_node().is_disabled(),
+            "nothing to apply"
+        );
     }
 
     #[test]

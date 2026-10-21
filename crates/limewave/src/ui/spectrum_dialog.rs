@@ -226,12 +226,20 @@ pub fn spectrum_dialog(ctx: &egui::Context, app: &mut LimewaveApp) {
         }));
     }
 
+    // A render whose worker died is not started again for the same key (a settings change
+    // tries again); say so instead of waiting for it.
+    let analysis_failed = d.analysis.failed(analysis_key);
+    let render_failed = d.render.failed(render_key);
     let before = d.settings;
     let mut clicks = Clicks::default();
     let modal = egui::Modal::new(egui::Id::unique("spectrum_dialog")).show(ctx, |ui| {
         ui.set_width(480.0);
         ui.heading("Make loop from spectrum");
         let a = match analysis {
+            None if analysis_failed => {
+                ui.colored_label(colors::END, "Analysis failed");
+                None
+            }
             None => {
                 ui.weak("Analysing…");
                 None
@@ -269,6 +277,10 @@ pub fn spectrum_dialog(ctx: &egui::Context, app: &mut LimewaveApp) {
                 Some(Err(err)) => {
                     plots(ui, None);
                     ui.colored_label(colors::END, err.to_string());
+                }
+                None if render_failed => {
+                    plots(ui, None);
+                    ui.colored_label(colors::END, "Rendering failed");
                 }
                 None => {
                     plots(ui, None);

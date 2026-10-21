@@ -34,8 +34,18 @@ impl<T> RenderJob<T> {
     }
 }
 
+/// Asks its context for a repaint when dropped, however the worker ends.
+struct RepaintOnDrop(egui::Context);
+
+impl Drop for RepaintOnDrop {
+    fn drop(&mut self) {
+        self.0.request_repaint();
+    }
+}
+
 /// Runs `f` on a new thread for `key` and asks `ctx` for a repaint when it is done, so the
-/// next frame can pick the result up. Dropping the job lets the render finish unseen.
+/// next frame can pick the result up, or see that the worker died without one (a panic).
+/// Dropping the job lets the render finish unseen.
 pub fn spawn_render<T: Send + 'static>(
     key: RenderKey,
     ctx: egui::Context,
@@ -43,18 +53,23 @@ pub fn spawn_render<T: Send + 'static>(
 ) -> RenderJob<T> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        if tx.send(f()).is_ok() {
-            ctx.request_repaint();
-        }
+        // Locals drop in reverse order, also when `f` panics: the sender goes first, so the
+        // repaint finds the result sent, or the channel closed.
+        let _repaint = RepaintOnDrop(ctx);
+        let tx = tx;
+        let _ = tx.send(f());
     });
     RenderJob { key, rx }
 }
 
-/// One dialog's render: the job running, the last result kept and when the settings last
-/// changed, for the pause before the next render.
+/// One dialog's render: the job running, the last result kept (or the key whose render
+/// failed) and when the settings last changed, for the pause before the next render.
 pub struct RenderSlot<T> {
     job: Option<RenderJob<T>>,
     result: Option<(RenderKey, T)>,
+    /// The key whose worker died without a result; it is not started again until the key
+    /// changes.
+    failed: Option<RenderKey>,
     changed_at: Option<Instant>,
 }
 
@@ -63,6 +78,7 @@ impl<T> Default for RenderSlot<T> {
         RenderSlot {
             job: None,
             result: None,
+            failed: None,
             changed_at: None,
         }
     }
@@ -74,15 +90,17 @@ impl<T> RenderSlot<T> {
     pub fn restart(&mut self) {
         self.job = None;
         self.result = None;
+        self.failed = None;
         self.changed_at = Some(Instant::now());
     }
 
-    /// Whether a render for `key` should start now: nothing for `key` is running or kept, and
-    /// `debounce` has passed since the last [`RenderSlot::restart`]. While that pause runs, a
-    /// repaint is asked for when it ends.
+    /// Whether a render for `key` should start now: nothing for `key` is running, kept or
+    /// failed, and `debounce` has passed since the last [`RenderSlot::restart`]. While that
+    /// pause runs, a repaint is asked for when it ends.
     pub fn wants(&self, key: RenderKey, debounce: Duration, ctx: &egui::Context) -> bool {
         if self.job.as_ref().is_some_and(|j| j.key == key)
             || self.result.as_ref().is_some_and(|(k, _)| *k == key)
+            || self.failed == Some(key)
         {
             return false;
         }
@@ -110,7 +128,8 @@ impl<T> RenderSlot<T> {
 
     /// Takes the running render's result once it has finished, or waits for it when `block`.
     /// The result is kept only when its key is `current`; otherwise it is discarded. A worker
-    /// that died without a result ends the job too.
+    /// that died without a result ends the job too, and, when its key is `current`, marks that
+    /// key as failed ([`RenderSlot::failed`]).
     pub fn finish(&mut self, current: Option<RenderKey>, block: bool) {
         let Some(job) = &self.job else { return };
         let got = if block {
@@ -124,11 +143,18 @@ impl<T> RenderSlot<T> {
         };
         let key = job.key;
         self.job = None;
-        if let Some(v) = got
-            && current == Some(key)
-        {
-            self.result = Some((key, v));
+        if current != Some(key) {
+            return;
         }
+        match got {
+            Some(v) => self.result = Some((key, v)),
+            None => self.failed = Some(key),
+        }
+    }
+
+    /// Whether the render for `current` failed: its worker died without a result.
+    pub fn failed(&self, current: Option<RenderKey>) -> bool {
+        current.is_some() && self.failed == current
     }
 
     /// The kept result, if it was rendered for `current`.
@@ -241,5 +267,36 @@ mod tests {
         slot.finish(Some(key(1)), true);
         assert!(!slot.is_rendering());
         assert_eq!(slot.result(Some(key(1))), None);
+    }
+
+    #[test]
+    fn a_failed_render_is_not_started_again_for_its_key() {
+        let (ctx, repaints) = counting_ctx();
+        let mut slot: RenderSlot<i32> = RenderSlot::default();
+        slot.start(spawn_render(key(1), ctx.clone(), || {
+            panic!("render failed")
+        }));
+        // The worker asks for a repaint even though it died, so the failure is seen.
+        let start = Instant::now();
+        while repaints.load(Ordering::SeqCst) == 0 {
+            assert!(start.elapsed() < Duration::from_secs(10), "no repaint");
+            std::thread::yield_now();
+        }
+        slot.finish(Some(key(1)), true);
+        assert!(slot.failed(Some(key(1))), "recorded as failed");
+        assert!(!slot.wants(key(1), Duration::ZERO, &ctx), "not respawned");
+        assert!(!slot.failed(Some(key(2))), "only for its key");
+        assert!(
+            slot.wants(key(2), Duration::ZERO, &ctx),
+            "another key renders"
+        );
+        slot.restart();
+        assert!(!slot.failed(Some(key(1))), "a change clears it");
+        assert!(slot.wants(key(1), Duration::ZERO, &ctx));
+
+        // A stale failure is not recorded.
+        slot.start(spawn_render(key(3), ctx, || panic!("render failed")));
+        slot.finish(Some(key(4)), true);
+        assert!(!slot.failed(Some(key(3))) && !slot.failed(Some(key(4))));
     }
 }
