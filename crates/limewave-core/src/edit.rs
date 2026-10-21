@@ -251,6 +251,11 @@ impl History {
         &self.entries[self.cursor]
     }
 
+    /// The index of the current entry; 0 is the state the file was opened with.
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+
     /// Records a new state, dropping any redo tail. A no-op if equal to the current state.
     pub fn push(&mut self, s: EditState) {
         if *self.current() == s {
@@ -560,6 +565,21 @@ mod tests {
         assert!(h.is_dirty());
         assert!(h.undo());
         assert!(!h.undo());
+    }
+
+    #[test]
+    fn history_cursor_counts_the_current_entry() {
+        let mut h = History::new(EditState::default_for(100));
+        assert_eq!(h.cursor(), 0);
+        h.push(at(1));
+        h.push(at(2));
+        assert_eq!(h.cursor(), 2);
+        h.undo();
+        assert_eq!(h.cursor(), 1);
+        h.push(at(1));
+        assert_eq!(h.cursor(), 1, "an equal push adds nothing");
+        h.redo();
+        assert_eq!(h.cursor(), 2);
     }
 
     #[test]

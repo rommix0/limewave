@@ -28,6 +28,7 @@ use crate::audio::keys::{octave_shift, qwerty_note};
 use crate::audio::midi::{MidiConnection, connect_midi, decode_last_note, list_midi_ports};
 use crate::audio::voice::{Adsr, PlayBuffer, play_buffer};
 use crate::folder;
+use crate::render_worker::{RenderKey, RenderSlot};
 use crate::theme::{self, colors};
 use crate::ui::coords::ViewTransform;
 use crate::ui::effects::{EffectDialog, EffectParams, edit_menu, effect_dialog, effects_menu};
@@ -97,6 +98,23 @@ pub struct Session {
     /// Identifies this session's play buffers, so voices released on another file finish on
     /// that file's audio. Unique per session: one rebased after a save gets a new id.
     pub source: u64,
+    /// The dialog preview the engine holds instead of this session's buffer, if any.
+    pub dialog_preview: Option<DialogPreview>,
+}
+
+/// A dialog's result being previewed (v0.3 §7.1, §7.2): the processed audio with the dialog's
+/// step applied, published under its own source so the session's audio, history and buffer
+/// stay as they are.
+pub struct DialogPreview {
+    /// The preview buffer's source, never the session's.
+    pub source: u64,
+    /// The preview audio with the step's crossfade, as the engine plays it.
+    pub rendered: Vec<Vec<f32>>,
+}
+
+/// A source id no buffer has used yet.
+fn next_source() -> u64 {
+    NEXT_SOURCE.fetch_add(1, Ordering::Relaxed)
 }
 
 impl Session {
@@ -123,7 +141,8 @@ impl Session {
             preview: None,
             last_preview_push: None,
             preview_held: false,
-            source: NEXT_SOURCE.fetch_add(1, Ordering::Relaxed),
+            source: next_source(),
+            dialog_preview: None,
         }
     }
 
@@ -309,6 +328,47 @@ impl Session {
         }
     }
 
+    /// Previews a dialog's `step` before it is applied: the processed audio with `step` applied,
+    /// played with `edit`'s markers and loop (the edit the dialog would apply), is published
+    /// under a fresh source. Voices on the session's buffer, or on an earlier preview, finish
+    /// on their own audio. The history, `processed` and `rendered` are untouched.
+    pub fn preview_step(
+        &mut self,
+        step: &AppliedEffect,
+        edit: &EditState,
+        engine: Option<&AudioEngine>,
+    ) {
+        let mut audio = self.processed.clone();
+        apply_effect(&mut audio, step);
+        let source = next_source();
+        let rendered = match engine {
+            Some(engine) => {
+                let buffer = play_buffer(&audio, self.doc.format.sample_rate, edit, source);
+                let rendered = buffer.audio.clone();
+                engine.set_buffer(buffer);
+                rendered
+            }
+            None => render(&audio, edit),
+        };
+        self.dialog_preview = Some(DialogPreview { source, rendered });
+    }
+
+    /// Ends a dialog preview: its voices are stopped (a 5 ms fade on the preview's own audio)
+    /// and the session's buffer is published again. Does nothing when no preview is live.
+    pub fn end_preview(&mut self, engine: Option<&mut AudioEngine>) {
+        if self.dialog_preview.take().is_none() {
+            return;
+        }
+        let e = self.shown_edit().clone();
+        match engine {
+            Some(engine) => {
+                engine.send(Command::AllOff);
+                self.publish(&e, Some(engine));
+            }
+            None => self.publish(&e, None),
+        }
+    }
+
     /// Brings `processed`, `peaks` and `mono` up to date with the current edit's effects:
     /// only the new effects are applied when they extend the ones already applied, else the
     /// audio is processed afresh. Does nothing when the effects are unchanged.
@@ -394,6 +454,23 @@ impl FileEntry {
     }
 }
 
+/// The pause after the last settings change before a dialog renders again (v0.3 §7).
+const RENDER_DEBOUNCE: Duration = Duration::from_millis(200);
+
+/// The Generate tail… dialog's state (v0.3 §7.1). For now only its render; the settings,
+/// the analysis and the result type come with the dialog.
+#[derive(Default)]
+pub struct TailDialogState {
+    pub render: RenderSlot<()>,
+}
+
+/// The Make loop from spectrum… dialog's state (v0.3 §7.2). For now only its render; the
+/// settings, the analysis and the result type come with the dialog.
+#[derive(Default)]
+pub struct SpectrumDialogState {
+    pub render: RenderSlot<()>,
+}
+
 /// View and tool settings that outlive a single frame.
 pub struct UiState {
     pub snap: bool,
@@ -424,6 +501,13 @@ pub struct UiState {
     pub release_after_loop: bool,
     /// Whether a MIDI input is connected; set each frame for the inspector.
     pub midi_connected: bool,
+    /// The Generate tail… dialog, while it is open.
+    pub tail_dialog: Option<TailDialogState>,
+    /// The Make loop from spectrum… dialog, while it is open.
+    pub spectrum_dialog: Option<SpectrumDialogState>,
+    /// How long the dialogs wait after the last settings change before they render again
+    /// (v0.3 §7). Tests set it to zero.
+    pub render_debounce: Duration,
     /// Why the last action did nothing, shown in the toolbar until the next action.
     pub message: Option<String>,
 }
@@ -449,6 +533,9 @@ impl Default for UiState {
             release_after_loop: false,
             midi_connected: false,
             message: None,
+            tail_dialog: None,
+            spectrum_dialog: None,
+            render_debounce: RENDER_DEBOUNCE,
         }
     }
 }
@@ -734,12 +821,15 @@ impl LimewaveApp {
         }
     }
 
-    /// True while a modal (unsaved prompt, save dialog, save results, effect dialog) is up.
+    /// True while a modal (unsaved prompt, save dialog, save results, an effect, tail or
+    /// spectrum-loop dialog) is up.
     fn modal_open(&self) -> bool {
         self.pending.is_some()
             || self.ui.save_dialog.open
             || self.save_results.is_some()
             || self.ui.effect_dialog.is_some()
+            || self.ui.tail_dialog.is_some()
+            || self.ui.spectrum_dialog.is_some()
     }
 
     fn perform(&mut self, action: PendingAction) {
@@ -792,7 +882,10 @@ impl LimewaveApp {
     }
 
     fn send(&mut self, c: Command) {
-        if matches!(c, Command::NoteOn { .. } | Command::PlayRange { .. }) {
+        if matches!(
+            c,
+            Command::NoteOn { .. } | Command::PlayRange { .. } | Command::PreviewOn { .. }
+        ) {
             self.cursor_watch.note_started(Instant::now());
         }
         if let Some(engine) = &mut self.engine {
@@ -1106,6 +1199,86 @@ impl LimewaveApp {
         self.ui.play_from = self.ui.play_from.filter(|&f| f < frames);
     }
 
+    /// Records `e`, a dialog's rendered edit, as one history entry of the selected file. The
+    /// selection and play-from point are kept inside the new length at once, and a file that
+    /// grew is refit in the view so its new audio shows.
+    pub fn apply_dialog_edit(&mut self, e: EditState) {
+        self.ui.message = None;
+        let engine = self.engine.as_ref();
+        if let Some(FileEntry::Loaded(s)) = self.selected.and_then(|i| self.files.get_mut(i)) {
+            let before = s.frames();
+            s.apply(e, engine);
+            if s.frames() > before {
+                s.view = None;
+            }
+        }
+        self.clamp_ui_to_file();
+    }
+
+    /// What a dialog render started now is made for: the selected file, its current edit and
+    /// `settings_hash`, a hash of the dialog's settings. `None` without a loaded file.
+    pub fn render_key(&self, settings_hash: u64) -> Option<RenderKey> {
+        let file = self.selected?;
+        let s = self.selected_session()?;
+        Some(RenderKey {
+            file,
+            effects_len: s.edit().effects.len(),
+            history_cursor: s.history.cursor(),
+            settings_hash,
+        })
+    }
+
+    /// Takes the open dialogs' finished renders, waiting for running ones when `block`. A
+    /// render made for a file or edit that is no longer current is discarded.
+    fn drain_renders(&mut self, block: bool) {
+        if let Some(mut d) = self.ui.tail_dialog.take() {
+            self.drain_render(&mut d.render, block);
+            self.ui.tail_dialog = Some(d);
+        }
+        if let Some(mut d) = self.ui.spectrum_dialog.take() {
+            self.drain_render(&mut d.render, block);
+            self.ui.spectrum_dialog = Some(d);
+        }
+    }
+
+    fn drain_render<T>(&self, slot: &mut RenderSlot<T>, block: bool) {
+        // A settings change drops the job, so only the file and the edit can have moved on.
+        let current = slot
+            .job_key()
+            .and_then(|k| self.render_key(k.settings_hash));
+        slot.finish(current, block);
+    }
+
+    /// Test hook: blocks until the open dialogs' running renders finish and takes their
+    /// results, as the frames after they finish would. Kittest tests call it between runs.
+    pub fn wait_for_renders(&mut self) {
+        self.drain_renders(true);
+    }
+
+    /// Previews a dialog's `step` on the selected file; see [`Session::preview_step`].
+    pub fn preview_step(&mut self, step: &AppliedEffect, edit: &EditState) {
+        let engine = self.engine.as_ref();
+        if let Some(FileEntry::Loaded(s)) = self.selected.and_then(|i| self.files.get_mut(i)) {
+            s.preview_step(step, edit, engine);
+        }
+    }
+
+    /// Plays the live dialog preview from `from` at the root key, with the session's attack
+    /// only and its release playing on past the loop ([`Command::PreviewOn`]).
+    pub fn play_preview(&mut self, from: usize) {
+        if let Some(note) = self.selected_session().map(|s| s.edit().root) {
+            self.send(Command::PreviewOn { note, from });
+        }
+    }
+
+    /// Ends the selected file's dialog preview; see [`Session::end_preview`].
+    pub fn end_preview(&mut self) {
+        let engine = self.engine.as_mut();
+        if let Some(FileEntry::Loaded(s)) = self.selected.and_then(|i| self.files.get_mut(i)) {
+            s.end_preview(engine);
+        }
+    }
+
     /// Moves finished background loads into the file list.
     fn drain_loader(&mut self) {
         let Some(rx) = &self.loader else { return };
@@ -1220,6 +1393,7 @@ impl LimewaveApp {
     pub fn show(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         self.drain_loader();
+        self.drain_renders(false);
         if self.loader.is_some() {
             ctx.request_repaint_after(Duration::from_millis(50));
         }
@@ -1586,6 +1760,7 @@ impl eframe::App for LimewaveApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::render_worker::spawn_render;
     use limewave_core::document::load_wav_bytes;
     use limewave_core::edit::LoopMode;
     use limewave_core::effects::{FadeCurve, MonoSource, Splice, SpliceKind};
@@ -2247,5 +2422,212 @@ mod tests {
         app.resolve_pending(true);
         assert_eq!(app.dirty_count(), 0);
         assert!(app.files.is_empty(), "discard opens the empty folder");
+    }
+
+    /// An app with `s` loaded and selected.
+    fn app_with(s: Session) -> LimewaveApp {
+        let mut app = LimewaveApp::for_test();
+        app.files = vec![FileEntry::Loaded(Box::new(s))];
+        app.select(0);
+        app
+    }
+
+    /// A step that splices `audio` (one channel) in place of `first..=last`.
+    fn splice_step(first: usize, last: usize, audio: Vec<f32>) -> AppliedEffect {
+        let n = audio.len();
+        AppliedEffect {
+            op: Op::Splice(Arc::new(Splice {
+                kind: SpliceKind::SpectrumLoop,
+                audio: vec![audio],
+                generated: (0, n - 1),
+            })),
+            first,
+            last,
+        }
+    }
+
+    #[test]
+    fn render_key_follows_the_file_and_its_history() {
+        assert_eq!(LimewaveApp::for_test().render_key(1), None, "no file");
+        let mut app = app_with(session());
+        let key = app.render_key(9).unwrap();
+        assert_eq!(
+            key,
+            RenderKey {
+                file: 0,
+                effects_len: 0,
+                history_cursor: 0,
+                settings_hash: 9,
+            }
+        );
+        assert!(app.apply_effect(Effect::Gain { db: -6.0 }));
+        let after = app.render_key(9).unwrap();
+        assert_eq!((after.effects_len, after.history_cursor), (1, 1));
+        app.undo();
+        assert_eq!(app.render_key(9), Some(key));
+    }
+
+    #[test]
+    fn render_debounce_defaults_to_200_ms() {
+        assert_eq!(
+            UiState::default().render_debounce,
+            Duration::from_millis(200)
+        );
+    }
+
+    #[test]
+    fn stale_render_is_discarded() {
+        let mut app = app_with(session());
+        let ctx = app.ctx.clone();
+        let key = app.render_key(3).unwrap();
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        let mut d = TailDialogState::default();
+        d.render.start(spawn_render(key, ctx, move || {
+            wait.recv().unwrap();
+        }));
+        app.ui.tail_dialog = Some(d);
+        assert!(app.apply_effect(Effect::Gain { db: -6.0 }));
+        let history = app.render_key(3).unwrap();
+        go.send(()).unwrap();
+        app.wait_for_renders();
+
+        let render = &app.ui.tail_dialog.as_ref().unwrap().render;
+        assert!(!render.is_rendering(), "the job is drained");
+        assert_eq!(render.result(Some(key)), None, "and its result dropped");
+        assert_eq!(render.result(app.render_key(3)), None);
+        assert_eq!(app.render_key(3), Some(history), "the history is unchanged");
+
+        // A job for the current edit is kept.
+        let ctx = app.ctx.clone();
+        let d = app.ui.tail_dialog.as_mut().unwrap();
+        d.render.start(spawn_render(history, ctx, || ()));
+        app.wait_for_renders();
+        let render = &app.ui.tail_dialog.as_ref().unwrap().render;
+        assert_eq!(render.result(app.render_key(3)), Some(&()));
+    }
+
+    #[test]
+    fn spectrum_dialog_renders_are_drained_too() {
+        let mut app = app_with(session());
+        let key = app.render_key(1).unwrap();
+        let mut d = SpectrumDialogState::default();
+        d.render.start(spawn_render(key, app.ctx.clone(), || ()));
+        app.ui.spectrum_dialog = Some(d);
+        app.wait_for_renders();
+        let render = &app.ui.spectrum_dialog.as_ref().unwrap().render;
+        assert_eq!(render.result(Some(key)), Some(&()));
+    }
+
+    #[test]
+    fn the_new_dialogs_count_as_modal() {
+        let mut app = LimewaveApp::for_test();
+        assert!(!app.modal_open());
+        app.ui.tail_dialog = Some(TailDialogState::default());
+        assert!(app.modal_open());
+        app.ui.tail_dialog = None;
+        app.ui.spectrum_dialog = Some(SpectrumDialogState::default());
+        assert!(app.modal_open());
+    }
+
+    #[test]
+    fn preview_uses_its_own_source_and_end_restores_the_session_buffer() {
+        // Without an engine: the bookkeeping.
+        let mut s = short_session();
+        let source = s.source;
+        let rendered = s.rendered.clone();
+        let step = tail(1, 1000, 900, 500);
+        let mut edit = s.edit().clone();
+        edit.effects.push(step.clone());
+        edit.end = 1499;
+        s.preview_step(&step, &edit, None);
+        let p = s.dialog_preview.as_ref().expect("a preview is live");
+        assert!(p.source != source && p.source != 0, "its own source");
+        let mut audio = s.processed.clone();
+        apply_effect(&mut audio, &step);
+        assert_eq!(p.rendered, render(&audio, &edit), "processed + the step");
+        assert_eq!(p.rendered[0].len(), 1500);
+        let first = p.source;
+        assert_eq!(s.source, source, "the session keeps its source");
+        assert_eq!(s.rendered, rendered, "and its audio");
+        assert_eq!(s.frames(), 1000);
+        assert_eq!(s.history.cursor(), 0, "the history is untouched");
+        s.preview_step(&step, &edit, None);
+        let second = s.dialog_preview.as_ref().unwrap().source;
+        assert!(
+            second != first && second != source,
+            "a fresh source each time"
+        );
+        s.end_preview(None);
+        assert!(s.dialog_preview.is_none());
+        assert_eq!((s.source, &s.rendered), (source, &rendered));
+
+        // With an engine: voices on the preview source move to `previous` when it ends.
+        let (engine, mut out) = crate::audio::engine::headless(48_000);
+        let mut app = LimewaveApp::build(egui::Context::default(), Some(engine), None);
+        app.files = vec![FileEntry::Loaded(Box::new(short_session()))];
+        app.select(0);
+        let session_source = app.selected_session().unwrap().source;
+        out.render(16);
+        assert_eq!(out.sources().0, session_source);
+
+        app.preview_step(&step, &edit);
+        let preview_source = app
+            .selected_session()
+            .and_then(|s| s.dialog_preview.as_ref())
+            .unwrap()
+            .source;
+        app.play_preview(950);
+        let sound = out.render(256);
+        assert_eq!(out.sources(), (preview_source, session_source));
+        assert_eq!(out.voice_sources(), [preview_source]);
+        assert!(sound.iter().any(|x| x.abs() > 0.01), "the preview sounds");
+
+        app.end_preview();
+        assert!(app.selected_session().unwrap().dialog_preview.is_none());
+        out.render(16);
+        assert_eq!(out.sources(), (session_source, preview_source));
+        assert_eq!(
+            out.voice_sources(),
+            [preview_source],
+            "fading on its own audio"
+        );
+        out.render(480);
+        assert!(out.voice_sources().is_empty(), "gone after the 5 ms fade");
+        // Without a live preview, ending one changes nothing.
+        app.end_preview();
+        out.render(16);
+        assert_eq!(out.sources(), (session_source, preview_source));
+    }
+
+    #[test]
+    fn apply_dialog_edit_clamps_the_selection_and_refits_a_longer_file() {
+        // A splice that shortens the file to 600 frames.
+        let mut app = app_with(short_session());
+        app.ui.selection = Some((550, 800));
+        app.ui.play_from = Some(650);
+        let mut e = app.selected_session().unwrap().edit().clone();
+        e.effects.push(splice_step(500, 999, vec![0.1; 100]));
+        e.end = 599;
+        let view = ViewTransform {
+            first: 0.0,
+            frames_per_px: 1.0,
+        };
+        app.selected_session_mut().unwrap().view = Some(view);
+        app.apply_dialog_edit(e);
+        let s = app.selected_session().unwrap();
+        assert_eq!(s.frames(), 600);
+        assert_eq!(s.history.cursor(), 1, "one history entry");
+        assert_eq!(app.ui.selection, Some((550, 599)));
+        assert_eq!(app.ui.play_from, None);
+        assert!(s.view.is_some(), "a shorter file keeps its view");
+
+        // One that lengthens it refits the view.
+        let mut e = s.edit().clone();
+        e.effects.push(tail(1, 600, 500, 900));
+        e.end = 1499;
+        app.apply_dialog_edit(e);
+        let s = app.selected_session().unwrap();
+        assert_eq!(s.frames(), 1500);
+        assert_eq!(s.view, None, "refit to show the new audio");
     }
 }

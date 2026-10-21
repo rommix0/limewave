@@ -374,8 +374,9 @@ impl Callback {
 pub struct AudioEngine {
     pub device_rate: u32,
     pub device_name: String,
-    // Declared before the buffers so the stream (and its callback) is dropped first.
-    _stream: cpal::Stream,
+    // Declared before the buffers so the stream (and its callback) is dropped first. `None`
+    // only in tests, where the callback is driven by hand.
+    _stream: Option<cpal::Stream>,
     buffer: Arc<ArcSwap<PlayBuffer>>,
     /// Buffers swapped out by `set_buffer` that the audio thread may still hold. Each is dropped
     /// here on the UI thread once nothing else holds it, so the audio thread never frees one.
@@ -437,7 +438,7 @@ impl AudioEngine {
         Ok(AudioEngine {
             device_rate,
             device_name,
-            _stream: stream,
+            _stream: Some(stream),
             buffer,
             retired: RefCell::new(Vec::new()),
             cursors,
@@ -481,6 +482,65 @@ impl AudioEngine {
     /// The producer end of the MIDI command queue. `Some` on the first call only.
     pub fn midi_sender(&mut self) -> Option<rtrb::Producer<Command>> {
         self.midi_tx.take()
+    }
+}
+
+/// An engine without an output device, for tests: its callback is driven by hand through the
+/// returned [`HeadlessOutput`].
+#[cfg(test)]
+pub(crate) fn headless(device_rate: u32) -> (AudioEngine, HeadlessOutput) {
+    let buffer = Arc::new(ArcSwap::from_pointee(empty_buffer(device_rate)));
+    let (ui_tx, ui_rx) = rtrb::RingBuffer::new(COMMAND_CAPACITY);
+    let (midi_tx, midi_rx) = rtrb::RingBuffer::new(COMMAND_CAPACITY);
+    let cursors = Arc::new(Cursors::new());
+    let cb = Callback::new(
+        Arc::clone(&buffer),
+        Arc::clone(&cursors),
+        ui_rx,
+        midi_rx,
+        2,
+        device_rate,
+    );
+    let engine = AudioEngine {
+        device_rate,
+        device_name: "headless".to_string(),
+        _stream: None,
+        buffer,
+        retired: RefCell::new(Vec::new()),
+        cursors,
+        ui_tx,
+        midi_tx: Some(midi_tx),
+    };
+    (engine, HeadlessOutput(cb))
+}
+
+/// The audio callback of a [`headless`] engine.
+#[cfg(test)]
+pub(crate) struct HeadlessOutput(Callback);
+
+#[cfg(test)]
+impl HeadlessOutput {
+    /// Runs the callback for `frames` stereo frames and returns them interleaved.
+    pub(crate) fn render(&mut self, frames: usize) -> Vec<f32> {
+        let mut out = vec![0.0; frames * 2];
+        self.0.render(&mut out);
+        out
+    }
+
+    /// The sources of the buffers the callback holds: the current one and the previous one.
+    pub(crate) fn sources(&self) -> (u64, u64) {
+        (self.0.current.source, self.0.previous.source)
+    }
+
+    /// The source each sounding voice plays.
+    pub(crate) fn voice_sources(&self) -> Vec<u64> {
+        self.0
+            .state
+            .voices
+            .iter()
+            .flatten()
+            .map(Voice::source)
+            .collect()
     }
 }
 
