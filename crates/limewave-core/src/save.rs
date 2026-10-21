@@ -6,13 +6,14 @@ use std::path::{Path, PathBuf};
 
 use crate::document::WavDocument;
 use crate::edit::{EditState, LoopMode};
+use crate::effects::{AppliedEffect, Op, map_frame, process};
 use crate::error::SaveError;
 use crate::meta::{info_set, sync_acid, sync_inst};
 use crate::render::crossfade_region;
-use crate::riff::{Chunk, RiffFile, list_type, write_riff};
+use crate::riff::{Chunk, RiffFile, find, list_type, write_riff};
 use crate::smpl::{Smpl, SmplLoop, sample_period, tuning_to_smpl};
 use crate::software_tag;
-use crate::wav::{encode_frames, frame_stride};
+use crate::wav::{WavFormat, encode_frames, fmt_with_channels, frame_stride, parse_fmt};
 
 /// Where a save goes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,16 +39,76 @@ fn to_u32(n: usize) -> u32 {
     u32::try_from(n).unwrap_or(u32::MAX)
 }
 
-/// The `data` bytes: the original bytes with only the crossfade region re-encoded, then
-/// trimmed to frames `e.start..=e.end`. `e` must be clamped.
-fn edited_data(doc: &WavDocument, e: &EditState) -> Vec<u8> {
+/// The inclusive frame ranges (sorted, merged) that effects or the crossfade change in a file
+/// of `frames` frames. A channel tool changes every frame whatever its stored range.
+fn changed_ranges(
+    effects: &[AppliedEffect],
+    crossfade: Option<(usize, usize)>,
+    frames: usize,
+) -> Vec<(usize, usize)> {
+    let Some(last_frame) = frames.checked_sub(1) else {
+        return Vec::new();
+    };
+    let mut ranges: Vec<(usize, usize)> = effects
+        .iter()
+        .map(|a| match a.op {
+            Op::StereoToMono | Op::SwapChannels | Op::MonoToStereo => (0, last_frame),
+            _ => (a.first, a.last.min(last_frame)),
+        })
+        .chain(crossfade)
+        .filter(|(first, last)| first <= last)
+        .collect();
+    ranges.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for (first, last) in ranges {
+        match merged.last_mut() {
+            // Overlapping or touching the previous range.
+            Some(prev) if first <= prev.1.saturating_add(1) => prev.1 = prev.1.max(last),
+            _ => merged.push((first, last)),
+        }
+    }
+    merged
+}
+
+/// Applies the loop crossfade to `audio` in place and returns the frames it replaced, if any.
+fn crossfade_in_place(audio: &mut [Vec<f32>], e: &EditState) -> Option<(usize, usize)> {
+    let (first, replacement) = crossfade_region(audio, e)?;
+    let n = replacement.first().map_or(0, Vec::len);
+    for (ch, rep) in audio.iter_mut().zip(&replacement) {
+        ch[first..first + n].copy_from_slice(rep);
+    }
+    (n > 0).then(|| (first, first + n - 1))
+}
+
+/// The `data` bytes for `audio`, the effects-processed audio of `doc`, with the crossfade
+/// applied and trimmed to frames `e.start..=e.end`. `e` must be clamped.
+///
+/// While the channel count is unchanged, the original bytes are kept and only the frames inside
+/// an effect's range or the crossfade region are re-encoded. When it changed, all frames are
+/// encoded with `format`, the new layout.
+fn edited_data(
+    doc: &WavDocument,
+    e: &EditState,
+    mut audio: Vec<Vec<f32>>,
+    format: &WavFormat,
+) -> Vec<u8> {
     if doc.frames == 0 {
         return Vec::new();
     }
-    let stride = frame_stride(&doc.format);
+    let crossfaded = crossfade_in_place(&mut audio, e);
+    if audio.len() != usize::from(doc.format.channels) {
+        let trimmed: Vec<Vec<f32>> = audio
+            .iter()
+            .map(|ch| ch[e.start.min(ch.len())..(e.end + 1).min(ch.len())].to_vec())
+            .collect();
+        return encode_frames(&trimmed, format);
+    }
+
+    let stride = frame_stride(format);
     let mut data = doc.data_chunk().to_vec();
-    if let Some((first, frames)) = crossfade_region(&doc.audio, e) {
-        let encoded = encode_frames(&frames, &doc.format);
+    for (first, last) in changed_ranges(&e.effects, crossfaded, doc.frames) {
+        let frames: Vec<Vec<f32>> = audio.iter().map(|ch| ch[first..=last].to_vec()).collect();
+        let encoded = encode_frames(&frames, format);
         let at = (first * stride).min(data.len());
         let to = (at + encoded.len()).min(data.len());
         data[at..to].copy_from_slice(&encoded[..to - at]);
@@ -116,14 +177,57 @@ fn edited_smpl(doc: &WavDocument, init: &EditState, e: &EditState) -> Smpl {
         .loops
         .iter()
         .skip(1)
-        .filter(|l| range.contains(&(l.start as usize)) && range.contains(&(l.end as usize)))
-        .map(|l| SmplLoop {
-            start: l.start - shift,
-            end: l.end - shift,
+        .map(|l| {
+            let (start, end) = (
+                map_frame(&e.effects, l.start as usize),
+                map_frame(&e.effects, l.end as usize),
+            );
+            // A mirroring reverse swaps the ends; an ordered loop stays ordered.
+            if l.start <= l.end && start > end {
+                (end, start, l)
+            } else {
+                (start, end, l)
+            }
+        })
+        .filter(|(start, end, _)| range.contains(start) && range.contains(end))
+        .map(|(start, end, l)| SmplLoop {
+            start: to_u32(start) - shift,
+            end: to_u32(end) - shift,
             ..*l
         });
     s.loops = first.into_iter().chain(extra).collect();
     s
+}
+
+/// Whether the original `smpl` chunk can be written back as it is: the loop mode, points, root
+/// and cents are those of the file, nothing moves the sample numbers (no head trim, no
+/// marker-mirroring reverse), and every extra loop still lies inside the kept frames.
+fn smpl_unchanged(doc: &WavDocument, init: &EditState, e: &EditState) -> bool {
+    let Some(smpl) = &doc.smpl else {
+        return false;
+    };
+    (e.loop_mode, e.loop_start, e.loop_end, e.root, e.cents)
+        == (
+            init.loop_mode,
+            init.loop_start,
+            init.loop_end,
+            init.root,
+            init.cents,
+        )
+        && e.start == 0
+        && !e.effects.iter().any(|a| {
+            matches!(
+                a.op,
+                Op::Reverse {
+                    mirror_markers: true
+                }
+            )
+        })
+        && smpl
+            .loops
+            .iter()
+            .skip(1)
+            .all(|l| l.start as usize <= e.end && l.end as usize <= e.end)
 }
 
 /// The complete WAV file for `doc` edited by `e` (spec §6.5–6.6). `e` is clamped to the
@@ -131,9 +235,21 @@ fn edited_smpl(doc: &WavDocument, init: &EditState, e: &EditState) -> Smpl {
 pub fn build_wav_bytes(doc: &WavDocument, e: &EditState) -> Vec<u8> {
     let e = e.clone().clamped(doc.frames);
     let init = doc.initial_edit();
-    let mut smpl = (doc.smpl.is_some() || tuning_or_loop_changed(&init, &e))
-        .then(|| edited_smpl(doc, &init, &e).to_bytes());
-    let mut data = Some(edited_data(doc, &e));
+    let mut smpl = (!smpl_unchanged(doc, &init, &e)
+        && (doc.smpl.is_some() || tuning_or_loop_changed(&init, &e)))
+    .then(|| edited_smpl(doc, &init, &e).to_bytes());
+    let audio = process(&doc.audio, &e.effects);
+    // `fmt ` is rewritten only when the effects changed the channel count.
+    let mut new_fmt = u16::try_from(audio.len())
+        .ok()
+        .filter(|&n| n != doc.format.channels)
+        .zip(find(&doc.riff.chunks, b"fmt "))
+        .map(|(n, i)| fmt_with_channels(&doc.riff.chunks[i].data, n));
+    let format = new_fmt
+        .as_deref()
+        .and_then(|bytes| parse_fmt(bytes).ok())
+        .unwrap_or(doc.format);
+    let mut data = Some(edited_data(doc, &e, audio, &format));
     let mut data_at = None;
     let mut smpl_seen = false;
 
@@ -141,6 +257,12 @@ pub fn build_wav_bytes(doc: &WavDocument, e: &EditState) -> Vec<u8> {
     for c in &doc.riff.chunks {
         let mut c = c.clone();
         match &c.id {
+            // Only the first `fmt ` (the one in use) is rewritten, and only for a new layout.
+            b"fmt " => {
+                if let Some(bytes) = new_fmt.take() {
+                    c.data = bytes;
+                }
+            }
             b"cue " => continue,
             b"LIST" if list_type(&c) == Some(*b"adtl") => continue,
             // Only the first `data` chunk is the audio; later duplicates pass through.
@@ -333,10 +455,12 @@ mod tests {
     use super::*;
     use crate::document::{load_wav, load_wav_bytes};
     use crate::edit::FadeShape;
+    use crate::effects::{AppliedEffect, Effect, Op, mirror_edit, plan_effect, process};
     use crate::meta::info_get;
+    use crate::render::render;
     use crate::riff::{find, parse_riff};
     use crate::testwav::{sine, wav_bytes};
-    use crate::wav::SampleFormat;
+    use crate::wav::{SampleFormat, decode, parse_fmt};
 
     const RATE: u32 = 44100;
     const FRAMES: usize = 4000;
@@ -1026,6 +1150,333 @@ mod tests {
         assert_eq!((s.loops[0].start, s.loops[0].end), (100, 500));
     }
 
+    /// `e` with `effect` planned on the audio of `d` and pushed onto its effects.
+    fn with_effect(
+        d: &WavDocument,
+        mut e: EditState,
+        effect: Effect,
+        selection: Option<(usize, usize)>,
+    ) -> EditState {
+        let a = plan_effect(effect, &d.audio, &e, selection).unwrap();
+        e.effects.push(a);
+        e
+    }
+
+    /// A 32-bit file whose samples are noise in every byte (below half scale).
+    fn noisy_32bit(channels: &[Vec<f32>]) -> Vec<u8> {
+        let mut riff = parse_riff(&wav_bytes(
+            channels,
+            RATE,
+            SampleFormat::Int { bits: 32 },
+            vec![],
+        ))
+        .unwrap();
+        let data_idx = find(&riff.chunks, b"data").unwrap();
+        let mut seed = 0x1234_5678u32;
+        for sample in riff.chunks[data_idx].data.chunks_exact_mut(4) {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            sample.copy_from_slice(&(seed as i32 / 2).to_le_bytes());
+        }
+        write_riff(&riff)
+    }
+
+    fn u32_at(d: &[u8], at: usize) -> u32 {
+        u32::from_le_bytes(d[at..at + 4].try_into().unwrap())
+    }
+
+    fn fmt_of(bytes: &[u8]) -> Vec<u8> {
+        let c = chunks(bytes);
+        c[find(&c, b"fmt ").unwrap()].data.clone()
+    }
+
+    fn stereo_file() -> Vec<u8> {
+        let audio = vec![
+            sine(441.0, RATE, FRAMES, 0.8),
+            sine(330.0, RATE, FRAMES, 0.4),
+        ];
+        wav_bytes(&audio, RATE, I16, vec![])
+    }
+
+    const LSB: f32 = 1.0 / 32768.0 + 1e-6;
+
+    #[test]
+    fn effects_are_written_and_untouched_frames_keep_their_bytes() {
+        let bytes = noisy_32bit(&[
+            sine(441.0, RATE, FRAMES, 0.8),
+            sine(330.0, RATE, FRAMES, 0.5),
+        ]);
+        let d = doc(&bytes);
+        let e = with_effect(
+            &d,
+            d.initial_edit(),
+            Effect::Gain { db: -6.0 },
+            Some((100, 199)),
+        );
+        let orig = data_of(&bytes);
+        let data = data_of(&build_wav_bytes(&d, &e));
+        let stride = 8;
+        let (from, to) = (100 * stride, 200 * stride);
+        assert_eq!(data.len(), orig.len());
+        assert_eq!(data[..from], orig[..from]);
+        assert_eq!(data[to..], orig[to..]);
+
+        let gain = 10f32.powf(-6.0 / 20.0);
+        assert!((gain - 0.501).abs() < 1e-3);
+        let before = decode(&orig, &d.format);
+        let after = decode(&data, &d.format);
+        for (b, a) in before.iter().zip(&after) {
+            for i in 100..200 {
+                assert!((a[i] - gain * b[i]).abs() < 1e-6, "frame {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn overlapping_effect_ranges_leave_everything_else_alone() {
+        let bytes = noisy_32bit(&[sine(441.0, RATE, FRAMES, 0.8)]);
+        let d = doc(&bytes);
+        let e = with_effect(
+            &d,
+            d.initial_edit(),
+            Effect::Gain { db: -6.0 },
+            Some((100, 199)),
+        );
+        let e = with_effect(&d, e, Effect::Invert, Some((150, 249)));
+        let orig = data_of(&bytes);
+        let data = data_of(&build_wav_bytes(&d, &e));
+        assert_eq!(data[..100 * 4], orig[..100 * 4]);
+        assert_eq!(data[250 * 4..], orig[250 * 4..]);
+        let want = process(&d.audio, &e.effects);
+        let got = decode(&data, &d.format);
+        for i in 100..250 {
+            assert!((got[0][i] - want[0][i]).abs() < 1e-6, "frame {i}");
+        }
+    }
+
+    #[test]
+    fn effects_then_crossfade_then_trim() {
+        let d = doc(&file(vec![], vec![]));
+        let e = EditState {
+            crossfade: 50,
+            start: 200,
+            ..looped(&d, 1000, 1999)
+        };
+        let e = with_effect(&d, e, Effect::Invert, None).clamped(d.frames);
+        assert_eq!(e.crossfade, 50);
+
+        let rendered = render(&process(&d.audio, &e.effects), &e);
+        assert_ne!(rendered, d.audio, "the test must change the audio");
+        let want = &rendered[0][e.start..=e.end];
+        let got = decode(&data_of(&build_wav_bytes(&d, &e)), &d.format);
+        assert_eq!(got[0].len(), want.len());
+        for (i, (g, w)) in got[0].iter().zip(want).enumerate() {
+            // The equal-power crossfade of two near-identical waves can clip.
+            let w = w.clamp(-1.0, 32767.0 / 32768.0);
+            assert!((g - w).abs() <= LSB, "frame {i}: {g} vs {w}");
+        }
+    }
+
+    #[test]
+    fn stereo_to_mono_rewrites_fmt() {
+        let d = doc(&stereo_file());
+        let e = with_effect(&d, d.initial_edit(), Effect::StereoToMono, None);
+        let out = build_wav_bytes(&d, &e);
+
+        let f = parse_fmt(&fmt_of(&out)).unwrap();
+        assert_eq!((f.channels, f.block_align), (1, 2));
+        assert_eq!(u32_at(&fmt_of(&out), 8), RATE * 2);
+        let back = doc(&out);
+        assert_eq!(back.frames, FRAMES);
+        assert_eq!(back.audio.len(), 1);
+        for i in 0..FRAMES {
+            let avg = (d.audio[0][i] + d.audio[1][i]) / 2.0;
+            assert!((back.audio[0][i] - avg).abs() <= LSB, "frame {i}");
+        }
+    }
+
+    #[test]
+    fn mono_to_stereo_rewrites_fmt() {
+        let d = doc(&file(vec![], vec![]));
+        let e = with_effect(&d, d.initial_edit(), Effect::MonoToStereo, None);
+        let out = build_wav_bytes(&d, &e);
+
+        let f = parse_fmt(&fmt_of(&out)).unwrap();
+        assert_eq!((f.channels, f.block_align), (2, 4));
+        assert_eq!(u32_at(&fmt_of(&out), 8), RATE * 4);
+        let back = doc(&out);
+        assert_eq!(back.frames, FRAMES);
+        assert_eq!(back.audio.len(), 2);
+        assert_eq!(back.audio[0], d.audio[0]);
+        assert_eq!(back.audio[1], d.audio[0]);
+    }
+
+    #[test]
+    fn channel_change_with_trim_and_crossfade_stays_aligned() {
+        let d = doc(&stereo_file());
+        let e = EditState {
+            start: 100,
+            end: 3000,
+            crossfade: 20,
+            ..looped(&d, 1000, 2000)
+        };
+        let e = with_effect(&d, e, Effect::StereoToMono, None);
+        let rendered = render(&process(&d.audio, &e.effects), &e);
+        let back = doc(&build_wav_bytes(&d, &e));
+        assert_eq!(back.audio.len(), 1);
+        assert_eq!(back.frames, 2901);
+        for (i, v) in back.audio[0].iter().enumerate() {
+            assert!((v - rendered[0][100 + i]).abs() <= LSB, "frame {i}");
+        }
+    }
+
+    #[test]
+    fn extensible_channel_change_rewrites_the_mask() {
+        let mut riff = parse_riff(&wav_bytes(
+            &[
+                sine(441.0, RATE, FRAMES, 0.8),
+                sine(330.0, RATE, FRAMES, 0.4),
+            ],
+            RATE,
+            SampleFormat::Int { bits: 24 },
+            vec![],
+        ))
+        .unwrap();
+        let mut fmt = Vec::new();
+        fmt.extend_from_slice(&0xFFFEu16.to_le_bytes());
+        fmt.extend_from_slice(&2u16.to_le_bytes());
+        fmt.extend_from_slice(&RATE.to_le_bytes());
+        fmt.extend_from_slice(&(RATE * 6).to_le_bytes());
+        fmt.extend_from_slice(&6u16.to_le_bytes());
+        fmt.extend_from_slice(&24u16.to_le_bytes());
+        fmt.extend_from_slice(&22u16.to_le_bytes()); // cbSize
+        fmt.extend_from_slice(&24u16.to_le_bytes()); // valid bits
+        fmt.extend_from_slice(&3u32.to_le_bytes()); // channel mask
+        fmt.extend_from_slice(&[
+            0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38,
+            0x9B, 0x71,
+        ]);
+        assert_eq!(fmt.len(), 40);
+        let i = find(&riff.chunks, b"fmt ").unwrap();
+        riff.chunks[i].data = fmt.clone();
+        let d = doc(&write_riff(&riff));
+        assert_eq!(d.format.channels, 2);
+
+        let e = with_effect(&d, d.initial_edit(), Effect::StereoToMono, None);
+        let out = build_wav_bytes(&d, &e);
+        let saved = fmt_of(&out);
+        assert_eq!(saved.len(), 40);
+        let f = parse_fmt(&saved).unwrap();
+        assert_eq!((f.channels, f.block_align), (1, 3));
+        assert_eq!(u32_at(&saved, 8), RATE * 3);
+        assert_eq!(u32_at(&saved, 20), 0x4);
+        assert_eq!(saved[24..], fmt[24..]);
+        let back = doc(&out);
+        assert_eq!((back.audio.len(), back.frames), (1, FRAMES));
+
+        // And back to stereo: the mask returns to front left and right.
+        let e2 = with_effect(&back, back.initial_edit(), Effect::MonoToStereo, None);
+        assert_eq!(u32_at(&fmt_of(&build_wav_bytes(&back, &e2)), 20), 0x3);
+    }
+
+    #[test]
+    fn reverse_whole_mirrors_extra_smpl_loops() {
+        let audio = vec![sine(441.0, RATE, 1000, 0.8)];
+        let bytes = wav_bytes(
+            &audio,
+            RATE,
+            I16,
+            vec![smpl_chunk(vec![fwd(100, 199), fwd(200, 300)])],
+        );
+        let d = doc(&bytes);
+        assert_eq!(d.frames, 1000);
+        let e = d.initial_edit();
+        let a = plan_effect(Effect::Reverse, &d.audio, &e, None).unwrap();
+        let mut e = mirror_edit(&e, a.first, a.last);
+        e.effects.push(a);
+
+        let out = build_wav_bytes(&d, &e);
+        let s = smpl_of(&out).unwrap();
+        assert_eq!(s.loops, vec![fwd(800, 899), fwd(699, 799)]);
+        let want: Vec<f32> = d.audio[0].iter().rev().copied().collect();
+        assert_eq!(doc(&out).audio[0], want);
+    }
+
+    #[test]
+    fn unchanged_smpl_is_kept_byte_for_byte() {
+        let original = Smpl {
+            manufacturer: 0x47,
+            product: 7,
+            sample_period: 12345,
+            unity_note: 60,
+            pitch_fraction: 0,
+            smpte_format: 0,
+            smpte_offset: 0,
+            loops: vec![
+                SmplLoop {
+                    cue_id: 7,
+                    ..fwd(2532, 2915)
+                },
+                fwd(3000, 3100),
+            ],
+            sampler_data: vec![1, 2, 3, 4],
+        }
+        .to_bytes();
+        let bytes = file(vec![chunk(b"smpl", original.clone())], vec![]);
+        let d = doc(&bytes);
+        let smpl_bytes = |e: &EditState| {
+            let c = chunks(&build_wav_bytes(&d, e));
+            c[find(&c, b"smpl").unwrap()].data.clone()
+        };
+        let init = d.initial_edit();
+        assert_eq!(smpl_bytes(&init), original);
+
+        // Effects, a tail trim and a crossfade do not touch the chunk.
+        let with_fx = with_effect(&d, init.clone(), Effect::Invert, None);
+        assert_eq!(smpl_bytes(&with_fx), original);
+        let tail = EditState {
+            end: 3500,
+            crossfade: 20,
+            ..init.clone()
+        };
+        assert_eq!(smpl_bytes(&tail), original);
+
+        // A moved loop end rebuilds it: the sample period is recomputed, the cue id reset.
+        let moved = EditState {
+            loop_end: 2900,
+            ..init.clone()
+        };
+        let rebuilt = smpl_bytes(&moved);
+        assert_ne!(rebuilt, original);
+        let s = Smpl::parse(&rebuilt).unwrap();
+        assert_eq!(s.sample_period, sample_period(RATE));
+        assert_eq!(s.loops[0], fwd(2532, 2900));
+
+        // So do a new root, a head trim, a mirroring reverse and an extra loop cut off.
+        let rooted = EditState {
+            root: 61,
+            ..init.clone()
+        };
+        assert_ne!(smpl_bytes(&rooted), original);
+        let head = EditState {
+            start: 10,
+            ..init.clone()
+        };
+        assert_ne!(smpl_bytes(&head), original);
+        let mut mirrored = init.clone();
+        mirrored.effects.push(AppliedEffect {
+            op: Op::Reverse {
+                mirror_markers: true,
+            },
+            first: 0,
+            last: 10,
+        });
+        assert_ne!(smpl_bytes(&mirrored), original);
+        let cut = EditState { end: 2915, ..init };
+        let s = Smpl::parse(&smpl_bytes(&cut)).unwrap();
+        assert_eq!(s.loops.len(), 1);
+        assert_eq!(s.loops[0].cue_id, 0);
+    }
+
     #[test]
     fn wild_edit_states_never_panic() {
         let d = doc(&file(vec![smpl_chunk(vec![fwd(2532, 2915)])], vec![]));
@@ -1053,6 +1504,26 @@ mod tests {
         for e in &wild {
             assert!(load_wav_bytes(PathBuf::from("y.wav"), &build_wav_bytes(&d, e)).is_ok());
         }
+
+        // Hand-made effects with ranges far outside the file, inverted or in the wrong channel
+        // count are clamped or ignored.
+        let mut e = d.initial_edit();
+        for (first, last) in [(usize::MAX, usize::MAX), (500, 100), (3999, usize::MAX)] {
+            e.effects.push(AppliedEffect {
+                op: Op::Invert,
+                first,
+                last,
+            });
+        }
+        for op in [Op::SwapChannels, Op::MonoToStereo, Op::StereoToMono] {
+            e.effects.push(AppliedEffect {
+                op,
+                first: 7,
+                last: 3,
+            });
+        }
+        let out = doc(&build_wav_bytes(&d, &e));
+        assert_eq!((out.frames, out.audio.len()), (FRAMES, 1));
 
         let empty = wav_bytes(&[Vec::new()], RATE, I16, vec![]);
         let d = doc(&empty);

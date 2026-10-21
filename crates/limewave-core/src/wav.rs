@@ -112,6 +112,34 @@ pub fn frame_stride(fmt: &WavFormat) -> usize {
     usize::from(fmt.block_align).max(usize::from(fmt.channels) * bytes_per_sample(fmt.format))
 }
 
+/// A copy of the `fmt ` payload `fmt` for `channels` channels: the channel count, the block
+/// align (`channels` × container bytes) and the byte rate (`rate` × block align) are updated.
+/// An extensible chunk (tag 0xFFFE, at least 24 bytes) also gets the channel mask for 1 channel
+/// (`0x4`, front centre) or 2 (`0x3`, front left and right). A payload shorter than 16 bytes
+/// is returned unchanged.
+pub fn fmt_with_channels(fmt: &[u8], channels: u16) -> Vec<u8> {
+    let mut out = fmt.to_vec();
+    if out.len() < 16 {
+        return out;
+    }
+    let block_align = channels.saturating_mul(u16_at(&out, 14) / 8);
+    let byte_rate = u32_at(&out, 4).saturating_mul(u32::from(block_align));
+    out[2..4].copy_from_slice(&channels.to_le_bytes());
+    out[8..12].copy_from_slice(&byte_rate.to_le_bytes());
+    out[12..14].copy_from_slice(&block_align.to_le_bytes());
+    if u16_at(&out, 0) == TAG_EXTENSIBLE && out.len() >= 24 {
+        let mask = match channels {
+            1 => Some(0x4u32),
+            2 => Some(0x3),
+            _ => None,
+        };
+        if let Some(mask) = mask {
+            out[20..24].copy_from_slice(&mask.to_le_bytes());
+        }
+    }
+    out
+}
+
 /// Reads one sample from exactly `bytes_per_sample` bytes of a supported format.
 fn decode_sample(b: &[u8], format: SampleFormat) -> f32 {
     match format {
@@ -323,5 +351,53 @@ mod tests {
         assert_eq!(f.format, SampleFormat::Int { bits: 16 });
         let d = &riff.chunks[find(&riff.chunks, b"data").unwrap()].data;
         assert_eq!(decode(d, &f)[0].len(), 100);
+    }
+
+    /// A 40-byte extensible `fmt ` chunk for PCM with the given channel mask.
+    fn extensible_fmt(channels: u16, bits: u16, mask: u32) -> Vec<u8> {
+        let mut d = fmt_chunk(0xFFFE, channels, bits);
+        d.extend_from_slice(&22u16.to_le_bytes()); // cbSize
+        d.extend_from_slice(&bits.to_le_bytes()); // wValidBitsPerSample
+        d.extend_from_slice(&mask.to_le_bytes());
+        d.extend_from_slice(&[
+            0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38,
+            0x9B, 0x71,
+        ]);
+        d
+    }
+
+    #[test]
+    fn fmt_with_channels_plain_layout() {
+        let original = fmt_chunk(1, 2, 16);
+        let mono = fmt_with_channels(&original, 1);
+        assert_eq!(mono, fmt_chunk(1, 1, 16));
+        let f = parse_fmt(&mono).unwrap();
+        assert_eq!((f.channels, f.block_align), (1, 2));
+        assert_eq!(u32_at(&mono, 8), 44100 * 2);
+
+        // Round trip, and a float format keeps its tag.
+        assert_eq!(fmt_with_channels(&mono, 2), original);
+        let float = fmt_with_channels(&fmt_chunk(3, 1, 32), 2);
+        assert_eq!(float, fmt_chunk(3, 2, 32));
+    }
+
+    #[test]
+    fn fmt_with_channels_extensible_layout() {
+        let stereo = extensible_fmt(2, 24, 3);
+        let mono = fmt_with_channels(&stereo, 1);
+        assert_eq!(mono, extensible_fmt(1, 24, 4));
+        let f = parse_fmt(&mono).unwrap();
+        assert_eq!((f.channels, f.block_align), (1, 3));
+        assert_eq!(u32_at(&mono, 8), 44100 * 3);
+        assert_eq!(u32_at(&mono, 20), 0x4);
+
+        assert_eq!(fmt_with_channels(&mono, 2), stereo);
+        // The sub-format GUID and everything after the mask are untouched.
+        assert_eq!(mono[24..], stereo[24..]);
+    }
+
+    #[test]
+    fn fmt_with_channels_leaves_a_short_chunk_alone() {
+        assert_eq!(fmt_with_channels(&[1, 0, 2], 1), vec![1, 0, 2]);
     }
 }
