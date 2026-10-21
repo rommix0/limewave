@@ -401,28 +401,71 @@ pub fn map_range(effects: &[AppliedEffect], first: usize, last: usize) -> Option
     Some((lo, hi))
 }
 
-/// The synthetic range of every splice in `effects`, in the coordinates after the last step:
-/// each is placed at its splice's start and mapped through the later steps with [`map_range`].
-/// Ranges that nothing survives of are left out.
+/// The synthetic frames of every splice in `effects`, in the coordinates after the last step,
+/// as sorted inclusive ranges with touching ones merged. Each splice's range is placed at the
+/// splice's start and follows the audio through the later steps: every reverse mirrors the
+/// part of it inside the reversed block, and later splices clip and shift it as in
+/// [`map_range`]. Parts that nothing survives of are left out.
 pub fn generated_ranges(effects: &[AppliedEffect]) -> Vec<(usize, usize)> {
-    effects
+    let mut ranges: Vec<(usize, usize)> = effects
         .iter()
         .enumerate()
-        .filter_map(|(i, a)| {
-            let Op::Splice(s) = &a.op else {
-                return None;
+        .flat_map(|(i, a)| {
+            let start = match &a.op {
+                Op::Splice(s) => {
+                    let (g0, g1) = s.generated;
+                    (a.first <= a.last && g0 <= g1 && g1 < frame_count(&s.audio))
+                        .then(|| (a.first.saturating_add(g0), a.first.saturating_add(g1)))
+                }
+                _ => None,
             };
-            let (g0, g1) = s.generated;
-            if a.first > a.last || g0 > g1 || g1 >= frame_count(&s.audio) {
-                return None;
-            }
-            map_range(
-                &effects[i + 1..],
-                a.first.saturating_add(g0),
-                a.first.saturating_add(g1),
-            )
+            effects[i + 1..]
+                .iter()
+                .fold(Vec::from_iter(start), |parts, a| follow_audio(a, parts))
         })
-        .collect()
+        .collect();
+    ranges.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for (first, last) in ranges {
+        match merged.last_mut() {
+            // Overlapping or touching the previous range.
+            Some(prev) if first <= prev.1.saturating_add(1) => prev.1 = prev.1.max(last),
+            _ => merged.push((first, last)),
+        }
+    }
+    merged
+}
+
+/// Where the ranges of audio frames `parts` land after step `a`. A reverse, whether or not
+/// it mirrors the markers, splits a range at its block and mirrors the part inside; a splice
+/// clips and shifts it as in [`map_range`]; other steps leave the frames where they are.
+fn follow_audio(a: &AppliedEffect, parts: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    match a.op {
+        Op::Reverse { .. } if a.first <= a.last => {
+            let (r0, r1) = (a.first, a.last);
+            let mut out = Vec::with_capacity(parts.len());
+            for (lo, hi) in parts {
+                if hi < r0 || lo > r1 {
+                    out.push((lo, hi));
+                    continue;
+                }
+                if lo < r0 {
+                    out.push((lo, r0 - 1));
+                }
+                let (in0, in1) = (lo.max(r0), hi.min(r1));
+                out.push((r1 - (in1 - r0), r1 - (in0 - r0)));
+                if hi > r1 {
+                    out.push((r1 + 1, hi));
+                }
+            }
+            out
+        }
+        Op::Splice(_) => parts
+            .into_iter()
+            .filter_map(|(lo, hi)| map_range(std::slice::from_ref(a), lo, hi))
+            .collect(),
+        _ => parts,
+    }
 }
 
 /// The edit state after a marker-mirroring reverse of `first..=last`: the loop points swap
@@ -1022,8 +1065,46 @@ mod tests {
         };
         assert_eq!(
             generated_ranges(&[tail, spectrum]),
-            vec![(820, 919), (200, 499)]
+            vec![(200, 499), (820, 919)]
         );
+    }
+
+    /// A tail over 900..=999 of a 1000-frame file, 600 frames long with 20..=119 generated,
+    /// so the tint is 920..=1019 of 1500 frames.
+    fn tinted_tail() -> AppliedEffect {
+        AppliedEffect {
+            op: Op::Splice(Arc::new(Splice {
+                kind: SpliceKind::Tail,
+                audio: vec![vec![0.0; 600]],
+                generated: (20, 119),
+            })),
+            first: 900,
+            last: 999,
+        }
+    }
+
+    fn reverse(mirror_markers: bool, first: usize, last: usize) -> AppliedEffect {
+        AppliedEffect {
+            op: Op::Reverse { mirror_markers },
+            first,
+            last,
+        }
+    }
+
+    #[test]
+    fn generated_ranges_follow_a_partial_marker_reverse() {
+        // 920..=999 is reversed to 0..=79; 1000..=1019 lies outside and stays.
+        let effects = [tinted_tail(), reverse(true, 0, 999)];
+        assert_eq!(generated_ranges(&effects), vec![(0, 79), (1000, 1019)]);
+    }
+
+    #[test]
+    fn generated_ranges_follow_a_selection_reverse() {
+        let effects = [tinted_tail(), reverse(false, 900, 1499)];
+        assert_eq!(generated_ranges(&effects), vec![(1380, 1479)]);
+        // Parts that land next to each other are merged.
+        let effects = [tinted_tail(), reverse(false, 1000, 1019)];
+        assert_eq!(generated_ranges(&effects), vec![(920, 1019)]);
     }
 
     #[test]
