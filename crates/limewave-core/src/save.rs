@@ -71,8 +71,8 @@ fn tuning_or_loop_changed(init: &EditState, e: &EditState) -> bool {
 /// The `smpl` chunk for `e` (clamped), keeping the original's other fields and those of
 /// its extra loops that lie inside the trim range (shifted by `-e.start`).
 ///
-/// Loop 0 is type 0 (forward) or 1 (ping-pong), except that an original backward or
-/// unknown type (2 and up, shown as forward) is kept while the loop mode and points
+/// Loop 0 is type 0 (forward), 1 (ping-pong) or 2 (backward), except that an original
+/// unknown type (3 and up, shown as forward) is kept while the loop mode and points
 /// are unchanged from `init`.
 fn edited_smpl(doc: &WavDocument, init: &EditState, e: &EditState) -> Smpl {
     let mut s = doc.smpl.clone().unwrap_or(Smpl {
@@ -95,11 +95,12 @@ fn edited_smpl(doc: &WavDocument, init: &EditState, e: &EditState) -> Smpl {
         .loops
         .first()
         .map(|l| l.loop_type)
-        .filter(|t| *t >= 2 && loop_unchanged);
+        .filter(|t| *t >= 3 && loop_unchanged);
     let first = match e.loop_mode {
         LoopMode::Off => None,
         LoopMode::Forward => Some(kept_type.unwrap_or(0)),
         LoopMode::PingPong => Some(kept_type.unwrap_or(1)),
+        LoopMode::Backward => Some(kept_type.unwrap_or(2)),
     }
     .map(|loop_type| SmplLoop {
         cue_id: 0,
@@ -958,59 +959,71 @@ mod tests {
     }
 
     #[test]
-    fn backward_and_unknown_loop_types_kept_until_loop_edited() {
+    fn unknown_loop_type_kept_until_loop_edited() {
         let tag = software_tag();
-        for original_type in [2, 7] {
-            let bytes = file(
-                vec![
-                    smpl_chunk(vec![SmplLoop {
-                        loop_type: original_type,
-                        ..fwd(2532, 2915)
-                    }]),
-                    info(&[(b"ISFT", &tag)]),
-                ],
-                vec![],
-            );
-            let d = doc(&bytes);
-            let init = d.initial_edit();
-            assert_eq!(build_wav_bytes(&d, &init), bytes, "type {original_type}");
+        let bytes = file(
+            vec![
+                smpl_chunk(vec![SmplLoop {
+                    loop_type: 5,
+                    ..fwd(2532, 2915)
+                }]),
+                info(&[(b"ISFT", &tag)]),
+            ],
+            vec![],
+        );
+        let d = doc(&bytes);
+        let init = d.initial_edit();
+        assert_eq!(build_wav_bytes(&d, &init), bytes);
 
-            let trimmed = EditState {
-                start: 1000,
-                ..init.clone()
-            };
-            let s = smpl_of(&build_wav_bytes(&d, &trimmed)).unwrap();
-            let want = SmplLoop {
-                loop_type: original_type,
-                ..fwd(1532, 1915)
-            };
-            assert_eq!(s.loops, vec![want]);
+        let trimmed = EditState {
+            start: 1000,
+            ..init.clone()
+        };
+        let s = smpl_of(&build_wav_bytes(&d, &trimmed)).unwrap();
+        let want = SmplLoop {
+            loop_type: 5,
+            ..fwd(1532, 1915)
+        };
+        assert_eq!(s.loops, vec![want]);
 
-            let moved = EditState {
-                loop_start: 2600,
-                ..init.clone()
-            };
-            let s = smpl_of(&build_wav_bytes(&d, &moved)).unwrap();
-            assert_eq!(s.loops, vec![fwd(2600, 2915)]);
+        let moved = EditState {
+            loop_end: 2900,
+            ..init.clone()
+        };
+        let s = smpl_of(&build_wav_bytes(&d, &moved)).unwrap();
+        assert_eq!(s.loops, vec![fwd(2532, 2900)]);
 
-            let pingpong = EditState {
-                loop_mode: LoopMode::PingPong,
-                ..init.clone()
-            };
-            let s = smpl_of(&build_wav_bytes(&d, &pingpong)).unwrap();
-            assert_eq!(s.loops[0].loop_type, 1);
+        let pingpong = EditState {
+            loop_mode: LoopMode::PingPong,
+            ..init.clone()
+        };
+        let s = smpl_of(&build_wav_bytes(&d, &pingpong)).unwrap();
+        assert_eq!(s.loops[0].loop_type, 1);
 
-            let off = EditState {
-                loop_mode: LoopMode::Off,
-                ..init
-            };
-            assert!(
-                smpl_of(&build_wav_bytes(&d, &off))
-                    .unwrap()
-                    .loops
-                    .is_empty()
-            );
-        }
+        let off = EditState {
+            loop_mode: LoopMode::Off,
+            ..init
+        };
+        assert!(
+            smpl_of(&build_wav_bytes(&d, &off))
+                .unwrap()
+                .loops
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn backward_loop_written_as_type_2() {
+        let d = doc(&file(vec![smpl_chunk(vec![fwd(100, 500)])], vec![]));
+        let init = d.initial_edit();
+        assert_eq!(init.loop_mode, LoopMode::Forward);
+        let e = EditState {
+            loop_mode: LoopMode::Backward,
+            ..init
+        };
+        let s = smpl_of(&build_wav_bytes(&d, &e)).unwrap();
+        assert_eq!(s.loops[0].loop_type, 2);
+        assert_eq!((s.loops[0].start, s.loops[0].end), (100, 500));
     }
 
     #[test]

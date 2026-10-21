@@ -1,6 +1,6 @@
 //! Loop crossfade rendering and seam data for the loop-boundary views.
 
-use crate::edit::{EditState, FadeShape};
+use crate::edit::{EditState, FadeShape, LoopMode};
 
 /// `(out_gain, in_gain)` for crossfade frame `i` of `n`, with `t = (i + 1) / n`.
 pub fn fade_gains(shape: FadeShape, i: usize, n: usize) -> (f32, f32) {
@@ -17,10 +17,13 @@ pub fn fade_gains(shape: FadeShape, i: usize, n: usize) -> (f32, f32) {
 /// The crossfaded replacement for the frames ending at `loop_end`, as
 /// `(first_frame, replacement_frames_per_channel)`.
 ///
-/// `None` when the loop is off, the effective length `min(crossfade, max_crossfade)` is zero,
-/// or the loop does not fit inside the audio. For `i in 0..N`:
-/// `y[i] = out * x[loop_end - N + 1 + i] + in * x[loop_start - N + i]`.
+/// `None` when the loop is off or backward (a backward loop is never crossfaded), the
+/// effective length `min(crossfade, max_crossfade)` is zero, or the loop does not fit inside
+/// the audio. For `i in 0..N`: `y[i] = out * x[loop_end - N + 1 + i] + in * x[loop_start - N + i]`.
 pub fn crossfade_region(audio: &[Vec<f32>], e: &EditState) -> Option<(usize, Vec<Vec<f32>>)> {
+    if e.loop_mode == LoopMode::Backward {
+        return None;
+    }
     let n = e.crossfade.min(e.max_crossfade());
     let frames = audio.iter().map(Vec::len).min()?;
     if n == 0 || e.loop_end >= frames {
@@ -88,6 +91,22 @@ pub fn seam_data(x: &[f32], loop_start: usize, loop_end: usize, half: usize) -> 
         natural_step: x.get(loop_end + 1).map(|next| next - x[loop_end]),
     }
 }
+
+/// Seam data for a backward loop on one channel, in playback order: the loop plays from
+/// `loop_end` down to `loop_start`, then wraps back to `loop_end`.
+///
+/// This is `seam_data` on the time-reversed signal; empty with zero jump when the points are
+/// invalid for `x`. Here `jump` is `x[loop_end] - x[loop_start]` and `natural_step` is
+/// `x[loop_start - 1] - x[loop_start]` when that sample exists.
+pub fn seam_data_backward(x: &[f32], loop_start: usize, loop_end: usize, half: usize) -> SeamData {
+    if x.is_empty() || loop_end >= x.len() || loop_start > loop_end {
+        return SeamData::default();
+    }
+    let reversed: Vec<f32> = x.iter().rev().copied().collect();
+    let last = x.len() - 1;
+    seam_data(&reversed, last - loop_end, last - loop_start, half)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -186,6 +205,45 @@ mod tests {
             }
         }
         assert_ne!(rep[0], rep[1]);
+    }
+
+    #[test]
+    fn crossfade_none_for_backward_loops() {
+        let audio = vec![sine(441.0, 44100, 2000, 0.5)];
+        let mut e = looped(2000, 500, 1000, 100, FadeShape::EqualPower);
+        e.loop_mode = LoopMode::Backward;
+        assert!(crossfade_region(&audio, &e).is_none());
+        assert_eq!(render(&audio, &e), audio);
+        assert_eq!(e.clone().clamped(2000).crossfade, 100);
+    }
+
+    #[test]
+    fn backward_seam_data_known_values() {
+        let x: Vec<f32> = (0..100).map(|i| i as f32).collect();
+        let s = seam_data_backward(&x, 20, 60, 4);
+        assert_eq!(s.before_end, [23.0, 22.0, 21.0, 20.0]);
+        assert_eq!(s.after_start, [60.0, 59.0, 58.0, 57.0]);
+        assert_eq!(s.ghost_before_start, [64.0, 63.0, 62.0, 61.0]);
+        assert_eq!(s.ghost_after_end, [19.0, 18.0, 17.0, 16.0]);
+        assert_eq!(s.jump, 40.0);
+        assert_eq!(s.natural_step, Some(-1.0));
+    }
+
+    #[test]
+    fn backward_seam_at_file_start() {
+        let x: Vec<f32> = (0..100).map(|i| i as f32).collect();
+        let s = seam_data_backward(&x, 0, 60, 4);
+        assert!(s.ghost_after_end.is_empty());
+        assert_eq!(s.natural_step, None);
+        assert_eq!(s.before_end, [3.0, 2.0, 1.0, 0.0]);
+    }
+
+    #[test]
+    fn backward_seam_guards_bad_input() {
+        let x = [0.0f32; 10];
+        assert_eq!(seam_data_backward(&[], 0, 0, 4), SeamData::default());
+        assert_eq!(seam_data_backward(&x, 2, 10, 4), SeamData::default());
+        assert_eq!(seam_data_backward(&x, 5, 3, 4), SeamData::default());
     }
 
     #[test]

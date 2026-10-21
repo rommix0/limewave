@@ -52,6 +52,7 @@ fn loop_mode_text(m: LoopMode) -> &'static str {
         LoopMode::Off => "none",
         LoopMode::Forward => "forward",
         LoopMode::PingPong => "ping-pong",
+        LoopMode::Backward => "backward",
     }
 }
 

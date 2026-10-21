@@ -4,4 +4,8 @@ pub mod peaks;
 pub mod zerocross;
 
 pub use peaks::{PeakPyramid, mono_sum};
-pub use zerocross::{is_upward, nearest_upward, snap_loop_end, snap_loop_start, step_upward};
+pub use zerocross::{
+    Crossing, is_crossing, is_upward, loop_crossing, nearest_crossing, nearest_upward,
+    snap_loop_end, snap_loop_end_with, snap_loop_start, snap_loop_start_with, step_crossing,
+    step_upward,
+};

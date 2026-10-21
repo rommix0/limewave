@@ -110,10 +110,7 @@ fn derive_edit(frames: usize, smpl: Option<&Smpl>) -> (EditState, Vec<String>) {
     e.loop_mode = match l.loop_type {
         0 => LoopMode::Forward,
         1 => LoopMode::PingPong,
-        2 => {
-            warnings.push("backward loop shown as forward".into());
-            LoopMode::Forward
-        }
+        2 => LoopMode::Backward,
         other => {
             warnings.push(format!("unknown loop type {other} shown as forward"));
             LoopMode::Forward
@@ -223,16 +220,19 @@ mod tests {
     }
 
     #[test]
-    fn ping_pong_and_backward_loop_types() {
+    fn ping_pong_loop_type() {
         let doc = load(1000, vec![smpl_chunk(60, &[(1, 100, 500)])]).unwrap();
         assert_eq!(doc.initial_edit().loop_mode, LoopMode::PingPong);
         assert!(doc.warnings.is_empty());
+    }
 
+    #[test]
+    fn backward_loop_type_reads_as_backward() {
         let doc = load(1000, vec![smpl_chunk(60, &[(2, 100, 500)])]).unwrap();
         let e = doc.initial_edit();
-        assert_eq!(e.loop_mode, LoopMode::Forward);
+        assert_eq!(e.loop_mode, LoopMode::Backward);
         assert_eq!((e.loop_start, e.loop_end), (100, 500));
-        assert_eq!(doc.warnings, vec!["backward loop shown as forward"]);
+        assert!(doc.warnings.is_empty());
     }
 
     #[test]

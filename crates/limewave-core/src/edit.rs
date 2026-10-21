@@ -6,6 +6,7 @@ pub enum LoopMode {
     Off,
     Forward,
     PingPong,
+    Backward,
 }
 
 /// Crossfade curve shape.
