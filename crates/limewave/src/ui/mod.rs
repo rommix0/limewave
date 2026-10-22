@@ -9,6 +9,7 @@ pub mod keyboard;
 pub mod keymap;
 pub mod new_dialog;
 pub mod overview;
+pub mod rate_dialog;
 pub mod record_panel;
 pub mod region_inspector;
 pub mod regions;

@@ -9,6 +9,7 @@ use limewave_core::wav::SampleFormat;
 
 use crate::app::{LimewaveApp, SELECT_ALL_SHORTCUT};
 use crate::theme::colors;
+use crate::ui::rate_dialog::RateDialogState;
 use crate::ui::spectrum_dialog::SpectrumDialogState;
 use crate::ui::tail_dialog::TailDialogState;
 
@@ -115,8 +116,8 @@ pub enum EffectDialog {
 }
 
 /// The toolbar's Effects menu. Gain, Normalize, the fades, Stereo to mono, Auto-trim,
-/// Generate tail and Make loop from spectrum open a dialog; the rest apply at once. A channel tool that does not fit the
-/// file is greyed out.
+/// Generate tail, Make loop from spectrum and Change sample rate open a dialog; the rest apply
+/// at once. A channel tool that does not fit the file is greyed out.
 pub fn effects_menu(ui: &mut egui::Ui, app: &mut LimewaveApp) {
     let loaded = app.selected_session().is_some();
     ui.menu_button("Effects", |ui| {
@@ -180,6 +181,14 @@ pub fn effects_menu(ui: &mut egui::Ui, app: &mut LimewaveApp) {
             .clicked()
         {
             app.ui.spectrum_dialog = Some(SpectrumDialogState::default());
+        }
+        ui.separator();
+        if ui
+            .add_enabled(loaded, Button::new("Change sample rate…"))
+            .on_hover_text("Convert the whole sample to another rate, keeping its pitch")
+            .clicked()
+        {
+            app.ui.rate_dialog = Some(RateDialogState::default());
         }
     });
 }

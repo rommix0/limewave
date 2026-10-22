@@ -51,6 +51,7 @@ use crate::ui::keyboard::{KeyEvent, keyboard_strip};
 use crate::ui::keymap::{KeyMapAction, key_map};
 use crate::ui::new_dialog::{BitDepth, NewDialogState, new_dialog};
 use crate::ui::overview::overview;
+use crate::ui::rate_dialog::{RateDialogState, rate_dialog};
 use crate::ui::record_panel::{NO_INPUT, RecordPanelState, record_panel};
 use crate::ui::region_inspector::{
     OWN_LOOP_NOTE, OWN_TUNING, RegionContext, RegionEdit, region_only,
@@ -637,6 +638,8 @@ pub struct UiState {
     pub tail_dialog: Option<TailDialogState>,
     /// The Make loop from spectrum… dialog, while it is open.
     pub spectrum_dialog: Option<SpectrumDialogState>,
+    /// The Change sample rate… dialog, while it is open.
+    pub rate_dialog: Option<RateDialogState>,
     /// The Record panel, while it is open (and with it the input device).
     pub record_panel: Option<RecordPanelState>,
     /// How long the dialogs wait after the last settings change before they render again
@@ -673,6 +676,7 @@ impl Default for UiState {
             new_dialog: None,
             tail_dialog: None,
             spectrum_dialog: None,
+            rate_dialog: None,
             record_panel: None,
             render_debounce: RENDER_DEBOUNCE,
         }
@@ -1743,8 +1747,8 @@ impl LimewaveApp {
         }
     }
 
-    /// True while a modal (unsaved prompt, save dialog, save results, the New, effect, tail
-    /// or spectrum-loop dialog, the Record panel) is up.
+    /// True while a modal (unsaved prompt, save dialog, save results, the New, effect, tail,
+    /// spectrum-loop or sample-rate dialog, the Record panel) is up.
     fn modal_open(&self) -> bool {
         self.pending.is_some()
             || self.ui.save_dialog.open
@@ -1753,6 +1757,7 @@ impl LimewaveApp {
             || self.ui.effect_dialog.is_some()
             || self.ui.tail_dialog.is_some()
             || self.ui.spectrum_dialog.is_some()
+            || self.ui.rate_dialog.is_some()
             || self.ui.record_panel.is_some()
     }
 
@@ -1791,6 +1796,7 @@ impl LimewaveApp {
         // The render dialogs belong to the file they were opened for.
         let tail = self.ui.tail_dialog.take().is_some();
         let spectrum = self.ui.spectrum_dialog.take().is_some();
+        self.ui.rate_dialog = None;
         if tail || spectrum {
             self.end_preview();
         }
@@ -2312,6 +2318,10 @@ impl LimewaveApp {
             self.drain_render(&mut d.render, block);
             self.ui.spectrum_dialog = Some(d);
         }
+        if let Some(mut d) = self.ui.rate_dialog.take() {
+            self.drain_render(&mut d.render, block);
+            self.ui.rate_dialog = Some(d);
+        }
     }
 
     fn drain_render<T>(&self, slot: &mut RenderSlot<T>, block: bool) {
@@ -2625,6 +2635,7 @@ impl LimewaveApp {
         effect_dialog(&ctx, self);
         tail_dialog(&ctx, self);
         spectrum_dialog(&ctx, self);
+        rate_dialog(&ctx, self);
         self.refresh_sfz_conflicts();
         if let Some(req) = save_dialog(&ctx, &mut self.ui.save_dialog, &self.files) {
             let results = match req.instrument {
@@ -4045,8 +4056,24 @@ mod tests {
         app.ui.spectrum_dialog = Some(SpectrumDialogState::default());
         assert!(app.modal_open());
         app.ui.spectrum_dialog = None;
+        app.ui.rate_dialog = Some(RateDialogState::default());
+        assert!(app.modal_open());
+        app.ui.rate_dialog = None;
         app.ui.new_dialog = Some(NewDialogState::default());
         assert!(app.modal_open());
+    }
+
+    #[test]
+    fn switching_files_closes_the_rate_dialog() {
+        let mut app = LimewaveApp::for_test();
+        app.files = vec![
+            FileEntry::Loaded(Box::new(short_session())),
+            FileEntry::Loaded(Box::new(short_session())),
+        ];
+        app.select(0);
+        app.ui.rate_dialog = Some(RateDialogState::default());
+        app.select(1);
+        assert!(app.ui.rate_dialog.is_none(), "closed");
     }
 
     #[test]
