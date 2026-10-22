@@ -245,6 +245,22 @@ impl Capture {
         self.frames() >= self.cap
     }
 
+    /// Drains, then says why the take must stop, if it must: the cap, then an overflow, then
+    /// a device error. A pending error is taken whenever it is seen, so it never outlives
+    /// the take it hit.
+    fn drain_and_check(&mut self, shared: &Shared) -> Option<StopReason> {
+        // Flags before draining, so the drain takes every block pushed before them.
+        let overflow = shared.overflow.load(Ordering::Acquire);
+        let error = lock(&shared.error).take();
+        if self.drain(shared) {
+            Some(StopReason::Cap)
+        } else if overflow {
+            Some(StopReason::Overflow)
+        } else {
+            error.map(StopReason::Device)
+        }
+    }
+
     /// One pass of the capture thread: drains, and stops the take on the cap, an overflow or
     /// a device error.
     fn tick(&mut self, shared: &Shared) {
@@ -255,20 +271,10 @@ impl Capture {
         if !self.active {
             return;
         }
-        // Flags before draining, so the drain takes every block pushed before them.
-        let overflow = shared.overflow.load(Ordering::Acquire);
-        let failed = lock(&shared.error).is_some();
-        let stopped = if self.drain(shared) {
-            StopReason::Cap
-        } else if overflow {
-            StopReason::Overflow
-        } else if failed {
-            StopReason::Device(lock(&shared.error).take().unwrap_or_default())
-        } else {
-            return;
-        };
-        let take = self.finish(shared, stopped);
-        self.finished = Some(take);
+        if let Some(stopped) = self.drain_and_check(shared) {
+            let take = self.finish(shared, stopped);
+            self.finished = Some(take);
+        }
     }
 
     fn finish(&mut self, shared: &Shared, stopped: StopReason) -> Take {
@@ -362,21 +368,23 @@ impl Recorder {
         self.shared.recording.store(true, Ordering::Release);
     }
 
-    /// Stops the take in progress and returns it, or `None` when it has no frames or none is
-    /// in progress. A take the thread already stopped by itself waits for [`Recorder::poll`].
+    /// Stops the take in progress and returns it, or `None` when none is in progress. A take
+    /// the thread already stopped by itself waits for [`Recorder::poll`].
+    ///
+    /// A pending cap, overflow or device error the thread has not acted on yet is the take's
+    /// reason, as in `poll`; such a take is returned even with no frames, so the reason is
+    /// shown. A plain `User` take with no frames is `None`.
     pub fn stop(&mut self) -> Option<Take> {
         self.shared.recording.store(false, Ordering::Release);
         let mut capture = lock(&self.capture);
         if !capture.active {
             return None;
         }
-        let stopped = if capture.drain(&self.shared) {
-            StopReason::Cap
-        } else {
-            StopReason::User
-        };
+        let stopped = capture
+            .drain_and_check(&self.shared)
+            .unwrap_or(StopReason::User);
         let take = capture.finish(&self.shared, stopped);
-        (take.frames() > 0).then_some(take)
+        (take.frames() > 0 || take.stopped != StopReason::User).then_some(take)
     }
 
     /// A take the capture thread stopped by itself (cap, overflow or device error), once. It
@@ -611,6 +619,46 @@ mod tests {
         let take = rec.stop().expect("a take");
         assert_eq!(take.stopped, StopReason::User, "no overflow");
         assert_eq!(take.audio, vec![index(0..5000)]);
+    }
+
+    #[test]
+    fn stop_reports_an_overflow_the_thread_has_not_seen() {
+        let (mut rec, mut feed) = Recorder::new(48_000, 2, Pair(0));
+        rec.pause_drain(true);
+        rec.start();
+        push_blocks(&mut feed, &ramp(0..400 * BLOCK), 2);
+        let take = rec.stop().expect("a take");
+        assert_eq!(take.stopped, StopReason::Overflow);
+        assert_eq!(take.audio[0], index(0..96_000));
+        rec.pause_drain(false);
+        assert!(rec.poll().is_none(), "the take is returned once");
+    }
+
+    #[test]
+    fn stop_reports_a_device_error_and_it_does_not_leak() {
+        let (mut rec, mut feed) = Recorder::new(48_000, 2, Pair(0));
+        rec.pause_drain(true);
+        rec.start();
+        push_blocks(&mut feed, &ramp(0..100), 2);
+        feed.errors().report("gone".into());
+        let take = rec.stop().expect("a take");
+        assert_eq!(take.stopped, StopReason::Device("gone".into()));
+        assert_eq!(take.audio[0], index(0..100));
+
+        // With no audio, the reason still comes back.
+        rec.start();
+        feed.errors().report("gone again".into());
+        let take = rec.stop().expect("a take with no frames");
+        assert_eq!(take.stopped, StopReason::Device("gone again".into()));
+        assert_eq!(take.frames(), 0);
+
+        rec.pause_drain(false);
+        rec.start();
+        push_blocks(&mut feed, &ramp(0..100), 2);
+        let take = rec.stop().expect("a take");
+        assert_eq!(take.stopped, StopReason::User);
+        assert_eq!(take.frames(), 100);
+        assert!(rec.poll().is_none());
     }
 
     #[test]
