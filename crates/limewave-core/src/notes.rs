@@ -47,6 +47,21 @@ pub fn parse_note(s: &str) -> Option<u8> {
     u8::try_from(n).ok().filter(|n| *n <= 127)
 }
 
+/// Frequency in Hz of a MIDI note in equal temperament (A4 = note 69 = 440 Hz).
+pub fn note_hz(n: u8) -> f64 {
+    440.0 * 2f64.powf((f64::from(n) - 69.0) / 12.0)
+}
+
+/// Whole number of frames in one cycle of a note at a sample rate, at least 1.
+pub fn cycle_frames(n: u8, rate: u32) -> usize {
+    (f64::from(rate) / note_hz(n)).round().max(1.0) as usize
+}
+
+/// Pitch error in cents of a `frames`-long cycle against the note's frequency.
+pub fn cycle_cents(n: u8, rate: u32, frames: usize) -> f64 {
+    1200.0 * (f64::from(rate) / (frames as f64 * note_hz(n))).log2()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -94,5 +109,18 @@ mod tests {
         for n in 0..=127u8 {
             assert_eq!(parse_note(&note_name(n)), Some(n));
         }
+    }
+
+    #[test]
+    fn note_frequencies_and_cycle_lengths() {
+        assert!((note_hz(69) - 440.0).abs() < 1e-9);
+        assert!((note_hz(60) - 261.625_565).abs() < 1e-5);
+        assert_eq!(cycle_frames(69, 44_100), 100);
+        assert_eq!(cycle_frames(60, 48_000), 183);
+        assert_eq!(cycle_frames(127, 8_000), 1);
+        let cents = cycle_cents(69, 44_100, 100);
+        let want = 1200.0 * (44_100.0f64 / (100.0 * 440.0)).log2();
+        assert!((cents - want).abs() < 0.1);
+        assert!(cents > 0.0, "100 frames is slightly sharp of A4");
     }
 }
