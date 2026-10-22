@@ -1220,6 +1220,10 @@ fn playback_one_shot_writes_loop_mode() {
     region_edits(&mut h, &[RegionEdit::Playback(Playback::OneShot)]);
     region_edits(&mut h, &[RegionEdit::Playback(Playback::Normal)]);
     assert_eq!(opcode(&h, 0, "loop_mode").unwrap().0, "loop_continuous");
+    assert!(
+        st(&h).binding.samples[0].follows[0],
+        "looping by its mode alone, it still follows the sample"
+    );
     let steps = st(&h).history.cursor();
     region_edits(&mut h, &[RegionEdit::Playback(Playback::Normal)]);
     assert_eq!(
