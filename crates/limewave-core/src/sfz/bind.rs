@@ -1,0 +1,663 @@
+//! Binding an instrument's regions to the WAVs they play, reading a region's
+//! tuning and loop as an edit state, and writing sample edits back.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+use super::model::{Instrument, Keycenter, Level, LoopDir, SfzLoopMode};
+use super::paths::{find_sample, same_file_key, sample_path};
+use super::write::format_number;
+use crate::edit::{EditState, LoopMode};
+
+/// One WAV and the regions that play it.
+#[derive(Clone, PartialEq, Debug)]
+pub struct SampleBinding {
+    /// The file found on disk.
+    pub path: PathBuf,
+    /// Region numbers using this file, in file order.
+    pub regions: Vec<usize>,
+    /// Parallel to `regions`: does the region follow the sample's tuning and
+    /// loop (true), or keep its own (spec 4.3)? `regions[0]` always follows.
+    pub follows: Vec<bool>,
+}
+
+/// Which WAV each region plays.
+#[derive(Clone, PartialEq, Debug)]
+pub struct Binding {
+    /// Distinct WAVs, in order of first use.
+    pub samples: Vec<SampleBinding>,
+    /// Region n -> index into `samples`; `None` when the region names no
+    /// sample or the file is missing.
+    pub region_sample: Vec<Option<usize>>,
+}
+
+/// Finds each region's WAV under `sfz_dir`. A file named two ways (other
+/// separators, other case) is one sample. Every region follows until
+/// [`complete`] says otherwise.
+pub fn bind(inst: &Instrument, sfz_dir: &Path) -> Binding {
+    let default_path = inst.default_path();
+    let mut samples: Vec<SampleBinding> = Vec::new();
+    let mut by_file: HashMap<String, usize> = HashMap::new();
+    let mut region_sample = Vec::new();
+    for region in 0..inst.regions().len() {
+        let found = inst
+            .region_info(region)
+            .sample
+            .and_then(|s| find_sample(&sample_path(sfz_dir, &default_path, &s)));
+        let index = found.map(|path| {
+            let i = *by_file.entry(same_file_key(&path)).or_insert_with(|| {
+                samples.push(SampleBinding {
+                    path,
+                    regions: Vec::new(),
+                    follows: Vec::new(),
+                });
+                samples.len() - 1
+            });
+            samples[i].regions.push(region);
+            samples[i].follows.push(true);
+            i
+        });
+        region_sample.push(index);
+    }
+    Binding {
+        samples,
+        region_sample,
+    }
+}
+
+/// The sample state a region asks for (spec 4.2): root key, fine tune, loop
+/// points, direction and on/off come from the region's opcodes over `wav`'s;
+/// everything else is `wav`'s.
+pub fn region_edit(inst: &Instrument, region: usize, wav: &EditState) -> EditState {
+    let info = inst.region_info(region);
+    let mut e = wav.clone();
+    e.root = match info.keycenter {
+        Keycenter::Note(n) => n,
+        Keycenter::Sample => wav.root,
+    };
+    // `tune` raises playback; fine tune says how sharp the recording is. The
+    // subtraction from 0.0 keeps a zero tune from becoming -0.
+    e.cents = 0.0 - info.tune;
+
+    let wav_loops = wav.loop_mode != LoopMode::Off;
+    let on = match info.loop_mode {
+        Some(SfzLoopMode::NoLoop | SfzLoopMode::OneShot) => false,
+        Some(SfzLoopMode::Continuous | SfzLoopMode::Sustain) => true,
+        None => wav_loops || info.loop_start.is_some() || info.loop_end.is_some(),
+    };
+    let dir = if inst.get(region, "loop_type").is_some() {
+        match info.loop_dir {
+            LoopDir::Forward => LoopMode::Forward,
+            LoopDir::Backward => LoopMode::Backward,
+            LoopDir::Alternate => LoopMode::PingPong,
+        }
+    } else if wav_loops {
+        wav.loop_mode
+    } else {
+        LoopMode::Forward
+    };
+    let ls = info.loop_start.unwrap_or(wav.loop_start).min(wav.end);
+    let le = info.loop_end.unwrap_or(wav.loop_end).min(wav.end);
+    e.loop_start = ls.min(le);
+    e.loop_end = le;
+    e.loop_mode = if on && ls <= le { dir } else { LoopMode::Off };
+    e
+}
+
+/// What two regions must share to follow the same sample.
+fn tuning_and_loop(e: &EditState) -> (u8, f32, LoopMode, Option<(usize, usize)>) {
+    let points = (e.loop_mode != LoopMode::Off).then_some((e.loop_start, e.loop_end));
+    (e.root, e.cents, e.loop_mode, points)
+}
+
+/// Sets each sample's `follows`: a region follows when its root key, fine tune
+/// and loop equal those of the sample's first region. `wavs[i]` is sample `i`'s
+/// `initial_edit`, `None` while it loads or if it failed (all follow then).
+pub fn complete(b: &mut Binding, inst: &Instrument, wavs: &[Option<EditState>]) {
+    for (i, s) in b.samples.iter_mut().enumerate() {
+        s.follows = vec![true; s.regions.len()];
+        let Some(Some(wav)) = wavs.get(i) else {
+            continue;
+        };
+        let Some(&first) = s.regions.first() else {
+            continue;
+        };
+        let want = tuning_and_loop(&region_edit(inst, first, wav));
+        for (follows, &region) in s.follows.iter_mut().zip(&s.regions).skip(1) {
+            *follows = tuning_and_loop(&region_edit(inst, region, wav)) == want;
+        }
+    }
+}
+
+/// Sets `name` on `region` to `value`.
+fn put(inst: &mut Instrument, region: usize, name: &str, value: impl ToString) {
+    inst.set(region, name, &value.to_string());
+}
+
+/// Moves the sample-relative opcodes a region itself has by the trim, so they
+/// keep pointing at the same audio, clamped to the trimmed length.
+fn shift_for_trim(inst: &mut Instrument, region: usize, shift: i64, max: i64) {
+    for name in ["offset", "end", "loop_start", "loop_end"] {
+        let Some((text, Level::Region)) = inst.get(region, name) else {
+            continue;
+        };
+        let Ok(v) = text.trim().parse::<usize>() else {
+            continue;
+        };
+        let new = (v as i64 - shift).clamp(0, max);
+        if new != v as i64 {
+            put(inst, region, name, new);
+        }
+    }
+}
+
+/// Writes root key, fine tune and loop onto a region that follows its sample.
+/// A value is written only when it differs from what the region has now.
+fn write_tuning_and_loop(
+    inst: &mut Instrument,
+    region: usize,
+    before: &EditState,
+    after: &EditState,
+) {
+    let info = inst.region_info(region);
+    let current_root = match info.keycenter {
+        Keycenter::Note(n) => n,
+        // `sample` resolved to the WAV's own root when the edit began.
+        Keycenter::Sample => before.root,
+    };
+    if after.root != current_root {
+        put(inst, region, "pitch_keycenter", after.root);
+    }
+    let tune = format_number(-f64::from(after.cents));
+    if format_number(f64::from(info.tune)) != tune {
+        put(inst, region, "tune", tune);
+    }
+
+    if after.loop_mode == LoopMode::Off {
+        let stop = match info.loop_mode {
+            Some(SfzLoopMode::NoLoop | SfzLoopMode::OneShot) => false,
+            Some(SfzLoopMode::Continuous | SfzLoopMode::Sustain) => true,
+            // Unset plays as the WAV does, which looped only if it was on.
+            None => before.loop_mode != LoopMode::Off,
+        };
+        if stop {
+            put(inst, region, "loop_mode", "no_loop");
+        }
+        return;
+    }
+    if !matches!(
+        info.loop_mode,
+        Some(SfzLoopMode::Continuous | SfzLoopMode::Sustain)
+    ) {
+        put(inst, region, "loop_mode", "loop_continuous");
+    }
+    let start = after.loop_start.saturating_sub(after.start);
+    let end = after.loop_end.saturating_sub(after.start);
+    if info.loop_start != Some(start) {
+        put(inst, region, "loop_start", start);
+    }
+    if info.loop_end != Some(end) {
+        put(inst, region, "loop_end", end);
+    }
+    let (dir, name) = match after.loop_mode {
+        LoopMode::Backward => (LoopDir::Backward, "backward"),
+        LoopMode::PingPong => (LoopDir::Alternate, "alternate"),
+        _ => (LoopDir::Forward, "forward"),
+    };
+    if info.loop_dir != dir {
+        put(inst, region, "loop_type", name);
+    }
+}
+
+/// Writes a sample edit into the instrument (spec 7.2). Trimming moves the
+/// sample-relative opcodes of every region using it; a change to root key,
+/// fine tune or loop sets explicit opcodes on the regions that follow it.
+pub fn write_back(inst: &mut Instrument, b: &SampleBinding, before: &EditState, after: &EditState) {
+    // Trim first: the loop points written below are already relative to the
+    // new start and must not be shifted again.
+    let shift = after.start as i64 - before.start as i64;
+    if shift != 0 || after.end != before.end {
+        let max = after.end.saturating_sub(after.start) as i64;
+        for &region in &b.regions {
+            shift_for_trim(inst, region, shift, max);
+        }
+    }
+    let tuned = before.root != after.root
+        || before.cents != after.cents
+        || before.loop_mode != after.loop_mode
+        || before.loop_start != after.loop_start
+        || before.loop_end != after.loop_end;
+    if tuned {
+        for (&region, _) in b.regions.iter().zip(&b.follows).filter(|(_, f)| **f) {
+            write_tuning_and_loop(inst, region, before, after);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sfz::parse::parse;
+    use crate::sfz::write::write;
+
+    fn inst(text: &str) -> Instrument {
+        Instrument::new(parse(text).unwrap())
+    }
+
+    /// A WAV-derived state: 1000 frames, root 64, 3 cents sharp, no loop.
+    fn wav() -> EditState {
+        EditState {
+            root: 64,
+            cents: 3.0,
+            ..EditState::default_for(1000)
+        }
+    }
+
+    fn looped(mode: LoopMode, ls: usize, le: usize) -> EditState {
+        EditState {
+            loop_mode: mode,
+            loop_start: ls,
+            loop_end: le,
+            ..wav()
+        }
+    }
+
+    fn value(i: &Instrument, region: usize, name: &str) -> Option<String> {
+        i.get(region, name).map(|(v, _)| v)
+    }
+
+    /// A binding for regions `0..n`, all following.
+    fn all_follow(n: usize) -> SampleBinding {
+        SampleBinding {
+            path: PathBuf::new(),
+            regions: (0..n).collect(),
+            follows: vec![true; n],
+        }
+    }
+
+    fn touch(dir: &Path, rel: &str) {
+        let p = dir.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, b"RIFF").unwrap();
+    }
+
+    #[test]
+    fn one_wav_named_two_ways_binds_once() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(dir.path(), "Samples/A.wav");
+        std::fs::write(dir.path().join("a.sfz"), "").unwrap();
+        let i = inst("<region> sample=Samples\\A.wav\n<region> sample=samples/a.wav");
+        let b = bind(&i, dir.path());
+        assert_eq!(b.samples.len(), 1);
+        assert_eq!(b.samples[0].regions, [0, 1]);
+        assert_eq!(b.samples[0].follows, [true, true]);
+        assert_eq!(b.region_sample, [Some(0), Some(0)]);
+        assert!(b.samples[0].path.is_file());
+    }
+
+    #[test]
+    fn samples_are_in_order_of_first_use() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(dir.path(), "b.wav");
+        touch(dir.path(), "a.wav");
+        let i = inst("<region> sample=b.wav <region> sample=a.wav <region> sample=B.WAV");
+        let b = bind(&i, dir.path());
+        assert_eq!(b.region_sample, [Some(0), Some(1), Some(0)]);
+        assert_eq!(b.samples[0].regions, [0, 2]);
+        assert_eq!(b.samples[1].regions, [1]);
+    }
+
+    #[test]
+    fn default_path_is_honoured() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(dir.path(), "Kit/a.wav");
+        let i = inst("<control> default_path=Kit/\n<region> sample=a.wav");
+        assert_eq!(bind(&i, dir.path()).region_sample, [Some(0)]);
+    }
+
+    #[test]
+    fn missing_samples_are_none() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(dir.path(), "a.wav");
+        let i = inst(
+            "<region> sample=a.wav <region> sample=gone.wav <region> key=60 <region> sample=*sine",
+        );
+        let b = bind(&i, dir.path());
+        assert_eq!(b.region_sample, [Some(0), None, None, None]);
+        assert_eq!(b.samples.len(), 1);
+    }
+
+    #[test]
+    fn tune_14_reads_as_fine_minus_14() {
+        let mut i = inst("<region> sample=a.wav tune=14");
+        let before = region_edit(&i, 0, &wav());
+        assert_eq!(before.cents, -14.0);
+        let after = EditState {
+            cents: -20.0,
+            ..before.clone()
+        };
+        write_back(&mut i, &all_follow(1), &before, &after);
+        assert_eq!(value(&i, 0, "tune").as_deref(), Some("20"));
+        assert_eq!(region_edit(&i, 0, &wav()).cents, -20.0);
+    }
+
+    #[test]
+    fn unset_tune_reads_as_zero_not_the_wavs_cents() {
+        let e = region_edit(&inst("<region> sample=a.wav"), 0, &wav());
+        assert_eq!(e.cents, 0.0);
+        assert!(e.cents.is_sign_positive());
+    }
+
+    #[test]
+    fn keycenter_overrides_wav_root() {
+        let i = inst("<region> sample=a.wav pitch_keycenter=49");
+        assert_eq!(region_edit(&i, 0, &wav()).root, 49);
+        let i = inst("<group> pitch_keycenter=c3 <region> sample=a.wav");
+        assert_eq!(region_edit(&i, 0, &wav()).root, 48);
+        // Nothing sets it: the SFZ default, not the WAV's root.
+        let i = inst("<region> sample=a.wav");
+        assert_eq!(region_edit(&i, 0, &wav()).root, 60);
+    }
+
+    #[test]
+    fn pitch_keycenter_sample_keeps_wav_root() {
+        let mut i = inst("<region> sample=a.wav pitch_keycenter=sample");
+        let before = region_edit(&i, 0, &wav());
+        assert_eq!(before.root, 64);
+        // Editing something else leaves `sample` in place.
+        let after = EditState {
+            cents: 7.0,
+            ..before.clone()
+        };
+        write_back(&mut i, &all_follow(1), &before, &after);
+        assert_eq!(value(&i, 0, "pitch_keycenter").as_deref(), Some("sample"));
+        // Changing the root replaces it.
+        let after = EditState {
+            root: 65,
+            ..before.clone()
+        };
+        write_back(&mut i, &all_follow(1), &before, &after);
+        assert_eq!(value(&i, 0, "pitch_keycenter").as_deref(), Some("65"));
+    }
+
+    #[test]
+    fn region_loop_opcodes_override_wav_loop() {
+        let w = looped(LoopMode::Forward, 100, 200);
+        let i = inst(
+            "<region> loop_mode=loop_continuous loop_start=300 loop_end=400 loop_type=backward",
+        );
+        let e = region_edit(&i, 0, &w);
+        assert_eq!(
+            (e.loop_mode, e.loop_start, e.loop_end),
+            (LoopMode::Backward, 300, 400)
+        );
+        let i = inst("<region> loop_mode=loop_sustain loop_type=alternate");
+        let e = region_edit(&i, 0, &w);
+        assert_eq!(
+            (e.loop_mode, e.loop_start, e.loop_end),
+            (LoopMode::PingPong, 100, 200)
+        );
+        // No opcode sets the direction: the WAV's holds.
+        let w = looped(LoopMode::PingPong, 100, 200);
+        let e = region_edit(&inst("<region> loop_mode=loop_sustain"), 0, &w);
+        assert_eq!(e.loop_mode, LoopMode::PingPong);
+        // Nothing says anything about looping: the WAV's loop is used.
+        let e = region_edit(&inst("<region> sample=a.wav"), 0, &w);
+        assert_eq!(
+            (e.loop_mode, e.loop_start, e.loop_end),
+            (LoopMode::PingPong, 100, 200)
+        );
+        // A WAV without a loop, but loop points in the instrument: loops forward.
+        let e = region_edit(&inst("<region> loop_start=10 loop_end=20"), 0, &wav());
+        assert_eq!(
+            (e.loop_mode, e.loop_start, e.loop_end),
+            (LoopMode::Forward, 10, 20)
+        );
+        // Looping forced on a WAV without a loop uses forward and the whole sample.
+        let e = region_edit(&inst("<region> loop_mode=loop_continuous"), 0, &wav());
+        assert_eq!(
+            (e.loop_mode, e.loop_start, e.loop_end),
+            (LoopMode::Forward, 0, 999)
+        );
+    }
+
+    #[test]
+    fn no_loop_turns_loop_off() {
+        let w = looped(LoopMode::Forward, 100, 200);
+        for mode in ["no_loop", "one_shot"] {
+            let i = inst(&format!("<region> loop_mode={mode}"));
+            assert_eq!(region_edit(&i, 0, &w).loop_mode, LoopMode::Off, "{mode}");
+        }
+    }
+
+    #[test]
+    fn loop_points_are_clamped_into_the_sample() {
+        let w = wav();
+        let e = region_edit(
+            &inst("<region> loop_mode=loop_continuous loop_start=500 loop_end=5000"),
+            0,
+            &w,
+        );
+        assert_eq!(
+            (e.loop_mode, e.loop_start, e.loop_end),
+            (LoopMode::Forward, 500, 999)
+        );
+        // Start after end cannot be a loop.
+        let e = region_edit(
+            &inst("<region> loop_mode=loop_continuous loop_start=600 loop_end=500"),
+            0,
+            &w,
+        );
+        assert_eq!(e.loop_mode, LoopMode::Off);
+        assert!(e.loop_start <= e.loop_end);
+    }
+
+    #[test]
+    fn disagreeing_regions_keep_their_own() {
+        let mut i = inst(
+            "<region> sample=a.wav pitch_keycenter=49\n<region> sample=a.wav pitch_keycenter=50",
+        );
+        let dir = tempfile::tempdir().unwrap();
+        touch(dir.path(), "a.wav");
+        let mut b = bind(&i, dir.path());
+        let w = wav();
+        complete(&mut b, &i, &[Some(w.clone())]);
+        assert_eq!(b.samples[0].follows, [true, false]);
+
+        let before = region_edit(&i, 0, &w);
+        let after = EditState {
+            root: 55,
+            ..before.clone()
+        };
+        write_back(&mut i, &b.samples[0], &before, &after);
+        assert_eq!(value(&i, 0, "pitch_keycenter").as_deref(), Some("55"));
+        assert_eq!(value(&i, 1, "pitch_keycenter").as_deref(), Some("50"));
+    }
+
+    #[test]
+    fn regions_that_agree_follow_and_loading_samples_all_follow() {
+        let i = inst(
+            "<group> pitch_keycenter=60 <region> sample=a.wav <region> sample=a.wav \
+             <region> sample=a.wav tune=5 <region> sample=a.wav loop_mode=loop_continuous",
+        );
+        let dir = tempfile::tempdir().unwrap();
+        touch(dir.path(), "a.wav");
+        let mut b = bind(&i, dir.path());
+        complete(&mut b, &i, &[Some(wav())]);
+        assert_eq!(b.samples[0].follows, [true, true, false, false]);
+        complete(&mut b, &i, &[None]);
+        assert_eq!(b.samples[0].follows, [true; 4]);
+        complete(&mut b, &i, &[]);
+        assert_eq!(b.samples[0].follows, [true; 4]);
+    }
+
+    #[test]
+    fn regions_with_loop_off_agree_whatever_their_stale_points() {
+        let i = inst(
+            "<region> sample=a.wav loop_mode=no_loop \
+             <region> sample=a.wav loop_mode=one_shot loop_start=3 loop_end=9",
+        );
+        let dir = tempfile::tempdir().unwrap();
+        touch(dir.path(), "a.wav");
+        let mut b = bind(&i, dir.path());
+        complete(&mut b, &i, &[Some(wav())]);
+        assert_eq!(b.samples[0].follows, [true, true]);
+    }
+
+    #[test]
+    fn untouched_sample_writes_nothing() {
+        let text = "<group> volume=-3\n<region> sample=a.wav tune=4 loop_mode=loop_continuous\n";
+        let mut i = inst(text);
+        let before = region_edit(&i, 0, &looped(LoopMode::Forward, 10, 90));
+        let was = write(&i.file);
+        write_back(&mut i, &all_follow(1), &before, &before.clone());
+        assert_eq!(write(&i.file), was);
+        // An edit that is not tuning, loop or trim also writes nothing.
+        let after = EditState {
+            crossfade: 5,
+            ..before.clone()
+        };
+        write_back(&mut i, &all_follow(1), &before, &after);
+        assert_eq!(write(&i.file), was);
+    }
+
+    #[test]
+    fn root_edit_writes_at_region_level_and_leaves_the_group() {
+        let mut i = inst("<group> pitch_keycenter=48 <region> sample=a.wav\n<region> sample=b.wav");
+        let before = region_edit(&i, 0, &wav());
+        let after = EditState {
+            root: 50,
+            ..before.clone()
+        };
+        write_back(&mut i, &all_follow(1), &before, &after);
+        assert_eq!(
+            i.get(0, "pitch_keycenter"),
+            Some(("50".into(), Level::Region))
+        );
+        assert_eq!(
+            i.get(1, "pitch_keycenter"),
+            Some(("48".into(), Level::Group))
+        );
+        // Tune and loop already say the right thing, so they are not added.
+        assert_eq!(value(&i, 0, "tune"), None);
+        assert_eq!(value(&i, 0, "loop_mode"), None);
+    }
+
+    #[test]
+    fn turning_the_loop_off_keeps_one_shot() {
+        let w = looped(LoopMode::Forward, 100, 200);
+        let mut i = inst(
+            "<region> loop_mode=one_shot\n<region> loop_mode=loop_continuous\n<region> sample=a.wav",
+        );
+        let after = EditState {
+            loop_mode: LoopMode::Off,
+            ..w.clone()
+        };
+        write_back(&mut i, &all_follow(3), &w, &after);
+        assert_eq!(value(&i, 0, "loop_mode").as_deref(), Some("one_shot"));
+        assert_eq!(value(&i, 1, "loop_mode").as_deref(), Some("no_loop"));
+        // Unset played as the WAV's loop, so turning it off is written.
+        assert_eq!(value(&i, 2, "loop_mode").as_deref(), Some("no_loop"));
+        assert_eq!(value(&i, 1, "loop_start"), None);
+    }
+
+    #[test]
+    fn turning_the_loop_on_writes_points_and_direction() {
+        let w = wav();
+        let mut i = inst("<region> loop_mode=loop_sustain\n<region> sample=a.wav");
+        let after = EditState {
+            loop_mode: LoopMode::PingPong,
+            loop_start: 100,
+            loop_end: 300,
+            ..w.clone()
+        };
+        write_back(&mut i, &all_follow(2), &w, &after);
+        // Sustain is kept; unset becomes continuous.
+        assert_eq!(value(&i, 0, "loop_mode").as_deref(), Some("loop_sustain"));
+        assert_eq!(
+            value(&i, 1, "loop_mode").as_deref(),
+            Some("loop_continuous")
+        );
+        for r in 0..2 {
+            assert_eq!(value(&i, r, "loop_start").as_deref(), Some("100"));
+            assert_eq!(value(&i, r, "loop_end").as_deref(), Some("300"));
+            assert_eq!(value(&i, r, "loop_type").as_deref(), Some("alternate"));
+        }
+        // Back to forward: a stale direction is rewritten, but forward is
+        // never added to a region that did not have one.
+        let before = after.clone();
+        let after = EditState {
+            loop_mode: LoopMode::Forward,
+            ..after
+        };
+        let mut j = inst("<region> sample=a.wav\n<region> sample=a.wav loop_type=backward");
+        write_back(&mut j, &all_follow(2), &before, &after);
+        assert_eq!(value(&j, 0, "loop_type"), None);
+        assert_eq!(value(&j, 1, "loop_type").as_deref(), Some("forward"));
+    }
+
+    #[test]
+    fn start_trim_shifts_offset_and_clamps() {
+        let mut i = inst(
+            "<region> offset=8\n<region> offset=300\n\
+             <region> loop_mode=loop_continuous loop_start=150 loop_end=900 end=800",
+        );
+        let before = wav();
+        let after = EditState {
+            start: 100,
+            end: 599,
+            ..before.clone()
+        };
+        let mut b = all_follow(3);
+        b.follows[2] = false; // a region keeping its own loop is trimmed too
+        write_back(&mut i, &b, &before, &after);
+        assert_eq!(value(&i, 0, "offset").as_deref(), Some("0"));
+        assert_eq!(value(&i, 1, "offset").as_deref(), Some("200"));
+        assert_eq!(value(&i, 2, "loop_start").as_deref(), Some("50"));
+        // 900 - 100 is past the trimmed length of 499 frames.
+        assert_eq!(value(&i, 2, "loop_end").as_deref(), Some("499"));
+        assert_eq!(value(&i, 2, "end").as_deref(), Some("499"));
+        // No opcode is added where there was none.
+        assert_eq!(value(&i, 0, "end"), None);
+    }
+
+    #[test]
+    fn trim_leaves_inherited_values_alone() {
+        let mut i = inst("<group> offset=300 <region> sample=a.wav");
+        let before = wav();
+        let after = EditState {
+            start: 100,
+            ..before.clone()
+        };
+        write_back(&mut i, &all_follow(1), &before, &after);
+        assert_eq!(i.get(0, "offset"), Some(("300".into(), Level::Group)));
+    }
+
+    #[test]
+    fn end_trim_alone_clamps_without_shifting() {
+        let mut i = inst("<region> loop_end=900 offset=10");
+        let before = wav();
+        let after = EditState {
+            end: 499,
+            ..before.clone()
+        };
+        write_back(&mut i, &all_follow(1), &before, &after);
+        assert_eq!(value(&i, 0, "loop_end").as_deref(), Some("499"));
+        assert_eq!(value(&i, 0, "offset").as_deref(), Some("10"));
+    }
+
+    #[test]
+    fn trim_and_loop_move_together_write_the_new_points_once() {
+        let mut i = inst("<region> loop_mode=loop_continuous loop_start=100 loop_end=200");
+        let before = looped(LoopMode::Forward, 100, 200);
+        let after = EditState {
+            start: 50,
+            loop_start: 120,
+            loop_end: 220,
+            ..before.clone()
+        };
+        write_back(&mut i, &all_follow(1), &before, &after);
+        assert_eq!(value(&i, 0, "loop_start").as_deref(), Some("70"));
+        assert_eq!(value(&i, 0, "loop_end").as_deref(), Some("170"));
+    }
+}

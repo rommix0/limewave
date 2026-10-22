@@ -1,6 +1,7 @@
 //! Edit state (trim and loop markers, tuning, effects), marker-move constraints and undo history.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::effects::{AppliedEffect, Op, Splice, SpliceKind, frames_after, output_frames};
 
@@ -320,25 +321,45 @@ pub fn redraw_samples(
     Some(r)
 }
 
-/// Linear undo/redo history of edit states, tracking which one was last saved.
-pub struct History {
-    entries: Vec<EditState>,
+/// Source of entry stamps, shared by every history in the process so stamps from
+/// different histories compare: a larger stamp was recorded later.
+static NEXT_STAMP: AtomicU64 = AtomicU64::new(1);
+
+/// Linear undo/redo history, tracking which entry was last saved. Every recorded
+/// entry carries a stamp; an initial entry has stamp 0.
+pub struct History<T = EditState> {
+    entries: Vec<(T, u64)>,
     cursor: usize,
     /// Index of the saved entry; `None` once a push dropped it from the history.
     saved: Option<usize>,
 }
 
-impl History {
-    pub fn new(initial: EditState) -> History {
+impl<T: Clone + PartialEq> History<T> {
+    pub fn new(initial: T) -> History<T> {
         History {
-            entries: vec![initial],
+            entries: vec![(initial, 0)],
             cursor: 0,
             saved: Some(0),
         }
     }
 
-    pub fn current(&self) -> &EditState {
-        &self.entries[self.cursor]
+    pub fn current(&self) -> &T {
+        &self.entries[self.cursor].0
+    }
+
+    /// The state the history started from.
+    pub fn first(&self) -> &T {
+        &self.entries[0].0
+    }
+
+    /// The stamp of the current entry; 0 for the initial one.
+    pub fn stamp(&self) -> u64 {
+        self.entries[self.cursor].1
+    }
+
+    /// The stamp of the entry a redo would move to.
+    pub fn redo_stamp(&self) -> Option<u64> {
+        self.entries.get(self.cursor + 1).map(|e| e.1)
     }
 
     /// The index of the current entry; 0 is the state the file was opened with.
@@ -347,7 +368,7 @@ impl History {
     }
 
     /// Records a new state, dropping any redo tail. A no-op if equal to the current state.
-    pub fn push(&mut self, s: EditState) {
+    pub fn push(&mut self, s: T) {
         if *self.current() == s {
             return;
         }
@@ -355,7 +376,8 @@ impl History {
         if self.saved.is_some_and(|i| i > self.cursor) {
             self.saved = None;
         }
-        self.entries.push(s);
+        self.entries
+            .push((s, NEXT_STAMP.fetch_add(1, Ordering::Relaxed)));
         self.cursor += 1;
     }
 
@@ -670,6 +692,49 @@ mod tests {
         assert_eq!(h.cursor(), 1, "an equal push adds nothing");
         h.redo();
         assert_eq!(h.cursor(), 2);
+    }
+
+    #[test]
+    fn stamps_increase_and_undo_moves_them() {
+        let mut h = History::new(EditState::default_for(100));
+        assert_eq!(h.stamp(), 0);
+        assert_eq!(h.redo_stamp(), None);
+        h.push(at(1));
+        let a = h.stamp();
+        h.push(at(2));
+        let b = h.stamp();
+        assert!(a > 0 && b > a);
+        h.push(at(2));
+        assert_eq!(h.stamp(), b, "an equal push takes no stamp");
+        assert!(h.undo());
+        assert_eq!(h.stamp(), a);
+        assert_eq!(h.redo_stamp(), Some(b));
+        assert!(h.undo());
+        assert_eq!(h.stamp(), 0);
+        assert_eq!(h.redo_stamp(), Some(a));
+        assert_eq!(h.first(), &EditState::default_for(100));
+        // A later push, even on another history, is stamped after both.
+        let mut other = History::new(7u32);
+        other.push(8);
+        assert!(other.stamp() > b);
+        h.push(at(3));
+        assert!(h.stamp() > other.stamp());
+        assert_eq!(h.redo_stamp(), None);
+    }
+
+    #[test]
+    fn history_works_for_other_types() {
+        let mut h: History<u32> = History::new(1);
+        h.push(2);
+        h.push(3);
+        assert_eq!((*h.current(), *h.first()), (3, 1));
+        assert!(h.undo());
+        assert_eq!(*h.current(), 2);
+        assert!(h.is_dirty());
+        h.mark_saved();
+        assert!(!h.is_dirty());
+        assert!(h.redo());
+        assert!(h.is_dirty());
     }
 
     #[test]
