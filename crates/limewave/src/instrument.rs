@@ -13,7 +13,7 @@ use limewave_core::sfz::bind::{self, Binding};
 use limewave_core::sfz::format_number;
 use limewave_core::sfz::map::auto_map;
 use limewave_core::sfz::model::{Instrument, Keycenter, SfzLoopMode};
-use limewave_core::sfz::parse::parse;
+use limewave_core::sfz::parse::{HeaderKind, SfzFile, Token};
 use limewave_core::sfz::paths::same_file_key;
 
 use crate::app::{FileEntry, PendingAction, Session};
@@ -321,18 +321,27 @@ pub fn play_map(st: &InstrumentState, files: &[FileEntry]) -> InstrumentPlay {
 
 /// A new instrument (spec 4.4): one `<group>` and, for each `(sample file name, root key)` in
 /// order, a region with `pitch_keycenter` and the key range Auto-map gives it. Line endings
-/// are the platform's (spec 7.2).
-pub fn new_instrument_model(wavs: &[(String, u8)]) -> Option<Instrument> {
+/// are the platform's (spec 7.2). The names must be fit to write (`value_round_trips`).
+pub fn new_instrument_model(wavs: &[(String, u8)]) -> Instrument {
     let roots: Vec<u8> = wavs.iter().map(|w| w.1).collect();
-    let mut text = String::from("<group>\n");
+    let op = |name: &str, value: String| Token::Opcode {
+        name: name.to_owned(),
+        value,
+    };
+    let mut tokens = vec![Token::Header(HeaderKind::Group)];
     for ((name, root), (lo, hi)) in wavs.iter().zip(auto_map(&roots)) {
-        text.push_str(&format!(
-            "<region>\nsample={name}\npitch_keycenter={root}\nlokey={lo}\nhikey={hi}\n"
-        ));
+        tokens.extend([
+            Token::Header(HeaderKind::Region),
+            op("sample", name.clone()),
+            op("pitch_keycenter", root.to_string()),
+            op("lokey", lo.to_string()),
+            op("hikey", hi.to_string()),
+        ]);
     }
-    let mut file = parse(&text).ok()?;
-    file.crlf = cfg!(windows);
-    Some(Instrument::new(file))
+    Instrument::new(SfzFile {
+        tokens,
+        crlf: cfg!(windows),
+    })
 }
 
 /// Sets `region`'s key range, writing only the ends that change. A key already written as a

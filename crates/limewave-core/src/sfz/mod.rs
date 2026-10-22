@@ -14,4 +14,4 @@ pub use model::{Ampeg, Instrument, Keycenter, Level, LoopDir, RegionInfo, SfzLoo
 pub use parse::{HeaderKind, SfzError, SfzFile, Token, decode_text, expand, parse};
 pub use paths::{find_sample, normalize, same_file_key, sample_path, stays_inside};
 pub use save::{InstrumentSaved, SampleSave, needs_rewrite, save_instrument, wav_edit_for_save};
-pub use write::{format_number, write};
+pub use write::{format_number, value_round_trips, write};

@@ -876,3 +876,32 @@ fn the_toolbar_fits_one_row_in_a_1280_window() {
     assert_eq!(h.get_by_label("Audition").rect().top(), open.top());
     assert!(waveform_rect(&h).top() < 140.0);
 }
+
+#[test]
+fn the_folder_toolbar_fits_one_row_in_a_1280_window() {
+    let dir = tempfile::tempdir().unwrap();
+    for name in ["a.wav", "b.wav"] {
+        std::fs::write(dir.path().join(name), looped_bytes()).unwrap();
+    }
+    let mut app = LimewaveApp::for_test();
+    app.open_folder(dir.path().to_path_buf());
+    let mut h = Harness::builder()
+        .with_size(eframe::egui::vec2(1280.0, 700.0))
+        .allow_missing_glyphs()
+        .build_ui_state(|ui, app: &mut LimewaveApp| app.show(ui), app);
+    for _ in 0..400 {
+        h.step();
+        if h.state()
+            .files
+            .iter()
+            .all(|f| matches!(f, FileEntry::Loaded(_)))
+        {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    h.run();
+    let open = h.get_by_label("Open file…").rect();
+    assert_eq!(h.get_by_label("✏ Draw").rect().top(), open.top());
+    assert_eq!(h.get_by_label("Audition").rect().top(), open.top());
+}

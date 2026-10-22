@@ -21,12 +21,12 @@ use limewave_core::effects::{
 use limewave_core::notes::note_name;
 use limewave_core::render::render;
 use limewave_core::save::{Destination, default_folder};
-use limewave_core::sfz::bind;
 use limewave_core::sfz::map::{auto_map, fill_gaps};
 use limewave_core::sfz::model::Instrument;
 use limewave_core::sfz::parse::{decode_text, parse};
 use limewave_core::sfz::paths::{same_file_key, sample_path};
 use limewave_core::sfz::save::moved_text;
+use limewave_core::sfz::{bind, value_round_trips};
 use limewave_core::wav::SampleFormat;
 
 use crate::audio::engine::{AudioEngine, Command, Cursor};
@@ -518,6 +518,14 @@ fn sample_session(instrument: Option<&InstrumentState>, i: usize, doc: WavDocume
         None => Session::new(doc),
     }
 }
+/// What New instrument says when `count` WAVs had to be left out.
+fn left_out_message(count: usize) -> String {
+    if count == 1 {
+        "1 file was left out: its name can't be written in an SFZ file".to_owned()
+    } else {
+        format!("{count} files were left out: their names can't be written in an SFZ file")
+    }
+}
 
 /// Where the instrument's regions name samples that are not on disk: one path per file, in
 /// region order.
@@ -974,17 +982,20 @@ impl LimewaveApp {
         let Some(dir) = self.folder.clone().filter(|_| self.can_new_instrument()) else {
             return;
         };
-        let wavs: Vec<(String, u8)> = self
+        let (wavs, left_out): (Vec<(String, u8)>, Vec<_>) = self
             .files
             .iter()
             .filter_map(|f| match f {
                 FileEntry::Loaded(s) => Some((f.file_name(), s.edit().root)),
                 _ => None,
             })
-            .collect();
-        let Some(inst) = new_instrument_model(&wavs) else {
+            .partition(|(name, _)| value_round_trips("sample", name));
+        let left_out = left_out.len();
+        if wavs.is_empty() {
+            self.ui.message = Some(left_out_message(left_out));
             return;
-        };
+        }
+        let inst = new_instrument_model(&wavs);
         let path = dir.join("Untitled instrument.sfz");
         let mut st = InstrumentState::new(path, inst, Some(PendingAction::OpenFolder(dir)));
         st.untitled = true;
@@ -992,6 +1003,9 @@ impl LimewaveApp {
         self.ui.message = None;
         self.instrument = Some(st);
         self.select_region(0);
+        if left_out > 0 {
+            self.ui.message = Some(left_out_message(left_out));
+        }
     }
 
     /// Closes the instrument and opens again the folder or file that was open before it, or
@@ -1075,6 +1089,16 @@ impl LimewaveApp {
         let Some(st) = &self.instrument else {
             return;
         };
+        let dir = st.path.parent().unwrap_or(Path::new(""));
+        let text = moved_text(dir, &st.inst().default_path(), &path);
+        if !value_round_trips("sample", &text) {
+            self.ui.message = Some(format!(
+                "{} can't be added: its name can't be written in an SFZ file",
+                path.file_name()
+                    .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
+            ));
+            return;
+        }
         let key = same_file_key(&path);
         let found = self
             .files
@@ -1099,8 +1123,6 @@ impl LimewaveApp {
             return;
         };
         let root = session.edit().root;
-        let dir = st.path.parent().unwrap_or(Path::new(""));
-        let text = moved_text(dir, &st.inst().default_path(), &path);
         let group = st
             .selected_region
             .and_then(|r| st.inst().group_of(r))
@@ -2212,6 +2234,9 @@ impl LimewaveApp {
         self.toolbar(ui);
         if !self.single_file {
             let mut clicked = None;
+            let mut new_instrument = false;
+            let folder_mode = self.folder.is_some();
+            let can_new = self.can_new_instrument();
             let mut region_action = None;
             let mut fresh = None;
             egui::Panel::left("file_list")
@@ -2225,6 +2250,16 @@ impl LimewaveApp {
                         fresh = Some(unassigned);
                     }
                     None => {
+                        if folder_mode {
+                            if ui
+                                .add_enabled(can_new, egui::Button::new("New instrument"))
+                                .on_hover_text("Make an instrument with a region for each open WAV")
+                                .clicked()
+                            {
+                                new_instrument = true;
+                            }
+                            ui.add_space(4.0);
+                        }
                         clicked = filelist::file_list(
                             ui,
                             &self.files,
@@ -2248,6 +2283,9 @@ impl LimewaveApp {
             }
             if let Some(action) = region_action {
                 self.region_action(action);
+            }
+            if new_instrument {
+                self.new_instrument();
             }
         }
         self.inspector_panel(ui);
@@ -2559,7 +2597,6 @@ impl LimewaveApp {
         let mut save = None;
         let mut record = false;
         let mut record_hovered = false;
-        let mut new_instrument = false;
         egui::Panel::top("toolbar").show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 // A widget that does not fit moves whole to the next row; its text is never
@@ -2567,20 +2604,6 @@ impl LimewaveApp {
                 ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
                 if ui.button("New…").clicked() {
                     self.ui.new_dialog = Some(NewDialogState::default());
-                }
-                // Only in folder mode, which is also what keeps the toolbar of a single file
-                // on one row in the default window.
-                if self.folder.is_some()
-                    && !self.single_file
-                    && ui
-                        .add_enabled(
-                            self.can_new_instrument(),
-                            egui::Button::new("New instrument"),
-                        )
-                        .on_hover_text("Make an instrument with a region for each open WAV")
-                        .clicked()
-                {
-                    new_instrument = true;
                 }
                 if ui.button("Open file…").clicked()
                     && let Some(p) = rfd::FileDialog::new()
@@ -2671,9 +2694,6 @@ impl LimewaveApp {
                 self.status(ui);
             });
         });
-        if new_instrument {
-            self.new_instrument();
-        }
         if let Some(from_loop) = play {
             self.play(from_loop);
         }

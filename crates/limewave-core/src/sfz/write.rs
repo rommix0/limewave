@@ -21,6 +21,23 @@ pub fn format_number(v: f64) -> String {
     if s == "-0" { "0" } else { s }.to_owned()
 }
 
+/// Whether opcode `name=value` survives being written and read again: reading it back gives
+/// one region header and exactly that opcode. False for a value that holds `=`, `<`, a comment
+/// start, a `$` (which a `#define` can change) or line breaks.
+pub fn value_round_trips(name: &str, value: &str) -> bool {
+    let Ok(file) = super::parse::parse(&format!("<region>{name}={value}")) else {
+        return false;
+    };
+    !value.contains('$')
+        && matches!(
+            file.tokens.as_slice(),
+            [
+                Token::Header(HeaderKind::Region),
+                Token::Opcode { name: n, value: v },
+            ] if n == name && v == value
+        )
+}
+
 fn header_name(kind: &HeaderKind) -> &str {
     match kind {
         HeaderKind::Control => "control",
@@ -72,6 +89,17 @@ pub fn write(file: &SfzFile) -> String {
 mod tests {
     use super::*;
     use crate::sfz::{Instrument, parse};
+
+    #[test]
+    fn only_values_that_read_back_as_written_round_trip() {
+        assert!(value_round_trips("sample", "EP A1 mp.wav"));
+        assert!(value_round_trips("sample", "samples/EP A1.wav"));
+        assert!(!value_round_trips("sample", "x y=z.wav"));
+        assert!(!value_round_trips("sample", "a<b.wav"));
+        assert!(!value_round_trips("sample", "a//b.wav"));
+        assert!(!value_round_trips("sample", "a/*b.wav"));
+        assert!(!value_round_trips("sample", "$x.wav"));
+    }
 
     const EPIANO: &str = "\
 <control>

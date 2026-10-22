@@ -1621,7 +1621,7 @@ fn button_disabled_without_wavs() {
     assert!(h.query_by_label("New instrument").is_none());
     h.state_mut().new_instrument();
     assert!(h.state().instrument.is_none());
-    // Enabled with WAVs, disabled again once an instrument is open.
+    // Enabled with WAVs, gone once an instrument is open.
     let (_dir, mut h) = open_wav_folder(&[60]);
     assert!(
         !h.get_by_label("New instrument")
@@ -1630,11 +1630,8 @@ fn button_disabled_without_wavs() {
     );
     h.state_mut().new_instrument();
     h.run();
-    assert!(
-        h.get_by_label("New instrument")
-            .accesskit_node()
-            .is_disabled()
-    );
+    // The region list takes the button's place.
+    assert!(h.query_by_label("New instrument").is_none());
     let before = h.state().instrument.as_ref().unwrap().history.stamp();
     h.state_mut().new_instrument();
     assert_eq!(
@@ -1644,18 +1641,55 @@ fn button_disabled_without_wavs() {
 }
 
 #[test]
-fn new_instrument_keeps_file_names_with_spaces() {
+fn new_instrument_keeps_file_names_with_spaces_and_leaves_out_unwritable_ones() {
     let dir = tempfile::tempdir().unwrap();
     write_wav(dir.path(), "EP A1 mp.wav", Some(33));
     write_wav(dir.path(), "EP C2 mp.wav", Some(36));
+    // `=` would end the name early; it can't be written.
+    write_wav(dir.path(), "x y=z.wav", Some(40));
     let mut app = LimewaveApp::for_test();
     app.open_folder(dir.path().to_path_buf());
     let mut h = harness(app);
     wait_loaded(&mut h);
     h.state_mut().new_instrument();
     h.run();
+    assert_eq!(st(&h).inst().regions().len(), 2);
     assert_eq!(opcode(&h, 0, "sample").unwrap().0, "EP A1 mp.wav");
     assert_eq!(opcode(&h, 1, "sample").unwrap().0, "EP C2 mp.wav");
     assert_eq!(opcode(&h, 1, "pitch_keycenter").unwrap().0, "36");
     assert_eq!(st(&h).region_file(1), Some(1));
+    assert_eq!(
+        h.state().ui.message.as_deref(),
+        Some("1 file was left out: its name can't be written in an SFZ file")
+    );
+}
+
+#[test]
+fn new_instrument_with_only_unwritable_names_makes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    write_wav(dir.path(), "$x.wav", Some(40));
+    let mut app = LimewaveApp::for_test();
+    app.open_folder(dir.path().to_path_buf());
+    let mut h = harness(app);
+    wait_loaded(&mut h);
+    h.state_mut().new_instrument();
+    assert!(h.state().instrument.is_none());
+    assert!(h.state().ui.message.is_some());
+}
+
+#[test]
+fn add_unassigned_refuses_a_name_that_cannot_be_written() {
+    let (dir, mut h) = open_text("<region> sample=a.wav\n");
+    let bad = write_wav(dir.path(), "x y=z.wav", Some(50));
+    let files = h.state().files.len();
+    h.state_mut()
+        .region_action(RegionListAction::AddUnassigned(bad));
+    h.run();
+    assert_eq!(st(&h).inst().regions().len(), 1);
+    assert!(!st(&h).history.is_dirty());
+    assert_eq!(h.state().files.len(), files, "the WAV is not opened either");
+    assert_eq!(
+        h.state().ui.message.as_deref(),
+        Some("x y=z.wav can't be added: its name can't be written in an SFZ file")
+    );
 }
