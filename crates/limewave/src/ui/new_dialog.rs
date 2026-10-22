@@ -58,7 +58,7 @@ pub struct NewDialogState {
     pub rate: u32,
     pub stereo: bool,
     pub bits: BitDepth,
-    pub root: u8,
+    /// The root key as typed; Create waits until it is a note.
     pub root_text: String,
     pub whole_loop: bool,
 }
@@ -72,7 +72,6 @@ impl Default for NewDialogState {
             rate: 44_100,
             stereo: false,
             bits: BitDepth::default(),
-            root: 60,
             root_text: note_name(60),
             whole_loop: false,
         }
@@ -98,10 +97,19 @@ impl NewDialogState {
         if let Some(n) = parse_note(text) {
             self.unit = LengthUnit::Frames;
             self.length = cycle_frames(n, self.rate) as f64;
-            self.root = n;
             self.root_text = note_name(n);
             self.whole_loop = true;
         }
+    }
+
+    /// The root key, or `None` while the text is not a note.
+    pub fn root(&self) -> Option<u8> {
+        parse_note(&self.root_text)
+    }
+
+    /// True when the length and the root key are both valid.
+    pub fn can_create(&self) -> bool {
+        self.frames().is_some() && self.root().is_some()
     }
 
     /// The length was typed or dragged: it no longer follows a note.
@@ -115,13 +123,14 @@ impl NewDialogState {
         Some(cycle_cents(n, self.rate, self.frames()?))
     }
 
-    /// A new rate keeps the cycle when a note is set, else the duration.
+    /// A new rate keeps the cycle when a note is set, else the duration. The root key and the
+    /// loop are left as they are.
     fn set_rate(&mut self, rate: u32) {
         let old = self.rate;
         self.rate = rate;
-        if parse_note(&self.cycle_note).is_some() {
-            let text = self.cycle_note.clone();
-            self.set_cycle_note(&text);
+        if let Some(n) = parse_note(&self.cycle_note) {
+            self.unit = LengthUnit::Frames;
+            self.length = cycle_frames(n, rate) as f64;
         } else if self.unit == LengthUnit::Frames {
             self.length = (self.length * f64::from(rate) / f64::from(old)).round();
         }
@@ -150,7 +159,7 @@ pub fn new_dialog(ctx: &egui::Context, app: &mut LimewaveApp) {
     };
     let mut create = false;
     let mut cancel = false;
-    let frames = d.frames();
+    let ready = d.can_create();
     let modal = egui::Modal::new(egui::Id::unique("new_dialog")).show(ctx, |ui| {
         ui.set_width(340.0);
         ui.heading("New sample");
@@ -196,25 +205,20 @@ pub fn new_dialog(ctx: &egui::Context, app: &mut LimewaveApp) {
             ui.add(TextEdit::singleline(&mut d.root_text).desired_width(60.0))
                 .labelled_by(label.id)
                 .on_hover_text("A note name such as C4 or A#3, or a MIDI number");
-            match parse_note(&d.root_text) {
-                Some(n) => d.root = n,
-                None => {
-                    ui.colored_label(colors::END, "Not a note");
-                }
+            if d.root().is_none() {
+                ui.colored_label(colors::END, "Not a note");
             }
         });
         ui.checkbox(&mut d.whole_loop, "Loop the whole file");
         ui.add_space(8.0);
         ui.horizontal(|ui| {
-            create = ui
-                .add_enabled(frames.is_some(), Button::new("Create"))
-                .clicked();
+            create = ui.add_enabled(ready, Button::new("Create")).clicked();
             cancel = ui.button("Cancel").clicked();
         });
     });
-    if create && let Some(frames) = d.frames() {
+    if create && let (Some(frames), Some(root)) = (d.frames(), d.root()) {
         let channels = if d.stereo { 2 } else { 1 };
-        app.create_new(frames, d.rate, channels, d.bits, d.root, d.whole_loop);
+        app.create_new(frames, d.rate, channels, d.bits, root, d.whole_loop);
     }
     if !(create || cancel || modal.should_close()) {
         app.ui.new_dialog = Some(d);
@@ -288,7 +292,7 @@ mod tests {
         d.set_cycle_note("A4");
         assert_eq!(d.frames(), Some(100));
         assert_eq!(d.unit, LengthUnit::Frames);
-        assert_eq!(d.root, 69);
+        assert_eq!(d.root(), Some(69));
         assert_eq!(d.root_text, "A4");
         assert!(d.whole_loop);
         assert!(d.cents().is_some());
@@ -356,5 +360,35 @@ mod tests {
         d.length = 88_200.0;
         d.set_rate(44_100);
         assert_eq!(d.frames(), Some(44_100));
+    }
+
+    #[test]
+    fn a_new_rate_keeps_the_root_and_loop_chosen_after_the_note() {
+        let mut d = NewDialogState::default();
+        d.set_cycle_note("A4");
+        d.root_text = "C4".to_owned();
+        d.whole_loop = false;
+        d.set_rate(48_000);
+        assert_eq!(d.frames(), Some(cycle_frames(69, 48_000)));
+        assert_eq!(d.cycle_note, "A4");
+        assert_eq!(d.root(), Some(60));
+        assert!(!d.whole_loop);
+    }
+
+    #[test]
+    fn create_needs_a_valid_root_and_length() {
+        let mut d = NewDialogState::default();
+        assert!(d.can_create());
+        d.root_text = "H9".to_owned();
+        assert_eq!(d.root(), None);
+        assert!(
+            !d.can_create(),
+            "an invalid root must not fall back to an earlier one"
+        );
+        d.root_text = "62".to_owned();
+        assert_eq!(d.root(), Some(62));
+        assert!(d.can_create());
+        d.length = 0.0;
+        assert!(!d.can_create());
     }
 }
