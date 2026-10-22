@@ -174,6 +174,27 @@ fn plan_into(inst: &Instrument, binding: &Binding, sfz_dir: &Path, target_dir: &
     plans.into_iter().flatten().collect()
 }
 
+/// Where a save of the instrument into the folder `dir` writes: the `.sfz`, then each sample of
+/// `binding` (spec 7.1). Lets the caller ask before files already there are replaced.
+pub fn folder_targets(
+    inst: &Instrument,
+    sfz_path: &Path,
+    binding: &Binding,
+    dir: &Path,
+) -> Vec<PathBuf> {
+    let sfz_dir = sfz_path.parent().unwrap_or(Path::new(""));
+    sfz_path
+        .file_name()
+        .map(|name| dir.join(name))
+        .into_iter()
+        .chain(
+            plan_into(inst, binding, sfz_dir, dir)
+                .into_iter()
+                .map(|p| p.target),
+        )
+        .collect()
+}
+
 /// Creates the folder `target` goes into.
 fn create_parent(target: &Path) -> Result<(), SaveError> {
     if let Some(dir) = target.parent().filter(|d| !d.as_os_str().is_empty()) {
@@ -605,6 +626,35 @@ mod tests {
         assert!(saved.contains("sample=samples/y.wav"), "{saved}");
         assert!(saved.contains("sample=z.wav"), "{saved}");
         reopen_all_found(&out.join("a.sfz"));
+    }
+
+    #[test]
+    fn folder_targets_are_where_a_folder_save_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        put(root, "shared/y.wav", &wav_with(330.0, vec![]));
+        put(root, "inst/Samples/z.wav", &wav_with(110.0, vec![]));
+        let sfz = put(
+            root,
+            "inst/a.sfz",
+            b"<region> sample=../shared/y.wav key=60\n<region> sample=Samples/z.wav key=62\n",
+        );
+        let o = open(&sfz);
+        let out = root.join("inst/limewave");
+        let mut targets: Vec<PathBuf> = folder_targets(&o.inst, &sfz, &o.binding, &out)
+            .iter()
+            .map(|p| normalize(p))
+            .collect();
+        let saved = o.save(&Destination::Folder(out.clone()), false).unwrap();
+        let mut written: Vec<PathBuf> = saved
+            .written
+            .iter()
+            .map(|w| normalize(&w.written))
+            .collect();
+        targets.sort();
+        written.sort();
+        assert_eq!(targets.len(), 3);
+        assert_eq!(targets, written);
     }
 
     #[test]

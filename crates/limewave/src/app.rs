@@ -25,7 +25,7 @@ use limewave_core::sfz::map::{auto_map, fill_gaps};
 use limewave_core::sfz::model::Instrument;
 use limewave_core::sfz::parse::{decode_text, parse};
 use limewave_core::sfz::paths::{same_file_key, sample_path};
-use limewave_core::sfz::save::{SampleSave, moved_text, save_instrument};
+use limewave_core::sfz::save::{SampleSave, folder_targets, moved_text, save_instrument};
 use limewave_core::sfz::{bind, value_round_trips};
 use limewave_core::wav::SampleFormat;
 
@@ -54,8 +54,8 @@ use crate::ui::record_panel::{NO_INPUT, RecordPanelState, record_panel};
 use crate::ui::region_inspector::{OWN_TUNING, RegionContext, RegionEdit, region_only};
 use crate::ui::regions::{RegionListAction, region_list, unassigned_cached};
 use crate::ui::save_dialog::{
-    InstrumentSaveRequest, SaveCommand, SaveDialogState, SaveRequest, SaveResult,
-    other_file_in_the_way, perform_save, save_dialog, save_results_window,
+    InstrumentSaveRequest, SaveCommand, SaveDialogState, SaveFormat, SaveRequest, SaveResult,
+    export_wavs, other_file_in_the_way, perform_save, save_dialog, save_results_window,
 };
 use crate::ui::seam::{DEFAULT_HALF, SeamChannel, seam_view};
 use crate::ui::spectrum_dialog::{SpectrumDialogState, spectrum_dialog};
@@ -1390,7 +1390,8 @@ impl LimewaveApp {
 
     /// Saves the open instrument and its WAVs (spec 7), then reopens the saved `.sfz` with the
     /// same region selected and a fresh history. The next Save writes over a copy saved into a
-    /// folder or file without backups, and overwrites originals again after an overwrite.
+    /// folder or file without backups, and overwrites originals (with backups) again after an
+    /// overwrite or after a save that kept playing original WAVs.
     pub fn save_instrument_now(&mut self, req: InstrumentSaveRequest) -> Result<(), String> {
         self.save_instrument_written(req).map(|_| ())
     }
@@ -1426,6 +1427,12 @@ impl LimewaveApp {
         .map_err(|e| e.to_string())?;
         let reselect = st.selected_region;
         let own = st.sample_file.clone();
+        let sources: Vec<String> = st
+            .binding
+            .samples
+            .iter()
+            .map(|s| same_file_key(&s.path))
+            .collect();
 
         let before = std::mem::take(&mut self.files);
         if let Err(message) = self.try_open_instrument(saved.sfz.clone()) {
@@ -1445,7 +1452,17 @@ impl LimewaveApp {
                 .map(|(_, f)| f),
         );
         if let Some(st) = &mut self.instrument {
+            // A copy that still plays one of the original WAVs (an untitled instrument saved
+            // beside its WAVs) must not replace them without backups next time.
+            let shares = st
+                .binding
+                .samples
+                .iter()
+                .any(|s| sources.contains(&same_file_key(&s.path)));
             st.destination = Some(match req.destination {
+                Destination::Folder(_) | Destination::File(_) if shares => {
+                    Destination::OverwriteWithBackup
+                }
                 Destination::Folder(_) | Destination::File(_) => Destination::ReplaceSaved,
                 other => other,
             });
@@ -1596,6 +1613,9 @@ impl LimewaveApp {
             self.ui
                 .save_dialog
                 .open_for(i, &self.files, !self.single_file);
+            if self.instrument.is_some() {
+                self.ui.save_dialog.sfz_hint = "select one of the instrument's regions first";
+            }
         }
     }
 
@@ -2507,9 +2527,11 @@ impl LimewaveApp {
         effect_dialog(&ctx, self);
         tail_dialog(&ctx, self);
         spectrum_dialog(&ctx, self);
+        self.refresh_sfz_conflicts();
         if let Some(req) = save_dialog(&ctx, &mut self.ui.save_dialog, &self.files) {
             let results = match req.instrument {
                 Some(req) => self.dialog_instrument_save(req),
+                None if self.ui.save_dialog.exporting() => export_wavs(&self.files, &req),
                 None => perform_save(self, req),
             };
             self.save_results = Some(results);
@@ -2521,6 +2543,27 @@ impl LimewaveApp {
         }
         self.flush_preview(&ctx);
         self.focus_last_frame = ctx.egui_wants_keyboard_input();
+    }
+
+    /// Works out, once per folder, which files an SFZ save from the open dialog would replace
+    /// in its folder, so the dialog can ask first.
+    fn refresh_sfz_conflicts(&mut self) {
+        let d = &mut self.ui.save_dialog;
+        let (Some(st), true) = (&self.instrument, d.open && d.format == SaveFormat::Sfz) else {
+            return;
+        };
+        let fresh = d
+            .sfz_conflicts
+            .as_ref()
+            .is_some_and(|(dir, _)| *dir == d.folder);
+        if fresh || !d.folder.is_absolute() {
+            return;
+        }
+        let found = folder_targets(st.inst(), &st.path, &st.binding, &d.folder)
+            .into_iter()
+            .filter(|p| p.exists())
+            .collect();
+        d.sfz_conflicts = Some((d.folder.clone(), found));
     }
 
     /// Saves the instrument as the save dialog asked: one result per file written, or the

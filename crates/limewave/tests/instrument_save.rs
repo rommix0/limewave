@@ -491,6 +491,22 @@ fn sfz_option_disabled_without_instrument() {
     assert!(h.query_by_label("open an instrument first").is_none());
     assert!(h.query_by_label("Only save files that changed").is_none());
     h.get_by_label("Save instrument");
+
+    // A file outside the open instrument gets the plain WAV dialog, which says how to save
+    // the instrument instead.
+    let extra = _kit_dir.path().join("extra.wav");
+    write_wav(&extra);
+    let app = h.state_mut();
+    app.ui.save_dialog.open = false;
+    app.files.push(FileEntry::Loaded(Box::new(Session::new(
+        load_wav(&extra).unwrap(),
+    ))));
+    app.select(app.files.len() - 1);
+    app.save_as();
+    settle(&mut h);
+    assert!(!h.state().ui.save_dialog.instrument);
+    h.get_by_label("select one of the instrument's regions first");
+    assert!(h.query_by_label("open an instrument first").is_none());
 }
 
 #[test]
@@ -558,4 +574,212 @@ fn save_all_from_unsaved_prompt_saves_instrument() {
     assert!(st(&h).untitled, "the held action did not run");
     assert_eq!(h.state().files.len(), 2);
     assert!(h.state().save_results.is_none());
+}
+
+#[test]
+fn wav_export_leaves_instrument_and_samples_unsaved() {
+    let (dir, path) = kit();
+    let kit_dir = path.parent().unwrap().to_path_buf();
+    let a = kit_dir.join("Samples").join("a.wav");
+    let mut h = open(&path);
+    // Sample edits only: the instrument's history does not move.
+    edit_sample(&mut h, 0, |e| {
+        e.start = 100;
+        e.root = 64;
+    });
+    h.state_mut().save_as();
+    settle(&mut h);
+    h.get_by_label("Individual WAV files").click();
+    settle(&mut h);
+    assert!(
+        h.get_by_label("Overwrite originals")
+            .accesskit_node()
+            .is_disabled(),
+        "an export never replaces the samples"
+    );
+    h.get_by_label("Save 1 file(s)").click();
+    h.run();
+
+    let exported = kit_dir.join("limewave").join("a.wav");
+    let results = h.state().save_results.clone().unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].0, a);
+    assert_eq!(results[0].1.as_ref().unwrap().written, exported);
+    assert_eq!(load_wav(&exported).unwrap().frames, 4310);
+    let s = region_session(&mut h, 0);
+    assert_eq!(s.doc.path, a, "the session stays on its own file");
+    assert!(s.unsaved());
+    assert_eq!((s.edit().start, s.edit().root), (100, 64));
+    let app = h.state();
+    assert!(st(&h).unsaved(&app.files));
+    assert!(app.dirty_count() > 0);
+
+    // The instrument still has the edits to save.
+    let copy = dir.path().join("copy");
+    h.state_mut()
+        .save_instrument_now(InstrumentSaveRequest {
+            destination: Destination::Folder(copy.clone()),
+            write_smpl: false,
+        })
+        .unwrap();
+    wait_loaded(&mut h);
+    assert_eq!(
+        load_wav(&copy.join("Samples").join("a.wav"))
+            .unwrap()
+            .frames,
+        4310
+    );
+    let text = std::fs::read_to_string(copy.join("kit.sfz")).unwrap();
+    assert!(text.contains("pitch_keycenter=64"), "{text}");
+    assert_eq!(h.state().dirty_count(), 0);
+}
+
+#[test]
+fn untitled_saved_beside_its_wavs_keeps_backups() {
+    let (dir, mut h) = untitled();
+    let target = dir.path().join("kit");
+    h.state_mut().save_picker = Box::new(move |_| Some(target.clone()));
+    h.state_mut().save();
+    wait_loaded(&mut h);
+    assert_eq!(st(&h).path, dir.path().join("kit.sfz"));
+    assert_eq!(
+        st(&h).destination,
+        Some(Destination::OverwriteWithBackup),
+        "the saved instrument plays the original WAVs"
+    );
+    let original = std::fs::read(dir.path().join("a.wav")).unwrap();
+
+    edit_sample(&mut h, 0, |e| e.start = 100);
+    h.state_mut().save_picker = Box::new(|_| panic!("a saved instrument does not ask"));
+    h.state_mut().save();
+    wait_loaded(&mut h);
+    assert!(h.state().save_results.is_none());
+    assert_eq!(
+        std::fs::read(dir.path().join("a.wav.bak")).unwrap(),
+        original
+    );
+    assert!(dir.path().join("kit.sfz.bak").exists());
+    assert_eq!(load_wav(&dir.path().join("a.wav")).unwrap().frames, 4310);
+}
+
+#[test]
+fn same_named_samples_block_the_wav_export() {
+    let dir = tempfile::tempdir().unwrap();
+    write_wav(&dir.path().join("Samples").join("x.wav"));
+    write_wav(&dir.path().join("Other").join("X.wav"));
+    let path = dir.path().join("kit.sfz");
+    std::fs::write(
+        &path,
+        "<region> sample=Samples/x.wav hikey=60\n<region> sample=Other/X.wav lokey=61\n",
+    )
+    .unwrap();
+    let mut h = open(&path);
+    for r in [0, 1] {
+        edit_sample(&mut h, r, |e| e.start = 100);
+    }
+    h.state_mut().save_as();
+    h.state_mut().ui.save_dialog.format = SaveFormat::Wav;
+    settle(&mut h);
+    let app = h.state();
+    let d = &app.ui.save_dialog;
+    assert_eq!(d.chosen(&app.files).len(), 2);
+    let names = d.duplicate_names(&app.files);
+    assert_eq!(names.len(), 1);
+    assert!(names[0].eq_ignore_ascii_case("x.wav"));
+    assert_eq!(d.request(&app.files), None);
+    h.get_by_label(&format!(
+        "More than one chosen file is called {}; they would replace each other in this folder. Save them one at a time.",
+        names[0]
+    ));
+    assert!(
+        h.get_by_label("Save 2 file(s)")
+            .accesskit_node()
+            .is_disabled()
+    );
+
+    // One of them alone can be saved.
+    let other = st(&h).region_file(1).unwrap();
+    h.state_mut().ui.save_dialog.selected_files[other] = false;
+    let app = h.state();
+    assert!(app.ui.save_dialog.request(&app.files).is_some());
+}
+
+#[test]
+fn sfz_save_into_a_folder_with_files_asks_first() {
+    let (_dir, path) = kit();
+    let out = path.parent().unwrap().join("limewave");
+    std::fs::create_dir_all(out.join("Samples")).unwrap();
+    std::fs::write(out.join("kit.sfz"), "old").unwrap();
+    std::fs::write(out.join("Samples").join("b.wav"), "old wav").unwrap();
+    let mut h = open(&path);
+    st_mut(&mut h).edit(|i| i.set(1, "volume", "-6"));
+    h.state_mut().save_as();
+    settle(&mut h);
+    let app = h.state();
+    let mut conflicts = app.ui.save_dialog.conflicts(&app.files);
+    conflicts.sort();
+    assert_eq!(
+        conflicts,
+        [out.join("Samples").join("b.wav"), out.join("kit.sfz")]
+    );
+    assert_eq!(app.ui.save_dialog.request(&app.files), None);
+    assert!(
+        h.get_by_label("Save instrument")
+            .accesskit_node()
+            .is_disabled()
+    );
+    h.get_by_label("Replace existing files").click();
+    settle(&mut h);
+    h.get_by_label("Save instrument").click();
+    h.run();
+    wait_loaded(&mut h);
+
+    assert_eq!(
+        std::fs::read_to_string(out.join("kit.sfz.bak")).unwrap(),
+        "old"
+    );
+    assert_eq!(
+        std::fs::read_to_string(out.join("Samples").join("b.wav.bak")).unwrap(),
+        "old wav"
+    );
+    assert!(
+        std::fs::read_to_string(out.join("kit.sfz"))
+            .unwrap()
+            .contains("volume=-6")
+    );
+    assert_eq!(st(&h).path, out.join("kit.sfz"));
+    assert_eq!(h.state().dirty_count(), 0);
+}
+
+#[test]
+fn a_failed_save_keeps_the_instrument_and_its_edits() {
+    let (_dir, path) = kit();
+    let kit_dir = path.parent().unwrap().to_path_buf();
+    let mut h = open(&path);
+    st_mut(&mut h).edit(|i| i.set(1, "volume", "-6"));
+    edit_sample(&mut h, 0, |e| e.start = 100);
+    // A folder save into the instrument's own folder would replace the originals.
+    let own = Destination::Folder(kit_dir.clone());
+    st_mut(&mut h).destination = Some(own.clone());
+    h.state_mut().save();
+    h.run();
+
+    let results = h
+        .state()
+        .save_results
+        .clone()
+        .expect("the failure is shown");
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].0, path);
+    assert!(results[0].1.is_err());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), KIT);
+    let s = st(&h);
+    assert_eq!(s.path, path);
+    assert_eq!(s.destination, Some(own));
+    assert!(s.history.is_dirty());
+    assert_eq!(s.inst().region_info(1).volume, -6.0);
+    let session = region_session(&mut h, 0);
+    assert!(session.history.is_dirty());
+    assert_eq!(session.edit().start, 100);
+    assert_eq!(session.doc.path, kit_dir.join("Samples").join("a.wav"));
 }

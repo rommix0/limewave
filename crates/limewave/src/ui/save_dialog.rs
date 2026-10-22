@@ -41,6 +41,9 @@ pub enum SaveFormat {
     Sfz,
 }
 
+/// Why the SFZ format is not offered when no instrument is open.
+pub const NO_INSTRUMENT: &str = "open an instrument first";
+
 /// What the save dialog shows and remembers between openings.
 pub struct SaveDialogState {
     pub open: bool,
@@ -49,6 +52,11 @@ pub struct SaveDialogState {
     pub write_smpl: bool,
     /// Whether the dialog was opened for an instrument, which offers [`SaveFormat::Sfz`].
     pub instrument: bool,
+    /// Why [`SaveFormat::Sfz`] can't be chosen, shown while `instrument` is off.
+    pub sfz_hint: &'static str,
+    /// The files already in a folder that an SFZ save into it would replace, with that folder.
+    /// The app works them out while the dialog shows the SFZ format.
+    pub sfz_conflicts: Option<(PathBuf, Vec<PathBuf>)>,
     pub overwrite: bool,
     pub folder: PathBuf,
     pub trim_after_loop: bool,
@@ -75,6 +83,8 @@ impl Default for SaveDialogState {
             format: SaveFormat::Wav,
             write_smpl: false,
             instrument: false,
+            sfz_hint: NO_INSTRUMENT,
+            sfz_conflicts: None,
             overwrite: false,
             folder: PathBuf::new(),
             trim_after_loop: false,
@@ -110,6 +120,7 @@ impl SaveDialogState {
         self.open = true;
         self.format = SaveFormat::Wav;
         self.instrument = false;
+        self.sfz_hint = NO_INSTRUMENT;
         self.current = current;
         self.folder_mode = folder_mode;
         self.scope_all = false;
@@ -131,6 +142,7 @@ impl SaveDialogState {
         self.open = true;
         self.format = SaveFormat::Sfz;
         self.instrument = true;
+        self.sfz_conflicts = None;
         self.write_smpl = st.write_smpl;
         self.current = 0;
         self.folder_mode = true;
@@ -150,11 +162,29 @@ impl SaveDialogState {
         }
     }
 
-    /// The chosen files that would replace a different file of the same name in the new
-    /// folder (none when overwriting originals).
+    /// Whether the WAV format exports copies of an instrument's samples: the sessions are not
+    /// rebased and nothing is marked saved, so the instrument keeps its edits to save.
+    pub fn exporting(&self) -> bool {
+        self.instrument && self.format == SaveFormat::Wav
+    }
+
+    /// Whether the save writes over the originals; an export never does.
+    fn overwriting(&self) -> bool {
+        self.overwrite && !self.exporting()
+    }
+
+    /// The files already in the new folder that the save would replace (none when overwriting
+    /// originals): for WAVs, a different file of a chosen file's name; for an instrument, its
+    /// `.sfz` or a WAV target already there.
     pub fn conflicts(&self, files: &[FileEntry]) -> Vec<PathBuf> {
-        if self.overwrite || self.format == SaveFormat::Sfz {
+        if self.overwriting() {
             return Vec::new();
+        }
+        if self.format == SaveFormat::Sfz {
+            return match &self.sfz_conflicts {
+                Some((dir, found)) if *dir == self.folder => found.clone(),
+                _ => Vec::new(),
+            };
         }
         self.chosen(files)
             .into_iter()
@@ -192,9 +222,29 @@ impl SaveDialogState {
             .collect()
     }
 
+    /// The names that more than one chosen file has, so they would replace each other in the
+    /// new folder (compared ignoring case). None when overwriting originals.
+    pub fn duplicate_names(&self, files: &[FileEntry]) -> Vec<String> {
+        if self.overwriting() || self.format == SaveFormat::Sfz {
+            return Vec::new();
+        }
+        let mut seen = std::collections::HashMap::new();
+        for i in self.chosen(files) {
+            let name = files[i].file_name();
+            seen.entry(name.to_lowercase()).or_insert((name, 0)).1 += 1;
+        }
+        let mut names: Vec<String> = seen
+            .into_values()
+            .filter(|(_, n)| *n > 1)
+            .map(|(name, _)| name)
+            .collect();
+        names.sort();
+        names
+    }
+
     /// Where the files go, or `None` while the folder path is unusable.
     fn destination(&self) -> Option<Destination> {
-        if self.overwrite {
+        if self.overwriting() {
             Some(Destination::OverwriteWithBackup)
         } else if self.folder.is_absolute() {
             Some(Destination::Folder(self.folder.clone()))
@@ -204,9 +254,14 @@ impl SaveDialogState {
     }
 
     /// The request the Save button sends; `None` while it is disabled (nothing chosen, an
-    /// unusable folder, or other files would be replaced without "Replace existing files").
+    /// unusable folder, chosen files that share a name, or other files would be replaced
+    /// without "Replace existing files").
     pub fn request(&self, files: &[FileEntry]) -> Option<SaveRequest> {
+        let blocked = !self.replace_existing && !self.conflicts(files).is_empty();
         if self.format == SaveFormat::Sfz {
+            if blocked {
+                return None;
+            }
             let destination = self.destination()?;
             return Some(SaveRequest {
                 indices: Vec::new(),
@@ -219,7 +274,7 @@ impl SaveDialogState {
             });
         }
         let indices = self.chosen(files);
-        if indices.is_empty() || (!self.replace_existing && !self.conflicts(files).is_empty()) {
+        if indices.is_empty() || blocked || !self.duplicate_names(files).is_empty() {
             return None;
         }
         Some(SaveRequest {
@@ -308,7 +363,7 @@ fn dialog_body(ui: &mut Ui, st: &mut SaveDialogState, files: &[FileEntry]) {
             st.format = SaveFormat::Sfz;
         }
         if !st.instrument {
-            ui.weak("open an instrument first");
+            ui.weak(st.sfz_hint);
         }
     });
     if st.format == SaveFormat::Sfz {
@@ -321,12 +376,13 @@ fn dialog_body(ui: &mut Ui, st: &mut SaveDialogState, files: &[FileEntry]) {
     }
 
     group(ui, "Where");
+    let overwrite = st.overwriting();
     ui.horizontal(|ui| {
-        let new_folder = ui.radio(!st.overwrite, "New folder");
+        let new_folder = ui.radio(!overwrite, "New folder");
         if new_folder.clicked() {
             st.overwrite = false;
         }
-        ui.add_enabled_ui(!st.overwrite, |ui| {
+        ui.add_enabled_ui(!overwrite, |ui| {
             let mut text = st.folder.to_string_lossy().into_owned();
             let field = ui.add(TextEdit::singleline(&mut text).desired_width(300.0));
             let field = field.labelled_by(new_folder.id);
@@ -342,7 +398,7 @@ fn dialog_body(ui: &mut Ui, st: &mut SaveDialogState, files: &[FileEntry]) {
             }
         });
     });
-    if !st.overwrite && !st.folder.is_absolute() {
+    if !overwrite && !st.folder.is_absolute() {
         ui.colored_label(colors::END, "Enter the full path of a folder");
     }
     let conflicts = st.conflicts(files);
@@ -362,10 +418,26 @@ fn dialog_body(ui: &mut Ui, st: &mut SaveDialogState, files: &[FileEntry]) {
         ui.add(egui::Label::new(RichText::new(names.join(", ")).weak()).wrap());
         ui.checkbox(&mut st.replace_existing, "Replace existing files");
     }
-    if ui.radio(st.overwrite, "Overwrite originals").clicked() {
+    let duplicates = st.duplicate_names(files);
+    if !duplicates.is_empty() {
+        ui.colored_label(
+            colors::END,
+            format!(
+                "More than one chosen file is called {}; they would replace each other in this folder. Save them one at a time.",
+                duplicates.join(", ")
+            ),
+        );
+    }
+    let exporting = st.exporting();
+    let radio = RadioButton::new(overwrite, "Overwrite originals");
+    if ui.add_enabled(!exporting, radio).clicked() {
         st.overwrite = true;
     }
-    ui.weak("Keeps a .bak copy of each file it replaces");
+    if exporting {
+        ui.weak("Copies of the instrument's WAVs; the instrument keeps its changes to save");
+    } else {
+        ui.weak("Keeps a .bak copy of each file it replaces");
+    }
 
     group(ui, "Metadata");
     if st.format == SaveFormat::Sfz {
@@ -544,6 +616,23 @@ pub(crate) fn save_session(
             ))
         }
     }
+}
+
+/// Writes copies of the files of `req` (an export of an instrument's samples): each session
+/// stays on its own file with its history, unsaved as before.
+pub fn export_wavs(files: &[FileEntry], req: &SaveRequest) -> Vec<SaveResult> {
+    req.indices
+        .iter()
+        .filter_map(|&i| match files.get(i) {
+            Some(FileEntry::Loaded(s)) => Some(s),
+            _ => None,
+        })
+        .map(|s| {
+            let e = saved_edit(s, req.trim_after_loop);
+            let result = save_wav(&s.doc, &e, &req.destination).map_err(|err| err.to_string());
+            (s.doc.path.clone(), result)
+        })
+        .collect()
 }
 
 /// Saves the files of `req` one by one, rebasing each saved session on its new file, and
