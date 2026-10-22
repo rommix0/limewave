@@ -245,6 +245,22 @@ fn write_tuning_and_loop(
         if stop {
             put(inst, region, "loop_mode", "no_loop");
         }
+        // Points that were the sample's loop, left behind, would read as a loop
+        // of the region's own the next time a playback mode turns it on, and it
+        // would stop following. Any other points are the region's own and stay.
+        // The trim has already moved them, so compare where it moved the loop.
+        if before.loop_mode != LoopMode::Off {
+            let max = after.end.saturating_sub(after.start) as i64;
+            let moved = |p: usize| (p as i64 - after.start as i64).clamp(0, max) as usize;
+            for (name, now, was) in [
+                ("loop_start", info.loop_start, before.loop_start),
+                ("loop_end", info.loop_end, before.loop_end),
+            ] {
+                if now == Some(moved(was)) {
+                    inst.unset(region, name);
+                }
+            }
+        }
         return;
     }
     // A region that played without a loop now loops; `one_shot`, the looping
@@ -677,6 +693,78 @@ mod tests {
         let mut b = bind(&k, dir.path());
         complete(&mut b, &k, &[Some((w, reference))]);
         assert_eq!(b.samples[0].follows, [true, true, false, true]);
+    }
+
+    #[test]
+    fn turning_the_loop_off_clears_the_points_written_for_it() {
+        let mut i = inst("<region> sample=a.wav\n");
+        let on = EditState {
+            root: 60,
+            cents: 0.0,
+            ..looped(LoopMode::Forward, 100, 200)
+        };
+        let off = EditState {
+            loop_mode: LoopMode::Off,
+            ..on.clone()
+        };
+        write_back(&mut i, &all_follow(1), &off, &on);
+        assert_eq!(value(&i, 0, "loop_start").as_deref(), Some("100"));
+        write_back(&mut i, &all_follow(1), &on, &off);
+        assert_eq!(value(&i, 0, "loop_mode").as_deref(), Some("no_loop"));
+        assert_eq!(value(&i, 0, "loop_start"), None);
+        assert_eq!(value(&i, 0, "loop_end"), None);
+        // Saved so and opened again, Normal on a looped sample writes loop_continuous: the
+        // region loops by its mode alone and still follows the unlooped sample it opened with.
+        i.set(0, "loop_mode", "loop_continuous");
+        let dir = tempfile::tempdir().unwrap();
+        touch(dir.path(), "a.wav");
+        let mut b = bind(&i, dir.path());
+        complete(&mut b, &i, &[Some((off.clone(), off))]);
+        assert_eq!(b.samples[0].follows, [true]);
+    }
+
+    #[test]
+    fn a_one_shot_region_also_drops_its_points_when_the_loop_goes() {
+        let mut i = inst("<region> sample=a.wav loop_mode=one_shot loop_start=100 loop_end=200");
+        let on = looped(LoopMode::Forward, 100, 200);
+        write_back(&mut i, &all_follow(1), &on, &wav());
+        assert_eq!(value(&i, 0, "loop_mode").as_deref(), Some("one_shot"));
+        assert_eq!(value(&i, 0, "loop_start"), None);
+        assert_eq!(value(&i, 0, "loop_end"), None);
+    }
+
+    #[test]
+    fn loop_points_of_a_regions_own_stay_when_the_loop_goes() {
+        let text = "<region> sample=a.wav loop_mode=one_shot loop_start=300 loop_end=900\n";
+        // Off to off, as a crop changes the unused points: nothing was the sample's loop.
+        let mut i = inst(text);
+        let after = EditState {
+            loop_end: 500,
+            ..wav()
+        };
+        write_back(&mut i, &all_follow(1), &wav(), &after);
+        assert_eq!(value(&i, 0, "loop_start").as_deref(), Some("300"));
+        assert_eq!(value(&i, 0, "loop_end").as_deref(), Some("900"));
+        // On to off, but the region's points are not the sample's loop.
+        let mut j = inst(text);
+        write_back(
+            &mut j,
+            &all_follow(1),
+            &looped(LoopMode::Forward, 100, 200),
+            &wav(),
+        );
+        assert_eq!(value(&j, 0, "loop_start").as_deref(), Some("300"));
+        assert_eq!(value(&j, 0, "loop_end").as_deref(), Some("900"));
+    }
+
+    #[test]
+    fn the_sample_loop_points_go_with_the_loop_after_a_trim() {
+        let mut i = inst("<region> sample=a.wav loop_mode=one_shot loop_start=100 loop_end=200");
+        let before = looped(LoopMode::Forward, 100, 200);
+        let after = EditState { start: 50, ..wav() };
+        write_back(&mut i, &all_follow(1), &before, &after);
+        assert_eq!(value(&i, 0, "loop_start"), None);
+        assert_eq!(value(&i, 0, "loop_end"), None);
     }
 
     #[test]

@@ -487,6 +487,23 @@ impl Instrument {
         }
     }
 
+    /// Removes an opcode from the region itself, in any spelling. Inherited levels are never
+    /// touched, so the region may still inherit it.
+    pub fn unset(&mut self, region: usize, name: &str) {
+        let Some(&h) = self.regions().get(region) else {
+            return;
+        };
+        let canon = canonical(name);
+        let end = self.span_end(h);
+        let kept: Vec<Token> = self
+            .file
+            .tokens
+            .drain(h + 1..end)
+            .filter(|t| !matches!(t, Token::Opcode { name, .. } if canonical(name) == canon))
+            .collect();
+        self.file.tokens.splice(h + 1..h + 1, kept);
+    }
+
     /// Appends an empty `<group>` and returns its group number.
     pub fn add_group(&mut self) -> usize {
         self.file.tokens.push(Token::Header(HeaderKind::Group));
@@ -728,6 +745,24 @@ mod tests {
         i.set(0, "loop_start", "20");
         assert_eq!(i.file.tokens[1], op("loopstart", "20"));
         assert_eq!(i.file.tokens.len(), 3);
+    }
+
+    #[test]
+    fn unset_removes_the_region_level_opcode_only() {
+        let mut i = inst(
+            "<group> loop_end=90 <region> loopstart=10 loop_end=99 loop_start=12 hikey=5 \
+             <region> loop_start=7",
+        );
+        i.unset(0, "loop_start");
+        i.unset(0, "loop_end");
+        assert_eq!(i.get(0, "loop_start"), None);
+        assert_eq!(i.get(0, "loop_end"), Some(("90".into(), Level::Group)));
+        assert_eq!(i.get(0, "hikey"), Some(("5".into(), Level::Region)));
+        assert_eq!(i.get(1, "loop_start"), Some(("7".into(), Level::Region)));
+        // Nothing to remove is no change.
+        let was = i.clone();
+        i.unset(0, "loop_start");
+        assert_eq!(i, was);
     }
 
     #[test]
