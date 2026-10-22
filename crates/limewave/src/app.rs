@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Event, Key, KeyboardShortcut, Modifiers};
 use limewave_core::document::{WavDocument, load_wav, new_document};
+use limewave_core::dsp::resample::resampled_len;
 use limewave_core::dsp::{PeakPyramid, mono_sum};
 use limewave_core::edit::{
     EditState, History, Marker, crop_to_loop, crop_to_selection, redraw_samples,
@@ -582,6 +583,18 @@ impl FileEntry {
 /// The pause after the last settings change before a dialog renders again (v0.3 §7).
 const RENDER_DEBOUNCE: Duration = Duration::from_millis(200);
 
+/// The selection and play-from point a conversion moved, kept so that undoing that conversion
+/// puts them back exactly: scaling back by the ratio can be a frame off.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConvertedUi {
+    /// The rates converted from and to.
+    pub rates: (u32, u32),
+    /// The selection and play-from point before the conversion.
+    pub before: (Option<(usize, usize)>, Option<usize>),
+    /// The same after it.
+    pub after: (Option<(usize, usize)>, Option<usize>),
+}
+
 /// View and tool settings that outlive a single frame.
 pub struct UiState {
     pub snap: bool,
@@ -601,6 +614,8 @@ pub struct UiState {
     pub selection: Option<(usize, usize)>,
     /// Where Play starts instead of Start, set by clicking on the waveform.
     pub play_from: Option<usize>,
+    /// What the last conversion did to the selection and play-from point.
+    pub converted: Option<ConvertedUi>,
     /// The remembered values of the Effects dialogs.
     pub effect_params: EffectParams,
     /// The Effects dialog that is open.
@@ -646,6 +661,7 @@ impl Default for UiState {
             marker_entry: None,
             selection: None,
             play_from: None,
+            converted: None,
             effect_params: EffectParams::default(),
             effect_dialog: None,
             midi_learn: None,
@@ -2152,10 +2168,12 @@ impl LimewaveApp {
             self.step_instrument(false);
             return;
         }
+        let rate = self.selected_session().map(Session::rate);
         let engine = self.engine.as_ref();
         if let Some(FileEntry::Loaded(s)) = self.selected.and_then(|i| self.files.get_mut(i)) {
             s.undo(engine);
         }
+        self.follow_rate_change(rate);
         self.clamp_ui_to_file();
     }
 
@@ -2165,11 +2183,43 @@ impl LimewaveApp {
             self.step_instrument(true);
             return;
         }
+        let rate = self.selected_session().map(Session::rate);
         let engine = self.engine.as_ref();
         if let Some(FileEntry::Loaded(s)) = self.selected.and_then(|i| self.files.get_mut(i)) {
             s.redo(engine);
         }
+        self.follow_rate_change(rate);
         self.clamp_ui_to_file();
+    }
+
+    /// Moves the selection and the play-from point with the audio when undo or redo changed
+    /// the selected file's rate from `before`: positions scale by the ratio of the rates, the
+    /// selection's last frame as an inclusive end (the position one past it). Does nothing when
+    /// the rate is the same.
+    fn follow_rate_change(&mut self, before: Option<u32>) {
+        let (Some(from), Some(to)) = (before, self.selected_session().map(Session::rate)) else {
+            return;
+        };
+        if from == to || from == 0 {
+            return;
+        }
+        // Undoing the last conversion with nothing moved since: put back what it replaced.
+        if let Some(c) = self.ui.converted
+            && c.rates == (to, from)
+            && (self.ui.selection, self.ui.play_from) == c.after
+        {
+            (self.ui.selection, self.ui.play_from) = c.before;
+            return;
+        }
+        let scale = |f: usize| resampled_len(f, from, to);
+        self.ui.selection = self.ui.selection.map(|(first, last)| {
+            let first = scale(first);
+            (
+                first,
+                scale(last.saturating_add(1)).saturating_sub(1).max(first),
+            )
+        });
+        self.ui.play_from = self.ui.play_from.map(scale);
     }
 
     /// Keeps the selection and the play-from point inside the selected file, whose length a
@@ -2193,15 +2243,31 @@ impl LimewaveApp {
     /// that `e` adds: the selection's last frame as an inclusive end, the others as starts.
     /// Undo and redo leave them to the usual clamping.
     pub fn apply_rate_edit(&mut self, e: EditState) {
+        let before = (self.ui.selection, self.ui.play_from);
+        let mut rates = None;
         if let Some(s) = self.selected_session() {
             let steps = &e.effects[s.edit().effects.len().min(e.effects.len())..];
-            self.ui.selection = self.ui.selection.map(|(first, last)| {
+            let selection = before.0.map(|(first, last)| {
                 let first = resample_map(steps, first);
                 (first, resample_map_end(steps, last).max(first))
             });
-            self.ui.play_from = self.ui.play_from.map(|f| resample_map(steps, f));
+            let play_from = before.1.map(|f| resample_map(steps, f));
+            rates = Some((
+                s.rate(),
+                rate_after(s.doc.format.sample_rate, &e.effects),
+                selection,
+                play_from,
+            ));
+        }
+        if let Some((_, _, selection, play_from)) = rates {
+            (self.ui.selection, self.ui.play_from) = (selection, play_from);
         }
         self.apply_dialog_edit(e);
+        self.ui.converted = rates.map(|(from, to, ..)| ConvertedUi {
+            rates: (from, to),
+            before,
+            after: (self.ui.selection, self.ui.play_from),
+        });
     }
 
     /// Records `e`, a dialog's rendered edit, as one history entry of the selected file. The
@@ -4721,5 +4787,29 @@ mod tests {
         app.apply_rate_edit(e);
         assert_eq!(app.ui.selection, Some((2205, 4410)));
         assert_eq!(app.ui.play_from, Some(2205));
+
+        // Undo returns them to the same moments at the old rate; redo converts them again.
+        app.undo();
+        assert_eq!(app.ui.selection, Some((4410, 8820)));
+        assert_eq!(app.ui.play_from, Some(4410));
+        app.redo();
+        assert_eq!(app.ui.selection, Some((2205, 4410)));
+        assert_eq!(app.ui.play_from, Some(2205));
+    }
+
+    #[test]
+    fn undo_of_an_edit_that_keeps_the_rate_leaves_the_selection_alone() {
+        let mut app = app_with(short_session());
+        let e = converted(&app, 22_050);
+        app.apply_rate_edit(e);
+        let mut e = app.selected_session().unwrap().edit().clone();
+        e.start = 10;
+        app.apply_dialog_edit(e);
+        app.ui.selection = Some((100, 200));
+        app.ui.play_from = Some(150);
+        app.undo();
+        assert_eq!(app.selected_session().unwrap().rate(), 22_050);
+        assert_eq!(app.ui.selection, Some((100, 200)));
+        assert_eq!(app.ui.play_from, Some(150));
     }
 }
