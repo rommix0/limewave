@@ -269,6 +269,61 @@ fn edit_menu_crop_to_loop_uses_the_padding() {
 }
 
 #[test]
+fn edit_menu_crop_to_selection_cuts_the_audio() {
+    let mut h = looped_harness();
+    h.get_by_label("Edit").click();
+    h.run();
+    assert!(
+        h.get_by_label("Crop to selection")
+            .accesskit_node()
+            .is_disabled(),
+        "needs a selection"
+    );
+
+    // The loop 1000..=5000 crosses the selection's start, so it is clipped to it.
+    h.state_mut().ui.selection = Some((2000, 6999));
+    h.state_mut().ui.play_from = Some(2500);
+    h.run();
+    h.get_by_label("Crop to selection").click();
+    h.run();
+
+    let s = session(h.state());
+    assert_eq!(s.frames(), 5000);
+    assert_eq!(s.processed[0][..], s.doc.audio[0][2000..7000]);
+    let e = s.edit();
+    assert_eq!((e.start, e.end), (0, 4999));
+    assert_eq!(e.loop_mode, LoopMode::Forward);
+    assert_eq!((e.loop_start, e.loop_end), (0, 3000));
+    // The selection and the play-from point referred to the old frames.
+    assert_eq!(h.state().ui.selection, None);
+    assert_eq!(h.state().ui.play_from, None);
+
+    // One undo brings the whole file back.
+    h.state_mut().undo();
+    h.run();
+    let s = session(h.state());
+    assert_eq!(s.frames(), 8000);
+    assert_eq!((s.edit().loop_start, s.edit().loop_end), (1000, 5000));
+}
+
+#[test]
+fn crop_to_selection_of_the_whole_file_explains_itself() {
+    let mut h = looped_harness();
+    h.state_mut().ui.selection = Some((0, 7999));
+    h.run();
+    h.state_mut().crop_to_selection();
+    h.run();
+    assert_eq!(session(h.state()).frames(), 8000);
+    assert!(
+        h.state()
+            .ui
+            .message
+            .as_deref()
+            .is_some_and(|m| m.contains("whole file"))
+    );
+}
+
+#[test]
 fn edit_menu_selection_items_need_a_selection() {
     let mut h = looped_harness();
     h.get_by_label("Edit").click();

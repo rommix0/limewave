@@ -46,6 +46,13 @@ pub fn edit_menu(ui: &mut egui::Ui, app: &mut LimewaveApp) {
         {
             app.set_trim_to_selection();
         }
+        if ui
+            .add_enabled(selected, Button::new("Crop to selection"))
+            .on_hover_text("Remove the audio outside the selection now (undoable)")
+            .clicked()
+        {
+            app.crop_to_selection();
+        }
         ui.separator();
         if ui
             .add_enabled(looped, Button::new("Trim after loop end"))

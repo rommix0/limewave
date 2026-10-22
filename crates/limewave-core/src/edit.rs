@@ -1,6 +1,8 @@
 //! Edit state (trim and loop markers, tuning, effects), marker-move constraints and undo history.
 
-use crate::effects::{AppliedEffect, Op, frames_after, output_frames};
+use std::sync::Arc;
+
+use crate::effects::{AppliedEffect, Op, Splice, SpliceKind, frames_after, output_frames};
 
 /// How the sample loops on playback.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -228,6 +230,57 @@ pub fn crop_to_loop(e: &EditState, padding: usize, original_frames: usize) -> Ed
         return t;
     }
     move_marker(&t, Marker::Start, t.loop_start, false, original_frames)
+}
+
+/// Cuts the file down to the selection now: the audio before and after it is removed, as
+/// undoable effect steps. Start and End become the new first and last frame. A loop inside the
+/// selection moves with the audio, a loop crossing an edge is clipped to it, and a loop left with
+/// fewer than two frames is turned off. `channels` is the processed audio's channel count.
+/// Fails when there is no audio or the selection already covers the whole file.
+pub fn crop_to_selection(
+    e: &EditState,
+    sel: (usize, usize),
+    channels: usize,
+    original_frames: usize,
+) -> Result<EditState, String> {
+    let frames = frames_after(original_frames, &e.effects);
+    if frames == 0 {
+        return Err("There is no audio to crop".into());
+    }
+    let last = frames - 1;
+    let (lo, hi) = (sel.0.min(sel.1).min(last), sel.0.max(sel.1).min(last));
+    if lo == 0 && hi == last {
+        return Err("The selection already covers the whole file".into());
+    }
+    let cut = |first, last| AppliedEffect {
+        op: Op::Splice(Arc::new(Splice {
+            kind: SpliceKind::Cut,
+            audio: vec![Vec::new(); channels],
+            generated: (0, 0),
+        })),
+        first,
+        last,
+    };
+    let mut c = e.clone();
+    // The part after the selection goes first, so the frame numbers before it stay valid.
+    if hi < last {
+        c.effects.push(cut(hi + 1, last));
+    }
+    if lo > 0 {
+        c.effects.push(cut(0, lo - 1));
+    }
+    c.start = 0;
+    c.end = hi - lo;
+    if c.loop_mode != LoopMode::Off {
+        let (ls, le) = (e.loop_start.max(lo), e.loop_end.min(hi));
+        if le > ls {
+            c.loop_start = ls - lo;
+            c.loop_end = le - lo;
+        } else {
+            c.loop_mode = LoopMode::Off;
+        }
+    }
+    Ok(c.clamped(original_frames))
 }
 
 /// Linear undo/redo history of edit states, tracking which one was last saved.
@@ -654,5 +707,83 @@ mod tests {
         let off = EditState::default_for(1000);
         assert_eq!(trim_after_loop(&off, 16, 1000), off);
         assert_eq!(crop_to_loop(&off, 16, 1000), off);
+    }
+
+    /// `channels` channels of a distinct ramp each.
+    fn ramps(frames: usize, channels: usize) -> Vec<Vec<f32>> {
+        (0..channels)
+            .map(|c| (0..frames).map(|i| (c * 10_000 + i) as f32).collect())
+            .collect()
+    }
+
+    #[test]
+    fn crop_to_selection_removes_the_audio_outside() {
+        let audio = ramps(1000, 2);
+        let e = EditState::default_for(1000);
+        // A selection dragged right to left is ordered first.
+        let c = crop_to_selection(&e, (599, 200), 2, 1000).unwrap();
+        let out = crate::effects::process(&audio, &c.effects);
+        assert_eq!(out[0], audio[0][200..600]);
+        assert_eq!(out[1], audio[1][200..600]);
+        assert_eq!((c.start, c.end), (0, 399));
+        assert_eq!(c.clone().clamped(1000), c);
+    }
+
+    #[test]
+    fn crop_to_selection_shifts_clips_or_drops_the_loop() {
+        let crop = |ls, le| crop_to_selection(&looped(1000, 999, ls, le), (200, 599), 1, 1000);
+        let inside = crop(300, 500).unwrap();
+        assert_eq!(inside.loop_mode, LoopMode::Forward);
+        assert_eq!((inside.loop_start, inside.loop_end), (100, 300));
+        let crossing = crop(100, 400).unwrap();
+        assert_eq!((crossing.loop_start, crossing.loop_end), (0, 200));
+        assert_eq!(crossing.loop_mode, LoopMode::Forward);
+        let after = crop(700, 800).unwrap();
+        assert_eq!(after.loop_mode, LoopMode::Off);
+        // A loop left with a single frame is turned off.
+        assert_eq!(crop(599, 700).unwrap().loop_mode, LoopMode::Off);
+        // A crossfade longer than the clipped loop allows is shortened.
+        let mut faded = looped(1000, 999, 150, 700);
+        faded.crossfade = 100;
+        let c = crop_to_selection(&faded, (200, 599), 1, 1000).unwrap();
+        assert!(c.crossfade <= c.max_crossfade());
+        assert_eq!(c.clone().clamped(1000), c);
+    }
+
+    #[test]
+    fn crop_to_selection_at_the_file_edges_and_of_the_whole_file() {
+        let e = EditState::default_for(1000);
+        let head = crop_to_selection(&e, (0, 499), 1, 1000).unwrap();
+        assert_eq!(head.effects.len(), 1);
+        assert_eq!(frames_after(1000, &head.effects), 500);
+        let tail = crop_to_selection(&e, (500, 999), 1, 1000).unwrap();
+        assert_eq!(tail.effects.len(), 1);
+        assert_eq!(frames_after(1000, &tail.effects), 500);
+        // A selection past the end is clamped to the file.
+        let past = crop_to_selection(&e, (500, 5000), 1, 1000).unwrap();
+        assert_eq!(past, tail);
+        assert!(crop_to_selection(&e, (0, 999), 1, 1000).is_err());
+        assert!(crop_to_selection(&EditState::default_for(0), (0, 0), 1, 0).is_err());
+    }
+
+    #[test]
+    fn crop_to_selection_follows_an_earlier_splice() {
+        let audio = ramps(1000, 1);
+        let mut e = EditState::default_for(1000);
+        e.effects.push(AppliedEffect {
+            op: Op::Splice(Arc::new(Splice {
+                kind: SpliceKind::Tail,
+                audio: vec![(0..600).map(|i| -(i as f32)).collect()],
+                generated: (0, 599),
+            })),
+            first: 900,
+            last: 999,
+        });
+        let e = e.clamped(1000);
+        let c = crop_to_selection(&e, (1000, 1499), 1, 1000).unwrap();
+        let out = crate::effects::process(&audio, &c.effects);
+        let want: Vec<f32> = (100..600).map(|i| -(i as f32)).collect();
+        assert_eq!(out[0], want);
+        assert_eq!((c.start, c.end), (0, 499));
     }
 }

@@ -2133,6 +2133,26 @@ mod tests {
     }
 
     #[test]
+    fn crop_to_selection_saves_the_cut_file() {
+        let d = doc(&short_file(vec![chunk(
+            b"cue ",
+            cue_bytes(&[
+                cue_point(1, 100),
+                cue_point(2, 300),
+                cue_point(3, 700),
+                cue_point(4, 1000),
+            ]),
+        )]));
+        let e = crate::edit::crop_to_selection(&d.initial_edit(), (200, 599), 1, d.frames).unwrap();
+        let out = build_wav_bytes(&d, &e);
+        let saved = doc(&out);
+        assert_eq!(saved.frames, 400);
+        assert_eq!(saved.audio[0], d.audio[0][200..600]);
+        // Cues outside the selection go; the one inside shifts; the end-of-file cue follows.
+        assert_eq!(cue_positions(&out), vec![(2, 100), (4, 400)]);
+    }
+
+    #[test]
     fn cues_after_a_shortening_splice_shift() {
         let d = doc(&short_file(vec![chunk(
             b"cue ",

@@ -11,8 +11,8 @@ use eframe::egui::{self, Event, Key, KeyboardShortcut, Modifiers};
 use limewave_core::document::{WavDocument, load_wav};
 use limewave_core::dsp::{PeakPyramid, mono_sum};
 use limewave_core::edit::{
-    EditState, History, Marker, crop_to_loop, set_loop_to_selection, set_trim_to_selection,
-    trim_after_loop,
+    EditState, History, Marker, crop_to_loop, crop_to_selection, set_loop_to_selection,
+    set_trim_to_selection, trim_after_loop,
 };
 use limewave_core::effects::{
     AppliedEffect, Effect, Op, apply_effect, generated_ranges, mirror_edit, peak, plan_effect,
@@ -998,6 +998,21 @@ impl LimewaveApp {
     pub fn crop_to_loop(&mut self) {
         let padding = self.ui.save_dialog.padding;
         self.edit_selected(|s| Ok(crop_to_loop(s.edit(), padding, s.doc.frames)));
+    }
+
+    /// Cuts the audio down to the selection now (undoable). The selection and play-from point
+    /// referred to the old frames, so they are cleared, and the view refits the shorter file.
+    pub fn crop_to_selection(&mut self) {
+        let Some(sel) = self.ui.selection else { return };
+        let before = self.selected_session().map(|s| s.edit().clone());
+        self.edit_selected(|s| crop_to_selection(s.edit(), sel, s.processed.len(), s.doc.frames));
+        if let Some(s) = self.selected_session_mut()
+            && before.as_ref() != Some(s.edit())
+        {
+            s.view = None;
+            self.ui.selection = None;
+            self.ui.play_from = None;
+        }
     }
 
     /// Moves Start and End in to the first and last frame at or above `threshold_db` (kept

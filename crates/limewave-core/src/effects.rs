@@ -65,6 +65,8 @@ pub enum Op {
 pub enum SpliceKind {
     Tail,
     SpectrumLoop,
+    /// Audio removed with nothing in its place (Crop to selection).
+    Cut,
 }
 
 /// The finished audio that a splice step puts in place of its range.
