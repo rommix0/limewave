@@ -42,6 +42,9 @@ pub struct InstrumentState {
     /// Which WAV each region of the current instrument plays.
     pub binding: Binding,
     pub selected_region: Option<usize>,
+    /// The region to select once the samples have loaded: the one selected when this copy was
+    /// saved and reopened.
+    pub reselect: Option<usize>,
     /// `binding.samples[i]` -> its index in the app's file list; `None` when it is not there.
     pub sample_file: Vec<Option<usize>>,
     /// What Close instrument opens again: the folder or file open before.
@@ -77,6 +80,7 @@ impl InstrumentState {
             history: History::new(inst),
             binding,
             selected_region: None,
+            reselect: None,
             sample_file: (0..n).map(Some).collect(),
             return_to,
             destination: None,

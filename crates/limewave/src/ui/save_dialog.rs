@@ -16,6 +16,7 @@ use limewave_core::software_tag;
 use crate::app::{FileEntry, LimewaveApp, Session};
 use crate::audio::engine::{AudioEngine, Command};
 use crate::audio::voice::PlayBuffer;
+use crate::instrument::InstrumentState;
 use crate::theme::colors;
 
 /// One file's save result: the source path and what was written, or why not.
@@ -30,9 +31,24 @@ pub enum SaveCommand {
     SaveAs,
 }
 
+/// What the dialog saves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SaveFormat {
+    /// Each chosen file as its own WAV.
+    #[default]
+    Wav,
+    /// The open instrument: its `.sfz` and every WAV it plays (spec 7.1).
+    Sfz,
+}
+
 /// What the save dialog shows and remembers between openings.
 pub struct SaveDialogState {
     pub open: bool,
+    pub format: SaveFormat,
+    /// Also write the loop and root key into each of the instrument's WAVs (`smpl`).
+    pub write_smpl: bool,
+    /// Whether the dialog was opened for an instrument, which offers [`SaveFormat::Sfz`].
+    pub instrument: bool,
     pub overwrite: bool,
     pub folder: PathBuf,
     pub trim_after_loop: bool,
@@ -44,7 +60,8 @@ pub struct SaveDialogState {
     pub current: usize,
     /// Whether a folder is open, which offers `scope_all`.
     pub folder_mode: bool,
-    /// The per-file "save" ticks, indexed like the app's file list.
+    /// The per-file "save" ticks, indexed like the app's file list; a file past its end is
+    /// ticked.
     pub selected_files: Vec<bool>,
     /// The user agreed to replace other files of the same name in `folder`. Reset when the
     /// dialog opens or the folder changes.
@@ -55,6 +72,9 @@ impl Default for SaveDialogState {
     fn default() -> Self {
         SaveDialogState {
             open: false,
+            format: SaveFormat::Wav,
+            write_smpl: false,
+            instrument: false,
             overwrite: false,
             folder: PathBuf::new(),
             trim_after_loop: false,
@@ -88,6 +108,8 @@ impl SaveDialogState {
             return;
         };
         self.open = true;
+        self.format = SaveFormat::Wav;
+        self.instrument = false;
         self.current = current;
         self.folder_mode = folder_mode;
         self.scope_all = false;
@@ -102,6 +124,24 @@ impl SaveDialogState {
         };
     }
 
+    /// Opens the dialog for the open instrument (spec 7.1): SFZ format, a new folder next to the
+    /// `.sfz` unless the instrument last overwrote its originals, and its `smpl` choice.
+    /// "Individual WAV files" lists every loaded sample, as Save as… does for a folder.
+    pub fn open_for_instrument(&mut self, st: &InstrumentState) {
+        self.open = true;
+        self.format = SaveFormat::Sfz;
+        self.instrument = true;
+        self.write_smpl = st.write_smpl;
+        self.current = 0;
+        self.folder_mode = true;
+        self.scope_all = true;
+        self.only_changed = true;
+        self.selected_files.clear();
+        self.overwrite = st.destination == Some(Destination::OverwriteWithBackup);
+        self.replace_existing = false;
+        self.folder = default_folder(&st.path);
+    }
+
     /// Changes the folder; any agreement to replace files there no longer holds.
     pub fn set_folder(&mut self, folder: PathBuf) {
         if folder != self.folder {
@@ -113,7 +153,7 @@ impl SaveDialogState {
     /// The chosen files that would replace a different file of the same name in the new
     /// folder (none when overwriting originals).
     pub fn conflicts(&self, files: &[FileEntry]) -> Vec<PathBuf> {
-        if self.overwrite {
+        if self.overwrite || self.format == SaveFormat::Sfz {
             return Vec::new();
         }
         self.chosen(files)
@@ -147,7 +187,7 @@ impl SaveDialogState {
     /// The files that will be saved.
     pub fn chosen(&self, files: &[FileEntry]) -> Vec<usize> {
         self.scope(files)
-            .filter(|(i, s)| self.selected_files.get(*i) == Some(&true) && self.can_save(s))
+            .filter(|(i, s)| self.selected_files.get(*i) != Some(&false) && self.can_save(s))
             .map(|(i, _)| i)
             .collect()
     }
@@ -166,6 +206,18 @@ impl SaveDialogState {
     /// The request the Save button sends; `None` while it is disabled (nothing chosen, an
     /// unusable folder, or other files would be replaced without "Replace existing files").
     pub fn request(&self, files: &[FileEntry]) -> Option<SaveRequest> {
+        if self.format == SaveFormat::Sfz {
+            let destination = self.destination()?;
+            return Some(SaveRequest {
+                indices: Vec::new(),
+                destination: destination.clone(),
+                trim_after_loop: None,
+                instrument: Some(InstrumentSaveRequest {
+                    destination,
+                    write_smpl: self.write_smpl,
+                }),
+            });
+        }
         let indices = self.chosen(files);
         if indices.is_empty() || (!self.replace_existing && !self.conflicts(files).is_empty()) {
             return None;
@@ -174,6 +226,7 @@ impl SaveDialogState {
             indices,
             destination: self.destination()?,
             trim_after_loop: self.trim_after_loop.then_some(self.padding),
+            instrument: None,
         })
     }
 }
@@ -184,6 +237,15 @@ pub struct SaveRequest {
     pub indices: Vec<usize>,
     pub destination: Destination,
     pub trim_after_loop: Option<usize>,
+    /// Set when the open instrument is saved instead of `indices`.
+    pub instrument: Option<InstrumentSaveRequest>,
+}
+
+/// Where the open instrument goes, and whether its WAVs also get `smpl` from it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstrumentSaveRequest {
+    pub destination: Destination,
+    pub write_smpl: bool,
 }
 
 /// Draws the save dialog while `st.open`. Returns the request when Save is clicked; Save,
@@ -209,10 +271,13 @@ pub fn save_dialog(
             .show(ui, |ui| dialog_body(ui, st, app_files));
         ui.separator();
         let req = st.request(app_files);
-        let count = st.chosen(app_files).len();
+        let label = match st.format {
+            SaveFormat::Sfz => "Save instrument".to_owned(),
+            SaveFormat::Wav => format!("Save {} file(s)", st.chosen(app_files).len()),
+        };
         ui.horizontal(|ui| {
             cancel = ui.button("Cancel").clicked();
-            let save = ui.add_enabled(req.is_some(), Button::new(format!("Save {count} file(s)")));
+            let save = ui.add_enabled(req.is_some(), Button::new(label));
             if save.clicked() {
                 request = req;
             }
@@ -231,11 +296,27 @@ fn group(ui: &mut Ui, title: &str) {
 
 fn dialog_body(ui: &mut Ui, st: &mut SaveDialogState, files: &[FileEntry]) {
     group(ui, "Save as");
-    let _ = ui.radio(true, "Individual WAV files");
-    for label in ["SFZ instrument + its WAVs", "Both"] {
-        ui.horizontal(|ui| {
-            ui.add_enabled(false, RadioButton::new(false, label));
-            ui.weak("coming later");
+    if ui
+        .radio(st.format == SaveFormat::Wav, "Individual WAV files")
+        .clicked()
+    {
+        st.format = SaveFormat::Wav;
+    }
+    ui.horizontal(|ui| {
+        let sfz = RadioButton::new(st.format == SaveFormat::Sfz, "SFZ instrument + its WAVs");
+        if ui.add_enabled(st.instrument, sfz).clicked() {
+            st.format = SaveFormat::Sfz;
+        }
+        if !st.instrument {
+            ui.weak("open an instrument first");
+        }
+    });
+    if st.format == SaveFormat::Sfz {
+        ui.indent("write_smpl", |ui| {
+            ui.checkbox(
+                &mut st.write_smpl,
+                "Also write loop and root key into each WAV (smpl)",
+            );
         });
     }
 
@@ -286,6 +367,17 @@ fn dialog_body(ui: &mut Ui, st: &mut SaveDialogState, files: &[FileEntry]) {
     }
     ui.weak("Keeps a .bak copy of each file it replaces");
 
+    group(ui, "Metadata");
+    if st.format == SaveFormat::Sfz {
+        ui.label(format!("Software tag: {}", software_tag()));
+        return;
+    }
+    wav_files_body(ui, st, files);
+}
+
+/// The parts of the dialog only WAV saves have: what the `smpl` chunk holds, the audio changes
+/// and trim, and the file table.
+fn wav_files_body(ui: &mut Ui, st: &mut SaveDialogState, files: &[FileEntry]) {
     let chosen: Vec<&Session> = st
         .chosen(files)
         .into_iter()
@@ -295,7 +387,6 @@ fn dialog_body(ui: &mut Ui, st: &mut SaveDialogState, files: &[FileEntry]) {
         })
         .collect();
 
-    group(ui, "Metadata");
     ui.label("smpl chunk: root key, fine tune, loop points");
     ui.label(format!("Software tag: {}", software_tag()));
 
@@ -325,7 +416,7 @@ fn dialog_body(ui: &mut Ui, st: &mut SaveDialogState, files: &[FileEntry]) {
     });
 
     group(ui, "Files");
-    if st.folder_mode {
+    if st.folder_mode && !st.instrument {
         ui.checkbox(&mut st.scope_all, "All files in folder");
     }
     let rows: Vec<(usize, &Session)> = st.scope(files).collect();
@@ -634,6 +725,7 @@ mod tests {
             indices,
             destination: Destination::Folder(dir.to_path_buf()),
             trim_after_loop: None,
+            instrument: None,
         }
     }
 
@@ -758,6 +850,7 @@ mod tests {
             indices: vec![0],
             destination: Destination::OverwriteWithBackup,
             trim_after_loop: None,
+            instrument: None,
         };
         let results = perform_save(&mut app, overwrite.clone());
         let outcome = results[0].1.as_ref().unwrap();
@@ -1033,6 +1126,7 @@ mod tests {
                 indices: vec![0],
                 destination: Destination::Folder(dir.path().join("limewave")),
                 trim_after_loop: Some(16),
+                instrument: None,
             })
         );
         st.folder = PathBuf::from("relative");

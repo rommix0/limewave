@@ -20,12 +20,12 @@ use limewave_core::effects::{
 };
 use limewave_core::notes::note_name;
 use limewave_core::render::render;
-use limewave_core::save::{Destination, default_folder};
+use limewave_core::save::{Destination, SaveOutcome, default_folder};
 use limewave_core::sfz::map::{auto_map, fill_gaps};
 use limewave_core::sfz::model::Instrument;
 use limewave_core::sfz::parse::{decode_text, parse};
 use limewave_core::sfz::paths::{same_file_key, sample_path};
-use limewave_core::sfz::save::moved_text;
+use limewave_core::sfz::save::{SampleSave, moved_text, save_instrument};
 use limewave_core::sfz::{bind, value_round_trips};
 use limewave_core::wav::SampleFormat;
 
@@ -54,8 +54,8 @@ use crate::ui::record_panel::{NO_INPUT, RecordPanelState, record_panel};
 use crate::ui::region_inspector::{OWN_TUNING, RegionContext, RegionEdit, region_only};
 use crate::ui::regions::{RegionListAction, region_list, unassigned_cached};
 use crate::ui::save_dialog::{
-    SaveCommand, SaveDialogState, SaveRequest, SaveResult, other_file_in_the_way, perform_save,
-    save_dialog, save_results_window,
+    InstrumentSaveRequest, SaveCommand, SaveDialogState, SaveRequest, SaveResult,
+    other_file_in_the_way, perform_save, save_dialog, save_results_window,
 };
 use crate::ui::seam::{DEFAULT_HALF, SeamChannel, seam_view};
 use crate::ui::spectrum_dialog::{SpectrumDialogState, spectrum_dialog};
@@ -734,12 +734,31 @@ pub enum NewName {
 /// Asks where to save a file called the given name; `None` when the user cancels.
 pub type SavePicker = Box<dyn FnMut(&str) -> Option<PathBuf>>;
 
-/// The system's save-file dialog, offering WAV files.
+/// The system's save-file dialog, offering SFZ instruments for a `.sfz` name and WAV files
+/// otherwise.
 fn system_save_picker(name: &str) -> Option<PathBuf> {
-    rfd::FileDialog::new()
-        .add_filter("WAV audio", &["wav", "WAV"])
-        .set_file_name(name)
-        .save_file()
+    let dialog = rfd::FileDialog::new();
+    let dialog = if has_extension(Path::new(name), "sfz") {
+        dialog.add_filter("SFZ instrument", &["sfz", "SFZ"])
+    } else {
+        dialog.add_filter("WAV audio", &["wav", "WAV"])
+    };
+    dialog.set_file_name(name).save_file()
+}
+
+/// Whether `path` ends in `.ext`, in any case.
+fn has_extension(path: &Path, ext: &str) -> bool {
+    path.extension()
+        .is_some_and(|x| x.eq_ignore_ascii_case(ext))
+}
+
+/// `path` with `.ext` added unless it already ends in it. Some pickers return the typed name
+/// without the filter's extension; a name with a dot ("kick.01") keeps it, with `.ext` after.
+fn with_extension_added(mut path: PathBuf, ext: &str) -> PathBuf {
+    if !has_extension(&path, ext) {
+        path.as_mut_os_string().push(format!(".{ext}"));
+    }
+    path
 }
 
 pub struct LimewaveApp {
@@ -921,19 +940,19 @@ impl LimewaveApp {
     /// the open files. An instrument that can't be read (one using `#include`, say) opens
     /// nothing and says why in the toolbar.
     pub fn open_instrument(&mut self, path: PathBuf) {
+        if let Err(message) = self.try_open_instrument(path) {
+            self.ui.message = Some(message);
+        }
+    }
+
+    /// [`LimewaveApp::open_instrument`], returning why nothing was opened instead of showing it.
+    fn try_open_instrument(&mut self, path: PathBuf) -> Result<(), String> {
         let name = path
             .file_name()
             .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
-        let parsed = std::fs::read(&path)
+        let file = std::fs::read(&path)
             .map_err(|e| format!("Couldn't open {name}: {e}"))
-            .and_then(|bytes| parse(&decode_text(&bytes)).map_err(|e| e.to_string()));
-        let file = match parsed {
-            Ok(file) => file,
-            Err(message) => {
-                self.ui.message = Some(message);
-                return;
-            }
-        };
+            .and_then(|bytes| parse(&decode_text(&bytes)).map_err(|e| e.to_string()))?;
         // Close instrument goes back to what was open before any instrument.
         let return_to = match self.instrument.take() {
             Some(old) => old.return_to,
@@ -964,6 +983,7 @@ impl LimewaveApp {
         } else {
             self.loader = Some(folder::load_in_background(paths, self.ctx.clone()));
         }
+        Ok(())
     }
 
     /// Whether New instrument can run: a folder is open without an instrument, and at least
@@ -1192,13 +1212,21 @@ impl LimewaveApp {
     }
 
     /// The instrument's samples have all loaded (or failed): bind with each WAV's own state
-    /// and select the first region with a loaded sample, unless one is selected already.
+    /// and select the region to select again after a save, else the first region with a
+    /// loaded sample, unless one is selected already.
     fn finish_instrument_load(&mut self) {
         let Some(st) = &mut self.instrument else {
             return;
         };
         st.rebind(&self.files);
+        let reselect = st.reselect.take();
         if st.selected_region.is_some() {
+            return;
+        }
+        if let Some(region) = reselect
+            && let Some(last) = st.inst().regions().len().checked_sub(1)
+        {
+            self.select_region(region.min(last));
             return;
         }
         let first = (0..st.binding.region_sample.len()).find(|&r| {
@@ -1336,21 +1364,15 @@ impl LimewaveApp {
             .get(i)
             .map(FileEntry::file_name)
             .unwrap_or_default();
-        let Some(mut path) = (self.save_picker)(&name) else {
+        let Some(path) = (self.save_picker)(&name) else {
             return false;
         };
-        // Some pickers return the typed name without the filter's extension. A name with a dot
-        // ("kick.01") keeps it, with ".wav" added after.
-        let is_wav = path
-            .extension()
-            .is_some_and(|x| x.eq_ignore_ascii_case("wav"));
-        if !is_wav {
-            path.as_mut_os_string().push(".wav");
-        }
+        let path = with_extension_added(path, "wav");
         let req = SaveRequest {
             indices: vec![i],
             destination: Destination::File(path.clone()),
             trim_after_loop: None,
+            instrument: None,
         };
         let results = perform_save(self, req);
         if results.iter().any(|(_, r)| r.is_err()) {
@@ -1364,6 +1386,127 @@ impl LimewaveApp {
                 .map(|dir| Destination::Folder(dir.to_path_buf()));
         }
         true
+    }
+
+    /// Saves the open instrument and its WAVs (spec 7), then reopens the saved `.sfz` with the
+    /// same region selected and a fresh history. The next Save writes over a copy saved into a
+    /// folder or file without backups, and overwrites originals again after an overwrite.
+    pub fn save_instrument_now(&mut self, req: InstrumentSaveRequest) -> Result<(), String> {
+        self.save_instrument_written(req).map(|_| ())
+    }
+
+    /// [`LimewaveApp::save_instrument_now`], returning what was written.
+    fn save_instrument_written(
+        &mut self,
+        req: InstrumentSaveRequest,
+    ) -> Result<Vec<SaveOutcome>, String> {
+        let Some(st) = &self.instrument else {
+            return Err("no instrument is open".to_owned());
+        };
+        let samples: Vec<Option<SampleSave>> = st
+            .sample_file
+            .iter()
+            .map(|f| match f.and_then(|i| self.files.get(i)) {
+                Some(FileEntry::Loaded(s)) => Some(SampleSave {
+                    doc: &s.doc,
+                    initial: s.history.first(),
+                    edit: s.history.current(),
+                }),
+                _ => None,
+            })
+            .collect();
+        let saved = save_instrument(
+            st.inst(),
+            &st.path,
+            &st.binding,
+            &samples,
+            &req.destination,
+            req.write_smpl,
+        )
+        .map_err(|e| e.to_string())?;
+        let reselect = st.selected_region;
+        let own = st.sample_file.clone();
+
+        let before = std::mem::take(&mut self.files);
+        if let Err(message) = self.try_open_instrument(saved.sfz.clone()) {
+            self.files = before;
+            return Err(format!(
+                "saved to {}, but could not reopen it: {message}",
+                saved.sfz.display()
+            ));
+        }
+        // Unsaved files that are not the instrument's (an untitled recording, say) stay open,
+        // after the reopened instrument's own.
+        self.files.extend(
+            before
+                .into_iter()
+                .enumerate()
+                .filter(|(i, f)| !own.contains(&Some(*i)) && f.is_dirty())
+                .map(|(_, f)| f),
+        );
+        if let Some(st) = &mut self.instrument {
+            st.destination = Some(match req.destination {
+                Destination::Folder(_) | Destination::File(_) => Destination::ReplaceSaved,
+                other => other,
+            });
+            st.write_smpl = req.write_smpl;
+            st.reselect = reselect;
+        }
+        if self.loader.is_none() {
+            self.finish_instrument_load();
+        }
+        Ok(saved.written)
+    }
+
+    /// Saves the instrument to `destination` with its remembered `smpl` choice. Returns the
+    /// failure, if any, as a save result.
+    fn save_instrument_to(&mut self, destination: Destination) -> Option<SaveResult> {
+        let st = self.instrument.as_ref()?;
+        let (source, write_smpl) = (st.path.clone(), st.write_smpl);
+        let req = InstrumentSaveRequest {
+            destination,
+            write_smpl,
+        };
+        self.save_instrument_now(req)
+            .err()
+            .map(|e| (source, Err(e)))
+    }
+
+    /// Asks where the untitled instrument goes and saves it there, its WAVs beside it. Returns
+    /// false when the user cancels or the save fails (the results are then shown).
+    pub fn save_untitled_instrument(&mut self) -> bool {
+        let Some(st) = &self.instrument else {
+            return false;
+        };
+        let name = st
+            .path
+            .file_name()
+            .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+        let Some(path) = (self.save_picker)(&name) else {
+            return false;
+        };
+        let path = with_extension_added(path, "sfz");
+        match self.save_instrument_to(Destination::File(path)) {
+            Some(failed) => {
+                self.save_results = Some(vec![failed]);
+                false
+            }
+            None => true,
+        }
+    }
+
+    /// Whether Save and Save as… act on the instrument: one is open, and the selected file is
+    /// not a loaded file outside it (an untitled recording, say).
+    fn saving_instrument(&self) -> bool {
+        let Some(st) = &self.instrument else {
+            return false;
+        };
+        match self.selected {
+            Some(i) if matches!(self.files.get(i), Some(FileEntry::Loaded(_))) => {
+                st.sample_file.contains(&Some(i))
+            }
+            _ => true,
+        }
     }
 
     /// Runs `action`, or asks first when it would discard unsaved edits.
@@ -1395,9 +1538,26 @@ impl LimewaveApp {
         }
     }
 
-    /// Save: the selected file goes straight to its remembered destination, or the dialog
-    /// opens when it has none. The results are shown only if the save failed.
+    /// Save: the selected file, or the open instrument, goes straight to its remembered
+    /// destination, or the dialog opens when it has none. The results are shown only if the
+    /// save failed.
     pub fn save(&mut self) {
+        if self.saving_instrument() {
+            let Some(st) = &self.instrument else { return };
+            if st.untitled {
+                self.save_untitled_instrument();
+                return;
+            }
+            match st.destination.clone() {
+                Some(destination) => {
+                    if let Some(failed) = self.save_instrument_to(destination) {
+                        self.save_results = Some(vec![failed]);
+                    }
+                }
+                None => self.save_as(),
+            }
+            return;
+        }
         let Some(i) = self.selected else { return };
         let Some(FileEntry::Loaded(s)) = self.files.get(i) else {
             return;
@@ -1417,8 +1577,18 @@ impl LimewaveApp {
         }
     }
 
-    /// Save as…: opens the dialog for the selected file.
+    /// Save as…: opens the dialog for the selected file, or for the open instrument.
     pub fn save_as(&mut self) {
+        if self.saving_instrument()
+            && let Some(st) = &self.instrument
+        {
+            if st.untitled {
+                self.save_untitled_instrument();
+            } else {
+                self.ui.save_dialog.open_for_instrument(st);
+            }
+            return;
+        }
         let Some(i) = self.selected else { return };
         if matches!(self.files.get(i), Some(FileEntry::Loaded(s)) if s.untitled) {
             self.save_untitled(i);
@@ -1430,17 +1600,43 @@ impl LimewaveApp {
     }
 
     /// Saves every file with unsaved edits to its remembered destination, or to the default
-    /// folder next to it; untitled files ask for a file one at a time. Returns true when all
-    /// of them saved; otherwise the results are shown. A cancelled or failed untitled save
-    /// stops the rest.
+    /// folder next to it; untitled files ask for a file one at a time. An open instrument with
+    /// unsaved changes is saved first, with its WAVs, instead of those WAVs one by one. Returns
+    /// true when all of them saved; otherwise the results are shown. A cancelled or failed
+    /// untitled save stops the rest.
     pub fn save_all(&mut self) -> bool {
         let mut results = Vec::new();
         let mut stopped = false;
+        if let Some(st) = &self.instrument
+            && st.unsaved(&self.files)
+        {
+            if st.untitled {
+                if !self.save_untitled_instrument() {
+                    results.extend(self.save_results.take().unwrap_or_default());
+                    stopped = true;
+                }
+            } else {
+                let destination = st
+                    .destination
+                    .clone()
+                    .unwrap_or_else(|| Destination::Folder(default_folder(&st.path)));
+                results.extend(self.save_instrument_to(destination));
+            }
+        }
+        // The instrument's WAVs were saved with it, or failed with it.
+        let own: Vec<Option<usize>> = self
+            .instrument
+            .as_ref()
+            .map(|st| st.sample_file.clone())
+            .unwrap_or_default();
         for i in 0..self.files.len() {
+            if stopped {
+                break;
+            }
             let FileEntry::Loaded(s) = &self.files[i] else {
                 continue;
             };
-            if !s.unsaved() {
+            if !s.unsaved() || own.contains(&Some(i)) {
                 continue;
             }
             if s.untitled {
@@ -1483,6 +1679,7 @@ impl LimewaveApp {
             indices: vec![i],
             destination,
             trim_after_loop: None,
+            instrument: None,
         };
         perform_save(self, req)
     }
@@ -2311,7 +2508,11 @@ impl LimewaveApp {
         tail_dialog(&ctx, self);
         spectrum_dialog(&ctx, self);
         if let Some(req) = save_dialog(&ctx, &mut self.ui.save_dialog, &self.files) {
-            self.save_results = Some(perform_save(self, req));
+            let results = match req.instrument {
+                Some(req) => self.dialog_instrument_save(req),
+                None => perform_save(self, req),
+            };
+            self.save_results = Some(results);
         }
         if let Some(results) = &self.save_results
             && save_results_window(&ctx, results)
@@ -2320,6 +2521,23 @@ impl LimewaveApp {
         }
         self.flush_preview(&ctx);
         self.focus_last_frame = ctx.egui_wants_keyboard_input();
+    }
+
+    /// Saves the instrument as the save dialog asked: one result per file written, or the
+    /// failure.
+    fn dialog_instrument_save(&mut self, req: InstrumentSaveRequest) -> Vec<SaveResult> {
+        let source = self
+            .instrument
+            .as_ref()
+            .map(|st| st.path.clone())
+            .unwrap_or_default();
+        match self.save_instrument_written(req) {
+            Ok(written) => written
+                .into_iter()
+                .map(|o| (o.written.clone(), Ok(o)))
+                .collect(),
+            Err(e) => vec![(source, Err(e))],
+        }
     }
 
     /// Publishes the selected file's held-back drag preview, or asks for a repaint when
@@ -2620,7 +2838,8 @@ impl LimewaveApp {
                     action = Some(PendingAction::OpenFolder(d));
                 }
                 ui.separator();
-                ui.add_enabled_ui(self.selected_session().is_some(), |ui| {
+                let can_save = self.selected_session().is_some() || self.instrument.is_some();
+                ui.add_enabled_ui(can_save, |ui| {
                     let ctx = ui.ctx().clone();
                     let hint = format!(
                         "Save to the last destination, or choose one ({})",
@@ -2807,18 +3026,44 @@ impl LimewaveApp {
         }
     }
 
+    /// What the unsaved prompt says is not saved: the instrument (with its WAVs) counts as one,
+    /// then the other files.
+    fn unsaved_text(&self) -> String {
+        let Some(st) = self
+            .instrument
+            .as_ref()
+            .filter(|st| st.unsaved(&self.files))
+        else {
+            return format!(
+                "{} file(s) are not saved. Discarding them cannot be undone.",
+                self.dirty_count()
+            );
+        };
+        let others = self
+            .files
+            .iter()
+            .enumerate()
+            .filter(|(i, f)| f.is_dirty() && !st.sample_file.contains(&Some(*i)))
+            .count();
+        if others == 0 {
+            "1 instrument is not saved. Discarding it cannot be undone.".to_owned()
+        } else {
+            format!(
+                "1 instrument and {others} file(s) are not saved. Discarding them cannot be undone."
+            )
+        }
+    }
+
     fn unsaved_prompt(&mut self, ctx: &egui::Context) {
         if self.pending.is_none() {
             return;
         }
-        let count = self.dirty_count();
+        let text = self.unsaved_text();
         let mut choice = None;
         let mut save_all = false;
         egui::Modal::new(egui::Id::unique("unsaved_changes")).show(ctx, |ui| {
             ui.heading("Unsaved changes");
-            ui.label(format!(
-                "{count} file(s) are not saved. Discarding them cannot be undone."
-            ));
+            ui.label(text);
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 save_all = ui

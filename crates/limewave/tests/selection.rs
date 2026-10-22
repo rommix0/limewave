@@ -498,6 +498,7 @@ fn saving_the_file_clears_the_selection_and_play_from_point() {
         indices: vec![0],
         destination: Destination::Folder(out.path().to_path_buf()),
         trim_after_loop: Some(16),
+        instrument: None,
     };
     let results = perform_save(&mut app, req);
     assert!(results.iter().all(|(_, r)| r.is_ok()), "{results:?}");
