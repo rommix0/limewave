@@ -72,26 +72,27 @@ An SFZ instrument is a plain-text file that spreads a set of WAV files across th
 - Click a box to select its region (click again to cycle through boxes that overlap). Drag a box's left or right edge to change its key range, and its top or bottom edge to change its velocity range. A drag is one undo step.
 - Right-drag across the keyboard sets the selected region's key range to the keys you drag over.
 - The **Velocity** control sets the velocity of notes played from the computer keyboard and the on-screen keys.
-- **Auto-map from root keys** lays out the key ranges of the selected region's group from their root keys, each range reaching halfway to its neighbours. **Fill gaps** extends ranges to close the gaps between regions without shrinking any. Both change key ranges only and are one undo step.
+- **Auto-map from root keys** and **Fill gaps** both work on the selected region's group (every region when the instrument has no groups). Auto-map lays out the group's key ranges from the key each region sounds at (its root key, moved by any `transpose`), each range reaching halfway to its neighbours. Fill gaps extends the group's ranges to close the gaps between its regions without shrinking any. Both change key ranges only and are one undo step.
 
 **Inspector.** A **Region** section above the usual ones edits the selected region:
 
 - **Keys** (as note names) and **Velocity**; **Group**, which moves the region to the end of another group; **Volume** in dB.
 - **Playback**: **Normal**, **One-shot** (plays the whole sample and ignores note-off) or **Sustain loop** (loops while the key is held, plays on past the loop end on release).
-- **Envelope**: attack, decay, sustain and release for this region, saved as `ampeg_*`. A region with none uses the SFZ defaults.
+- **Envelope**: attack, decay, sustain and release for this region, saved as `ampeg_*`. A region with none uses the SFZ defaults. A region whose release is 0 gets a 5 ms release when Limewave plays it, so notes do not click off; this is for auditioning only and is not written to the file.
 - **Other settings (kept as written)**: every other setting that applies to the region, read-only, with where it comes from. Those Limewave does not play are marked as not heard.
 
-The **Tuning** and **Loop** sections edit the region's sample. Their values come from the instrument (`pitch_keycenter`, `tune`, `loop_*`), not from the WAV, because the instrument is what a sampler plays. **Fine tune is the opposite sign of `tune`**: Limewave's fine tune says how sharp the recording is, while `tune` says how much to raise it, so `tune=14` shows as a fine tune of -14 cents and is written back as `tune=14`.
+The **Tuning** and **Loop** sections edit the region's sample. Their values come from the instrument (`pitch_keycenter`, `tune`, `loop_*`), not from the WAV, because the instrument is what a sampler plays. **Fine tune is the opposite sign of `tune`**: Limewave's fine tune says how sharp the recording is, while `tune` says how much to raise it, so `tune=14` shows as a fine tune of -14 cents and is written back as `tune=14`. A `tune` beyond ±50 cents shows as the nearest root key plus the remaining cents, which is the same pitch: `pitch_keycenter=60 tune=80` shows as root key B3 with a fine tune of +20 cents. A loop with no `loop_type` in the instrument opens as forward, as a sampler plays it, whatever direction the WAV's own loop has.
 
-**Shared samples.** Two regions can use the same WAV. The editor shows one waveform with one loop, labelled "Shared by N regions", and an edit changes every region that follows the sample. If a later region disagrees with the first about the root key, tuning or loop, it is marked as keeping its own tuning and loop: its values are read-only, are written back exactly as read, and are used when it plays.
+**Shared samples.** Two regions can use the same WAV. The editor shows one waveform with one loop, labelled "Shared by N regions", and an edit changes every region that follows the sample. If a later region disagrees with the first about the root key, tuning or loop, it is marked as keeping its own tuning and loop: its values are read-only, are written back exactly as read, and are used when it plays. A region whose loop is off only because it plays **One-shot** or `no_loop` does not disagree. Which regions follow is decided against the sample as it was opened, and stays so until the instrument is saved or opened again (deleting the first region, for example, does not change it). While a region that keeps its own loop is selected, a note above the waveform reminds you that the loop markers still edit the shared sample.
 
-**New instrument** (button at the top of a folder's file list) makes an unsaved instrument with one region per open WAV, then runs Auto-map on it. The WAVs are not changed. WAVs whose names cannot be written as an SFZ value are left out (see Known limitations).
+**New instrument** (button at the top of a folder's file list) makes an unsaved instrument with one region per open WAV, each with the WAV's root key and fine tune (`pitch_keycenter` and `tune`), then runs Auto-map on it. The WAVs are not changed. WAVs whose names cannot be written as an SFZ value are left out (see Known limitations).
 
 **Saving.** **Save** and **Save as…** open the save dialog with **SFZ instrument** chosen. For an instrument that has never been saved, a save-file picker asks for the name instead.
 
 - **New folder** (the default) writes into `limewave` inside the instrument's folder. The samples go at the same relative paths, so the folder is complete on its own. Samples outside the instrument's folder (a `..` or absolute path) are gathered into `samples/` and the instrument's paths are changed to match.
 - **Overwrite originals** replaces the `.sfz` and each changed WAV, first copying each to a numbered `.bak`.
-- **Also write loop and root key into each WAV (smpl)** is off by default. Off, each WAV keeps the loop and root key it had, and the instrument carries your edits. On, the edited values are written into the WAV as well.
+- **Also write loop and root key into each WAV (smpl)** is off by default. Off, each WAV keeps the loop and root key it had, and the instrument carries your edits. On, the edited values are written into the WAV as well. Either way, a crossfade, trims and effects are written into the WAV's audio; the crossfade is made at the loop as you edited it.
+- An untitled instrument saved through the save-file picker into the folder its WAVs are in uses those WAVs where they are: a changed WAV is replaced there, first copied to a numbered `.bak`, and unchanged ones are left alone.
 - **Individual WAV files** saves the samples only, without changing the instrument, which stays unsaved.
 - After saving, the saved instrument is reopened from disk with the same region selected, and undo history starts fresh.
 
@@ -139,14 +140,14 @@ When you save an SFZ instrument:
 - Only the settings you edited are changed in the `.sfz`, and always in the region itself: a value a region inherits from its group is written as a setting of its own, and the group is not touched.
 - Comments, `#define` lines, headers Limewave does not use and settings it does not understand are kept, in their original order and with their original text. Values that used a `$NAME` are written back with the `$NAME`.
 - The layout is normalised: each header starts a line, settings follow one per line, and a blank line separates regions. Line endings follow the original file.
-- Key range edits are written as note names only where the existing value is a note name; otherwise as numbers.
-- When a sample's root key, tuning or loop changes, every region that follows it gets explicit `pitch_keycenter`, `tune`, `loop_mode`, `loop_start` and `loop_end` (and `loop_type` unless forward). When a sample's Start marker moves, `offset`, `end` and the loop settings of the regions that use it shift with it.
-- The WAVs follow the rules above. A WAV whose content would come out the same is copied byte for byte (new folder) or left alone (overwrite).
+- Key range and root key edits keep the spelling of the value they change: a number stays a number and a note name stays a note name. A new key range is written as note names, a new root key as a number.
+- When a sample's root key or fine tune changes, every region that follows it gets explicit `pitch_keycenter` and `tune`; when its loop changes, they get explicit `loop_start` and `loop_end`, `loop_mode=loop_continuous` where it is unset or `no_loop`, `loop_mode=no_loop` where the loop was turned off on a region that looped, and `loop_type` whenever the loop direction changed from what was read on opening (forward included). A **One-shot** region stays one-shot. When a sample's Start marker moves, `offset`, `end` and the loop settings of the regions that use it shift with it.
+- The WAVs follow the rules above. A WAV whose content would come out the same is copied byte for byte (new folder) or left alone (overwrite). With the `smpl` checkbox off, a sample whose only change is its loop or tuning comes out the same, since the instrument carries that change.
 
 Where files go:
 
 - By default a save writes into a new `limewave` folder next to the source file, keeping the file name. Your originals are not touched.
-- Originals are modified only if you choose **Overwrite originals**. Each file is first copied to `<name>.wav.bak` (or `.1.bak`, `.2.bak` and so on if that exists); if the backup fails, that file is not saved.
+- Originals are modified only if you choose **Overwrite originals**, or save an untitled instrument into the folder its WAVs are in (see [SFZ instruments](#sfz-instruments)). Each file is first copied to `<name>.wav.bak` (or `.1.bak`, `.2.bak` and so on if that exists); if the backup fails, that file is not saved.
 - A file that Limewave itself wrote into its output folder, and then reopened, is replaced in place when you save it again.
 - Limewave asks before replacing any other existing file.
 - Files are written to a temporary file and renamed into place, so a failed save never leaves a half-written file.
