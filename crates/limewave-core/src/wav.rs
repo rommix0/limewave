@@ -186,19 +186,34 @@ pub fn decode(data: &[u8], fmt: &WavFormat) -> Vec<Vec<f32>> {
     }
     let bps = bytes_per_sample(fmt.format);
     let stride = frame_stride(fmt);
-    let mut out = vec![Vec::with_capacity(data.len() / stride); channels];
-    for frame in data.chunks_exact(stride) {
-        for (ch, samples) in out.iter_mut().enumerate() {
-            samples.push(decode_sample(&frame[ch * bps..(ch + 1) * bps], fmt.format));
-        }
-    }
-    out
+    (0..channels)
+        .map(|ch| {
+            let samples = data
+                .chunks_exact(stride)
+                .map(|f| &f[ch * bps..(ch + 1) * bps]);
+            // One loop per format, so the format is not matched again for every sample.
+            match fmt.format {
+                SampleFormat::Int { bits: 16 } => samples
+                    .map(|b| f32::from(i16::from_le_bytes([b[0], b[1]])) / 32768.0)
+                    .collect(),
+                SampleFormat::Float { bits: 32 } => samples
+                    .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                    .collect(),
+                format => samples.map(|b| decode_sample(b, format)).collect(),
+            }
+        })
+        .collect()
 }
 
 /// Scales to `2^(bits-1)`, rounds to nearest and clips to the signed range.
 fn encode_int(x: f32, bits: u16) -> i64 {
     let scale = f64::from(1u32 << (bits - 1));
-    (f64::from(x) * scale).round().clamp(-scale, scale - 1.0) as i64
+    let v = f64::from(x) * scale;
+    // Rounds half away from zero like `f64::round`, without its slow library call. An `f32`
+    // times a power of two has at most 24 significant bits, so adding 0.5 is exact and the
+    // truncating cast lands on the same integer.
+    let r = if v < 0.0 { v - 0.5 } else { v + 0.5 } as i64;
+    r.clamp(-(scale as i64), scale as i64 - 1)
 }
 
 /// Encodes planar audio as interleaved sample bytes, rounding to nearest and
@@ -210,21 +225,35 @@ pub fn encode_frames(audio: &[Vec<f32>], fmt: &WavFormat) -> Vec<u8> {
     }
     let frames = audio.iter().map(Vec::len).min().unwrap_or(0);
     let bps = bytes_per_sample(fmt.format);
-    let pad = frame_stride(fmt).saturating_sub(audio.len() * bps);
-    let mut out = Vec::with_capacity(frames * (audio.len() * bps + pad));
-    for i in 0..frames {
-        for ch in audio {
-            let x = ch[i];
-            match fmt.format {
-                SampleFormat::Int { bits: 8 } => out.push((encode_int(x, 8) + 128) as u8),
-                SampleFormat::Int { bits } => {
-                    out.extend_from_slice(&encode_int(x, bits).to_le_bytes()[..bps]);
+    let stride = frame_stride(fmt).max(audio.len() * bps);
+    // Any padding at the end of a frame stays zero.
+    let mut out = vec![0u8; frames * stride];
+    for (c, ch) in audio.iter().enumerate() {
+        let slots = out
+            .chunks_exact_mut(stride)
+            .map(|f| &mut f[c * bps..(c + 1) * bps]);
+        match fmt.format {
+            SampleFormat::Int { bits: 8 } => {
+                for (slot, &x) in slots.zip(ch) {
+                    slot[0] = (encode_int(x, 8) + 128) as u8;
                 }
-                SampleFormat::Float { bits: 32 } => out.extend_from_slice(&x.to_le_bytes()),
-                SampleFormat::Float { .. } => out.extend_from_slice(&f64::from(x).to_le_bytes()),
+            }
+            SampleFormat::Int { bits } => {
+                for (slot, &x) in slots.zip(ch) {
+                    slot.copy_from_slice(&encode_int(x, bits).to_le_bytes()[..bps]);
+                }
+            }
+            SampleFormat::Float { bits: 32 } => {
+                for (slot, &x) in slots.zip(ch) {
+                    slot.copy_from_slice(&x.to_le_bytes());
+                }
+            }
+            SampleFormat::Float { .. } => {
+                for (slot, &x) in slots.zip(ch) {
+                    slot.copy_from_slice(&f64::from(x).to_le_bytes());
+                }
             }
         }
-        out.resize(out.len() + pad, 0);
     }
     out
 }
@@ -243,6 +272,89 @@ mod tests {
             format,
             block_align: channels * bytes,
         }
+    }
+
+    /// The encoder as it was before it was sped up: per-sample `f64::round`, sample by sample.
+    fn encode_reference(audio: &[Vec<f32>], fmt: &WavFormat) -> Vec<u8> {
+        let frames = audio.iter().map(Vec::len).min().unwrap_or(0);
+        let bps = bytes_per_sample(fmt.format);
+        let pad = frame_stride(fmt).saturating_sub(audio.len() * bps);
+        let int = |x: f32, bits: u16| {
+            let scale = f64::from(1u32 << (bits - 1));
+            (f64::from(x) * scale).round().clamp(-scale, scale - 1.0) as i64
+        };
+        let mut out = Vec::new();
+        for i in 0..frames {
+            for ch in audio {
+                let x = ch[i];
+                match fmt.format {
+                    SampleFormat::Int { bits: 8 } => out.push((int(x, 8) + 128) as u8),
+                    SampleFormat::Int { bits } => {
+                        out.extend_from_slice(&int(x, bits).to_le_bytes()[..bps]);
+                    }
+                    SampleFormat::Float { bits: 32 } => out.extend_from_slice(&x.to_le_bytes()),
+                    SampleFormat::Float { .. } => {
+                        out.extend_from_slice(&f64::from(x).to_le_bytes());
+                    }
+                }
+            }
+            out.resize(out.len() + pad, 0);
+        }
+        out
+    }
+
+    #[test]
+    fn encoding_matches_the_reference_byte_for_byte() {
+        // Halfway values for every bit depth, clipping, specials and a sweep of ordinary values.
+        let mut values = vec![
+            0.0,
+            -0.0,
+            1.0,
+            -1.0,
+            1.5,
+            -1.5,
+            0.999_999_9,
+            -0.999_999_9,
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::MIN_POSITIVE,
+            -f32::MIN_POSITIVE,
+        ];
+        for bits in [8u16, 16, 24, 32] {
+            let step = 1.0 / (1u64 << (bits - 1)) as f32;
+            for k in [-3.5f32, -2.5, -1.5, -0.5, 0.5, 1.5, 2.5, 3.5] {
+                values.push(k * step);
+                values.push(1.0 + k * step);
+                values.push(-1.0 - k * step);
+            }
+        }
+        values.extend((0..20_000).map(|i| ((i as f32) * 0.618_034).sin() * 1.02));
+        let audio = [values.clone(), values.iter().rev().copied().collect()];
+        for format in [
+            SampleFormat::Int { bits: 8 },
+            SampleFormat::Int { bits: 16 },
+            SampleFormat::Int { bits: 24 },
+            SampleFormat::Int { bits: 32 },
+            SampleFormat::Float { bits: 32 },
+            SampleFormat::Float { bits: 64 },
+        ] {
+            for channels in [1u16, 2] {
+                let f = fmt(channels, format);
+                let a = &audio[..usize::from(channels)];
+                assert!(
+                    encode_frames(a, &f) == encode_reference(a, &f),
+                    "{format:?} with {channels} channel(s)"
+                );
+            }
+        }
+        // A frame wider than its samples (an extensible layout) keeps zero padding.
+        let mut padded = fmt(1, SampleFormat::Int { bits: 16 });
+        padded.block_align = 4;
+        assert_eq!(
+            encode_frames(&audio[..1], &padded),
+            encode_reference(&audio[..1], &padded)
+        );
     }
 
     fn fmt_chunk(tag: u16, channels: u16, bits: u16) -> Vec<u8> {
