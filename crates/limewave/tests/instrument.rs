@@ -3,18 +3,19 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use eframe::egui::{Event, Modifiers, PointerButton, Pos2, Rect};
+use eframe::egui::{Event, Key, Modifiers, PointerButton, Pos2, Rect};
 use egui_kittest::Harness;
-use egui_kittest::kittest::Queryable;
+use egui_kittest::kittest::{NodeT, Queryable};
 use limewave::app::{FileEntry, LimewaveApp, PendingAction};
-use limewave::audio::voice::Playback;
+use limewave::audio::voice::{Adsr, Playback};
 use limewave::instrument::{InstrumentState, play_map, set_keys};
 use limewave::ui::keyboard::key_rect_in;
 use limewave::ui::keymap::box_rect;
+use limewave::ui::region_inspector::RegionEdit;
 use limewave::ui::regions::{RegionListAction, unassigned_wavs, unsaved_regions};
 use limewave_core::edit::{EditState, LoopMode};
 use limewave_core::riff::Chunk;
-use limewave_core::sfz::Keycenter;
+use limewave_core::sfz::{Keycenter, Level};
 use limewave_core::smpl::Smpl;
 use limewave_core::testwav::{sine, wav_bytes};
 use limewave_core::wav::SampleFormat;
@@ -63,7 +64,7 @@ fn folder(sfz: &str) -> (tempfile::TempDir, PathBuf) {
 
 fn harness(app: LimewaveApp) -> Harness<'static, LimewaveApp> {
     Harness::builder()
-        .with_size(eframe::egui::vec2(1100.0, 700.0))
+        .with_size(eframe::egui::vec2(1280.0, 800.0))
         .allow_missing_glyphs()
         .build_ui_state(|ui, app: &mut LimewaveApp| app.show(ui), app)
 }
@@ -1056,4 +1057,342 @@ fn right_drag_on_the_key_map_keyboard_sets_the_selected_range() {
     drag_with(&mut h, PointerButton::Secondary, at(48), at(52));
     assert_eq!(keys(st(&h), 0), (48, 52));
     assert_eq!(st(&h).history.cursor(), 1, "one undo step");
+}
+
+/// Applies `edits` as the inspector sends them.
+fn region_edits(h: &mut Harness<'static, LimewaveApp>, edits: &[RegionEdit]) {
+    for &e in edits {
+        h.state_mut().region_edit(e);
+    }
+    h.run();
+}
+
+/// The effective text of `name` on region `r`, with where it came from.
+fn opcode(h: &Harness<'static, LimewaveApp>, r: usize, name: &str) -> Option<(String, Level)> {
+    st(h).inst().get(r, name)
+}
+
+/// Gives the selected sample a forward loop.
+fn loop_selected_sample(h: &mut Harness<'static, LimewaveApp>) {
+    let i = h.state().selected.unwrap();
+    let FileEntry::Loaded(s) = &mut h.state_mut().files[i] else {
+        panic!("not loaded");
+    };
+    let e = EditState {
+        loop_mode: LoopMode::Forward,
+        loop_start: 100,
+        loop_end: 2000,
+        ..s.edit().clone()
+    };
+    s.apply(e, None);
+}
+
+#[test]
+fn region_section_edits_keys_and_volume() {
+    let (_dir, mut h) = open_text("<region> sample=a.wav lokey=0 hikey=127\n");
+    // A drag previews, and one commit is one undo step.
+    region_edits(
+        &mut h,
+        &[RegionEdit::Keys(40, 50), RegionEdit::Keys(48, 52)],
+    );
+    assert_eq!(st(&h).history.cursor(), 0, "still a preview");
+    assert_eq!(st(&h).shown().region_info(0).lokey, 48);
+    region_edits(&mut h, &[RegionEdit::Commit]);
+    assert_eq!(keys(st(&h), 0), (48, 52));
+    assert_eq!(st(&h).history.cursor(), 1);
+    assert_eq!(
+        opcode(&h, 0, "lokey").unwrap().0,
+        "C3",
+        "written as a note name"
+    );
+    region_edits(&mut h, &[RegionEdit::Vel(20, 90), RegionEdit::Commit]);
+    assert_eq!(opcode(&h, 0, "lovel").unwrap().0, "20");
+    assert_eq!(opcode(&h, 0, "hivel").unwrap().0, "90");
+    region_edits(&mut h, &[RegionEdit::Volume(-6.5), RegionEdit::Commit]);
+    assert_eq!(opcode(&h, 0, "volume").unwrap().0, "-6.5");
+    assert_eq!(st(&h).history.cursor(), 3);
+    // The same values again change nothing, so they are no undo step either.
+    region_edits(
+        &mut h,
+        &[
+            RegionEdit::Keys(48, 52),
+            RegionEdit::Volume(-6.5),
+            RegionEdit::Commit,
+        ],
+    );
+    assert_eq!(st(&h).history.cursor(), 3);
+    h.state_mut().undo();
+    assert!(opcode(&h, 0, "volume").is_none());
+}
+
+#[test]
+fn typing_a_low_key_above_the_high_key_swaps_them() {
+    let (_dir, mut h) = open_text("<region> sample=a.wav lokey=40 hikey=60\n");
+    h.get_by_label("Low key").focus();
+    h.run();
+    h.get_by_label("Low key").type_text("C5");
+    h.run();
+    h.key_press(Key::Enter);
+    h.run();
+    assert_eq!(keys(st(&h), 0), (60, 72));
+    assert_eq!(st(&h).history.cursor(), 1);
+    // Text that is not a note puts the old key back.
+    h.get_by_label("High key").focus();
+    h.run();
+    h.get_by_label("High key").type_text("zz");
+    h.run();
+    h.key_press(Key::Enter);
+    h.run();
+    assert_eq!(keys(st(&h), 0), (60, 72));
+    assert_eq!(st(&h).history.cursor(), 1);
+}
+
+#[test]
+fn inherited_values_are_not_written_again() {
+    let (_dir, mut h) = open_text("<group> volume=-6 <region> sample=a.wav\n");
+    region_edits(&mut h, &[RegionEdit::Volume(-6.0), RegionEdit::Commit]);
+    assert_eq!(opcode(&h, 0, "volume"), Some(("-6".into(), Level::Group)));
+    assert_eq!(st(&h).history.cursor(), 0);
+    region_edits(&mut h, &[RegionEdit::Volume(-3.0), RegionEdit::Commit]);
+    assert_eq!(opcode(&h, 0, "volume"), Some(("-3".into(), Level::Region)));
+    assert_eq!(st(&h).inst().group_get(0, "volume").as_deref(), Some("-6"));
+}
+
+#[test]
+fn envelope_edit_writes_ampeg_seconds_and_percent() {
+    let (_dir, mut h) = open_text("<region> sample=a.wav ampeg_release=0.01\n");
+    let adsr = Adsr {
+        attack_ms: 250.0,
+        decay_ms: 0.0,
+        sustain: 0.75,
+        release_ms: 10.0,
+    };
+    region_edits(&mut h, &[RegionEdit::Envelope(adsr), RegionEdit::Commit]);
+    let text = |name| opcode(&h, 0, name).map(|(v, _)| v);
+    assert_eq!(text("ampeg_attack").as_deref(), Some("0.25"));
+    assert_eq!(text("ampeg_sustain").as_deref(), Some("75"));
+    assert_eq!(text("ampeg_decay"), None, "decay is what the region had");
+    assert_eq!(
+        text("ampeg_release").as_deref(),
+        Some("0.01"),
+        "release is as read"
+    );
+    assert_eq!(st(&h).history.cursor(), 1);
+    // The inspector reads the values back as ms and %, with no audition floor.
+    let info = st(&h).inst().region_info(0);
+    assert_eq!(
+        (info.ampeg.attack, info.ampeg.sustain, info.ampeg.release),
+        (0.25, 75.0, 0.01)
+    );
+}
+
+#[test]
+fn playback_one_shot_writes_loop_mode() {
+    let (_dir, mut h) = open_text("<region> sample=a.wav\n");
+    region_edits(&mut h, &[RegionEdit::Playback(Playback::OneShot)]);
+    assert_eq!(opcode(&h, 0, "loop_mode").unwrap().0, "one_shot");
+    assert_eq!(st(&h).history.cursor(), 1, "a click is its own step");
+    region_edits(&mut h, &[RegionEdit::Playback(Playback::Sustain)]);
+    assert_eq!(opcode(&h, 0, "loop_mode").unwrap().0, "loop_sustain");
+    // Normal says no_loop while the sample does not loop, loop_continuous once it does.
+    region_edits(&mut h, &[RegionEdit::Playback(Playback::Normal)]);
+    assert_eq!(opcode(&h, 0, "loop_mode").unwrap().0, "no_loop");
+    loop_selected_sample(&mut h);
+    region_edits(&mut h, &[RegionEdit::Playback(Playback::OneShot)]);
+    region_edits(&mut h, &[RegionEdit::Playback(Playback::Normal)]);
+    assert_eq!(opcode(&h, 0, "loop_mode").unwrap().0, "loop_continuous");
+    let steps = st(&h).history.cursor();
+    region_edits(&mut h, &[RegionEdit::Playback(Playback::Normal)]);
+    assert_eq!(
+        st(&h).history.cursor(),
+        steps,
+        "already so: nothing written"
+    );
+}
+
+#[test]
+fn group_edit_moves_the_region_and_keeps_the_selection() {
+    let (_dir, mut h) = open_text(
+        "<group> <region> sample=a.wav lokey=0 hikey=40\n\
+         <region> sample=b.wav lokey=41 hikey=80\n\
+         <group> <region> sample=c.wav lokey=81 hikey=127\n",
+    );
+    h.state_mut().select_region(0);
+    region_edits(&mut h, &[RegionEdit::Group(1)]);
+    let inst = st(&h).inst();
+    assert_eq!(inst.group_of(0), Some(0));
+    assert_eq!(inst.region_info(0).sample.as_deref(), Some("b.wav"));
+    assert_eq!(inst.region_info(2).sample.as_deref(), Some("a.wav"));
+    assert_eq!(inst.group_of(2), Some(1), "moved to the end of group 2");
+    assert_eq!(st(&h).selected_region, Some(2), "the selection follows it");
+    assert_eq!(shown(h.state()), "a.wav");
+    assert_selection_valid(h.state());
+    h.state_mut().undo();
+    assert_eq!(
+        st(&h).inst().region_info(0).sample.as_deref(),
+        Some("a.wav")
+    );
+    assert_selection_valid(h.state());
+}
+
+#[test]
+fn shared_sample_says_shared_by_2() {
+    let (_dir, mut h) = open_text(
+        "<region> sample=a.wav lokey=0 hikey=60\n<region> sample=a.wav lokey=61\n\
+         <region> sample=b.wav lokey=40\n",
+    );
+    assert!(h.query_all_by_label("Shared by 2 regions").count() >= 1);
+    h.state_mut().select_region(2);
+    h.run();
+    assert!(h.query_by_label_contains("Shared by").is_none());
+    assert!(
+        h.query_by_label("This region keeps its own tuning and loop")
+            .is_none()
+    );
+}
+
+#[test]
+fn own_region_tuning_is_read_only() {
+    let (_dir, mut h) = open_text(
+        "<region> sample=a.wav pitch_keycenter=60 lokey=0 hikey=60\n\
+         <region> sample=a.wav pitch_keycenter=72 tune=-30 lokey=61 hikey=127\n",
+    );
+    assert_eq!(st(&h).binding.samples[0].follows, [true, false]);
+    let disabled = |h: &Harness<'static, LimewaveApp>| {
+        h.get_all_by_label("Fine tune")
+            .map(|n| n.accesskit_node().is_disabled())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(disabled(&h), [false, false], "the first region follows");
+    assert!(
+        h.query_by_label("This region keeps its own tuning and loop")
+            .is_none()
+    );
+    h.state_mut().select_region(1);
+    h.run();
+    assert!(
+        h.query_all_by_label("This region keeps its own tuning and loop")
+            .count()
+            >= 1
+    );
+    assert_eq!(disabled(&h), [true, true]);
+    let root = h.get_by_label("Root key");
+    assert!(root.accesskit_node().is_disabled());
+    assert_eq!(
+        root.accesskit_node().value().as_deref(),
+        Some("C5"),
+        "its own root"
+    );
+    assert!(h.query_by_label_contains("Shared by").is_none());
+
+    // A right-click on a key sets the root of a region that follows, and does nothing here.
+    let kb = h.get_by_label("Piano keyboard").rect();
+    let key = key_rect_in(kb, 0..=127, 70);
+    let at = Pos2::new(key.center().x, key.bottom() - 3.0);
+    let root_of = |h: &Harness<'static, LimewaveApp>| {
+        let FileEntry::Loaded(s) = &h.state().files[0] else {
+            panic!("not loaded");
+        };
+        s.edit().root
+    };
+    h.hover_at(at);
+    h.step();
+    press(&mut h, at, PointerButton::Secondary, true);
+    press(&mut h, at, PointerButton::Secondary, false);
+    h.run();
+    assert_eq!(root_of(&h), 60);
+    assert_eq!(
+        h.state().ui.message.as_deref(),
+        Some("This region keeps its own tuning and loop")
+    );
+    h.state_mut().select_region(0);
+    h.run();
+    press(&mut h, at, PointerButton::Secondary, true);
+    press(&mut h, at, PointerButton::Secondary, false);
+    h.run();
+    assert_eq!(root_of(&h), 70);
+}
+
+#[test]
+fn undo_takes_back_the_newest_edit_across_instrument_and_sample() {
+    let (_dir, mut h) = open_text("<region> sample=a.wav\n");
+    region_edits(&mut h, &[RegionEdit::Volume(-6.0), RegionEdit::Commit]);
+    loop_selected_sample(&mut h);
+    let looped = |h: &Harness<'static, LimewaveApp>| {
+        let FileEntry::Loaded(s) = &h.state().files[0] else {
+            panic!("not loaded");
+        };
+        s.edit().loop_mode
+    };
+    assert_eq!(looped(&h), LoopMode::Forward);
+    h.state_mut().undo();
+    assert_eq!(looped(&h), LoopMode::Off, "the loop edit went first");
+    assert!(opcode(&h, 0, "volume").is_some());
+    h.state_mut().undo();
+    assert!(opcode(&h, 0, "volume").is_none(), "then the volume");
+    h.state_mut().redo();
+    assert!(opcode(&h, 0, "volume").is_some());
+    assert_eq!(looped(&h), LoopMode::Off, "redo goes the other way");
+    h.state_mut().redo();
+    assert_eq!(looped(&h), LoopMode::Forward);
+    assert_selection_valid(h.state());
+}
+
+#[test]
+fn session_envelope_hidden_with_instrument() {
+    let (dir, mut h) = open_text("<region> sample=a.wav\n");
+    assert!(h.query_by_label("Release plays after loop end").is_none());
+    assert_eq!(h.get_all_by_label("Attack").count(), 1, "the region's own");
+    h.state_mut().close_instrument();
+    h.run();
+    // Closing an instrument opened by itself leaves nothing open.
+    h.state_mut().open_file(dir.path().join("a.wav"));
+    wait_loaded(&mut h);
+    assert!(h.state().instrument.is_none());
+    assert!(h.query_by_label("Release plays after loop end").is_some());
+    assert_eq!(h.get_all_by_label("Attack").count(), 1);
+}
+
+#[test]
+fn other_settings_are_listed_and_marked() {
+    let (_dir, mut h) = open_text("<group> polyphony=4 <region> sample=a.wav cutoff=800 pan=20\n");
+    h.get_by_label("Other settings (kept as written)").click();
+    h.run();
+    h.get_by_label("cutoff");
+    h.get_by_label("polyphony");
+    assert_eq!(
+        h.get_all_by_label("region, not heard in Limewave").count(),
+        2
+    );
+    h.get_by_label("group");
+}
+
+#[test]
+fn dragging_the_volume_field_is_one_undo_step() {
+    let (_dir, mut h) = open_text("<region> sample=a.wav\n");
+    let rect = h.get_by_label("Volume").rect();
+    drag_with(
+        &mut h,
+        PointerButton::Primary,
+        rect.center(),
+        rect.center() + eframe::egui::vec2(-60.0, 0.0),
+    );
+    let volume = st(&h).inst().region_info(0).volume;
+    assert!(volume < -1.0, "dragging left lowers it: {volume}");
+    assert_eq!(st(&h).history.cursor(), 1, "one undo step");
+    assert!(st(&h).preview.is_none());
+    h.state_mut().undo();
+    assert!(opcode(&h, 0, "volume").is_none());
+}
+
+#[test]
+fn a_region_without_a_sample_still_has_its_settings() {
+    let (_dir, mut h) = open_text("<region> sample=gone.wav lokey=30 hikey=40\n");
+    h.state_mut().select_region(0);
+    h.run();
+    assert_eq!(h.state().selected, None);
+    h.get_by_label("Low key");
+    region_edits(&mut h, &[RegionEdit::Volume(-3.0), RegionEdit::Commit]);
+    assert_eq!(opcode(&h, 0, "volume").unwrap().0, "-3");
+    assert!(h.query_by_label("Fine tune").is_none());
 }

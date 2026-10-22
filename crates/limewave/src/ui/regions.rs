@@ -175,7 +175,7 @@ fn text_name(text: &str) -> &str {
 }
 
 /// The title of group `g`: its label, else "Group N", then its velocity range when it sets one.
-fn group_title(st: &InstrumentState, g: usize) -> String {
+pub(crate) fn group_title(st: &InstrumentState, g: usize) -> String {
     let inst = st.inst();
     let mut title = match inst.group_get(g, "group_label") {
         Some(label) if !label.trim().is_empty() => label,

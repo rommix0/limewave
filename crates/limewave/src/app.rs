@@ -36,7 +36,10 @@ use crate::audio::midi::{MidiConnection, connect_midi, decode_last_note, list_mi
 use crate::audio::record::{Recorder, StopReason, Take};
 use crate::audio::voice::{Adsr, PlayBuffer, play_buffer};
 use crate::folder;
-use crate::instrument::{InstrumentState, is_region_source, play_map, set_keys, set_velocities};
+use crate::instrument::{
+    InstrumentState, is_region_source, play_map, set_envelope, set_keys, set_playback,
+    set_velocities, set_volume,
+};
 use crate::render_worker::{RenderKey, RenderSlot};
 use crate::theme::{self, colors};
 use crate::ui::coords::ViewTransform;
@@ -48,6 +51,7 @@ use crate::ui::keymap::{KeyMapAction, key_map};
 use crate::ui::new_dialog::{BitDepth, NewDialogState, new_dialog};
 use crate::ui::overview::overview;
 use crate::ui::record_panel::{NO_INPUT, RecordPanelState, record_panel};
+use crate::ui::region_inspector::{OWN_TUNING, RegionContext, RegionEdit, region_only};
 use crate::ui::regions::{RegionListAction, region_list, unassigned_cached};
 use crate::ui::save_dialog::{
     SaveCommand, SaveDialogState, SaveRequest, SaveResult, other_file_in_the_way, perform_save,
@@ -1784,6 +1788,14 @@ impl LimewaveApp {
     /// Makes `note` the root key of the selected file as one undoable step. Does nothing when
     /// it already is.
     fn set_root(&mut self, note: u8) {
+        // A region that keeps its own tuning is not retuned through its sample (spec 4.3).
+        if let Some(st) = &self.instrument
+            && let Some(region) = st.selected_region
+            && !RegionContext::new(st, region).follows
+        {
+            self.ui.message = Some(OWN_TUNING.to_owned());
+            return;
+        }
         let engine = self.engine.as_ref();
         if let Some(FileEntry::Loaded(s)) = self.selected.and_then(|i| self.files.get_mut(i))
             && s.edit().root != note
@@ -2270,21 +2282,60 @@ impl LimewaveApp {
         let engine = self.engine.as_ref();
         let ui_state = &mut self.ui;
         let selected = self.selected.and_then(|i| self.files.get_mut(i));
+        let region = self
+            .instrument
+            .as_ref()
+            .and_then(|st| Some(RegionContext::new(st, st.selected_region?)));
         let mut action = InspectorAction::default();
         egui::Panel::right("inspector")
             .resizable(true)
             .default_size(300.0)
             .size_range(220.0..=480.0)
-            .show(ui, |ui| {
-                if let Some(FileEntry::Loaded(s)) = selected {
-                    action = inspector(ui, s, ui_state, engine);
+            .show(ui, |ui| match (selected, &region) {
+                (Some(FileEntry::Loaded(s)), _) => {
+                    action = inspector(ui, s, ui_state, engine, region.as_ref());
                 }
+                // A region whose sample is missing or still loading has settings of its own.
+                (_, Some(r)) => action.region = region_only(ui, r),
+                _ => {}
             });
+        for edit in action.region {
+            self.region_edit(edit);
+        }
         if action.toggle_midi_learn {
             self.toggle_midi_learn();
         }
         if let Some(c) = action.save {
             self.run_save_command(c);
+        }
+    }
+
+    /// Applies what the user changed in the Region section to the selected region. Ranges,
+    /// volume and envelope follow a drag as a preview that `Commit` makes one undo step; a
+    /// group or playback change is a step at once (spec 5.3, 8).
+    pub fn region_edit(&mut self, edit: RegionEdit) {
+        let Some(st) = &mut self.instrument else {
+            return;
+        };
+        let Some(region) = st.selected_region else {
+            return;
+        };
+        match edit {
+            RegionEdit::Keys(lo, hi) => st.set_preview(|i| set_keys(i, region, lo, hi)),
+            RegionEdit::Vel(lo, hi) => st.set_preview(|i| set_velocities(i, region, lo, hi)),
+            RegionEdit::Volume(db) => st.set_preview(|i| set_volume(i, region, db)),
+            RegionEdit::Envelope(adsr) => st.set_preview(|i| set_envelope(i, region, &adsr)),
+            RegionEdit::Commit => st.commit_preview(),
+            RegionEdit::Playback(playback) => {
+                let loops = st.region_loops(&self.files, region);
+                st.edit(|i| set_playback(i, region, playback, loops));
+            }
+            RegionEdit::Group(group) => {
+                let mut moved = region;
+                st.edit(|i| moved = i.move_region(region, group));
+                st.rebind(&self.files);
+                self.settle_selection(Some(moved));
+            }
         }
     }
 

@@ -7,12 +7,14 @@ use eframe::egui::{
 use limewave_core::edit::{EditState, FadeShape, LoopMode, Marker, move_marker};
 use limewave_core::notes::{note_name, parse_note};
 use limewave_core::save::Destination;
+use limewave_core::sfz::region_edit;
 use limewave_core::wav::SampleFormat;
 
 use crate::app::{Session, UiState};
 use crate::audio::engine::AudioEngine;
 use crate::audio::voice::Adsr;
 use crate::theme::colors;
+use crate::ui::region_inspector::{RegionContext, RegionEdit, region_note, region_section};
 use crate::ui::save_dialog::SaveCommand;
 
 /// Crossfade length in milliseconds for `frames` frames.
@@ -79,35 +81,73 @@ fn track(
 }
 
 /// What the user asked of the app in the inspector this frame.
-#[derive(Default, Debug, PartialEq, Eq)]
+#[derive(Default, Debug, PartialEq)]
 pub struct InspectorAction {
     /// The Save button clicked.
     pub save: Option<SaveCommand>,
     /// The "Set from MIDI" toggle was clicked.
     pub toggle_midi_learn: bool,
+    /// What the user changed in the Region section, in order.
+    pub region: Vec<RegionEdit>,
 }
 
-/// Draws the inspector of `s`. Returns what the user clicked that the app has to act on.
+/// Draws the inspector of `s`. With an instrument open, `region` is its selected region: the
+/// Region section comes first, Tuning and Loop say who shares the sample (and show a region
+/// that keeps its own values read-only), and the session envelope is left out because each
+/// region has its own. Returns what the user clicked that the app has to act on.
 pub fn inspector(
     ui: &mut Ui,
     s: &mut Session,
     ui_state: &mut UiState,
     engine: Option<&AudioEngine>,
+    region: Option<&RegionContext>,
 ) -> InspectorAction {
+    // A region that keeps its own tuning and loop shows those, and cannot change them here.
+    let read_only = region.is_some_and(|r| !r.follows);
+    let mut shown = s.shown_edit().clone();
+    if let Some(r) = region.filter(|r| !r.follows) {
+        let own = region_edit(r.st.shown(), r.region, &s.doc.initial_edit());
+        shown = EditState {
+            root: own.root,
+            cents: own.cents,
+            loop_mode: own.loop_mode,
+            loop_start: own.loop_start,
+            loop_end: own.loop_end,
+            ..shown
+        };
+    }
     ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
+            let mut edits = Vec::new();
+            if let Some(r) = region {
+                edits = region_section(ui, r.st, r.region);
+                ui.separator();
+            }
             file_section(ui, s);
             ui.separator();
-            let toggle_midi_learn = tuning_section(ui, s, ui_state, engine);
+            ui.heading("Tuning");
+            region_note(ui, region);
+            let toggle_midi_learn = ui
+                .add_enabled_ui(!read_only, |ui| {
+                    tuning_section(ui, s, ui_state, engine, &shown)
+                })
+                .inner;
             ui.separator();
-            loop_section(ui, s, ui_state, engine);
+            ui.heading("Loop");
+            region_note(ui, region);
+            ui.add_enabled_ui(!read_only, |ui| {
+                loop_section(ui, s, ui_state, engine, &shown);
+            });
             ui.separator();
-            envelope_section(ui, &mut ui_state.envelope, &mut ui_state.release_after_loop);
-            ui.separator();
+            if region.is_none() {
+                envelope_section(ui, &mut ui_state.envelope, &mut ui_state.release_after_loop);
+                ui.separator();
+            }
             InspectorAction {
                 save: save_section(ui, s),
                 toggle_midi_learn,
+                region: edits,
             }
         })
         .inner
@@ -189,8 +229,7 @@ fn file_section(ui: &mut Ui, s: &Session) {
 
 /// The root key as editable text. Enter or leaving the field applies a valid note name;
 /// anything else, or Escape, puts the old key back.
-fn root_field(ui: &mut Ui, s: &mut Session, engine: Option<&AudioEngine>) {
-    let root = s.shown_edit().root;
+fn root_field(ui: &mut Ui, s: &mut Session, engine: Option<&AudioEngine>, root: u8) {
     ui.horizontal(|ui| {
         let label = ui.label("Root key");
         let id = ui.make_persistent_id("root_key_text");
@@ -252,9 +291,9 @@ fn tuning_section(
     s: &mut Session,
     ui_state: &UiState,
     engine: Option<&AudioEngine>,
+    shown: &EditState,
 ) -> bool {
-    ui.heading("Tuning");
-    root_field(ui, s, engine);
+    root_field(ui, s, engine, shown.root);
     let mut toggled = false;
     if ui_state.midi_connected {
         let listening = ui_state.midi_learn.is_some();
@@ -270,7 +309,7 @@ fn tuning_section(
     }
     ui.horizontal(|ui| {
         let name = ui.label("Fine tune");
-        let mut cents = s.shown_edit().cents;
+        let mut cents = shown.cents;
         let slider = ui.add(
             Slider::new(&mut cents, -50.0..=50.0)
                 .show_value(false)
@@ -291,9 +330,13 @@ fn tuning_section(
     toggled
 }
 
-fn loop_section(ui: &mut Ui, s: &mut Session, ui_state: &UiState, engine: Option<&AudioEngine>) {
-    ui.heading("Loop");
-    let shown = s.shown_edit().clone();
+fn loop_section(
+    ui: &mut Ui,
+    s: &mut Session,
+    ui_state: &UiState,
+    engine: Option<&AudioEngine>,
+    shown: &EditState,
+) {
     // Fields range over the file as it is now; marker moves take the original count.
     let last = s.frames().saturating_sub(1);
     let original_frames = s.doc.frames;
@@ -412,41 +455,65 @@ fn loop_section(ui: &mut Ui, s: &mut Session, ui_state: &UiState, engine: Option
     }
 }
 
-/// The audition envelope: attack, decay and release in ms, sustain in %, then "Release plays
-/// after loop end" (v0.3 §7.3).
-fn envelope_section(ui: &mut Ui, envelope: &mut Adsr, release_after_loop: &mut bool) {
-    ui.heading("Envelope");
-    let time = |ui: &mut Ui, name: &str, ms: &mut f32| {
+/// What the user did to the four envelope fields this frame.
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AdsrFields {
+    pub changed: bool,
+    pub dragged: bool,
+    pub drag_stopped: bool,
+}
+
+/// Attack, decay and release in ms and sustain in %: the controls of the audition envelope,
+/// also used for a region's envelope.
+pub fn adsr_fields(ui: &mut Ui, envelope: &mut Adsr) -> AdsrFields {
+    fn time(ui: &mut Ui, name: &str, ms: &mut f32) -> Response {
         ui.horizontal(|ui| {
             let label = ui.label(name);
-            ui.add(
+            let field = ui.add(
                 DragValue::new(ms)
                     .range(0.0..=10_000.0)
                     .speed(1.0)
                     .max_decimals(1)
                     .suffix(" ms"),
-            )
-            .labelled_by(label.id);
-        });
-    };
-    time(ui, "Attack", &mut envelope.attack_ms);
-    time(ui, "Decay", &mut envelope.decay_ms);
-    ui.horizontal(|ui| {
-        let label = ui.label("Sustain");
-        let mut percent = envelope.sustain * 100.0;
-        let field = ui.add(
-            DragValue::new(&mut percent)
-                .range(0.0..=100.0)
-                .speed(0.5)
-                .max_decimals(1)
-                .suffix(" %"),
-        );
-        // Only a change is written back, so the %-to-fraction round trip cannot drift.
-        if field.labelled_by(label.id).changed() {
-            envelope.sustain = percent / 100.0;
-        }
-    });
-    time(ui, "Release", &mut envelope.release_ms);
+            );
+            field.labelled_by(label.id)
+        })
+        .inner
+    }
+    let attack = time(ui, "Attack", &mut envelope.attack_ms);
+    let decay = time(ui, "Decay", &mut envelope.decay_ms);
+    let sustain = ui
+        .horizontal(|ui| {
+            let label = ui.label("Sustain");
+            let mut percent = envelope.sustain * 100.0;
+            let field = ui.add(
+                DragValue::new(&mut percent)
+                    .range(0.0..=100.0)
+                    .speed(0.5)
+                    .max_decimals(1)
+                    .suffix(" %"),
+            );
+            let field = field.labelled_by(label.id);
+            // Only a change is written back, so the %-to-fraction round trip cannot drift.
+            if field.changed() {
+                envelope.sustain = percent / 100.0;
+            }
+            field
+        })
+        .inner;
+    let release = time(ui, "Release", &mut envelope.release_ms);
+    let all = [attack, decay, sustain, release];
+    AdsrFields {
+        changed: all.iter().any(Response::changed),
+        dragged: all.iter().any(Response::dragged),
+        drag_stopped: all.iter().any(Response::drag_stopped),
+    }
+}
+
+/// The audition envelope, then "Release plays after loop end" (v0.3 §7.3).
+fn envelope_section(ui: &mut Ui, envelope: &mut Adsr, release_after_loop: &mut bool) {
+    ui.heading("Envelope");
+    adsr_fields(ui, envelope);
     ui.checkbox(release_after_loop, "Release plays after loop end")
         .on_hover_text(RELEASE_AFTER_LOOP_HINT);
 }

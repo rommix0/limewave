@@ -6,14 +6,16 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use limewave_core::edit::{EditState, History};
+use limewave_core::edit::{EditState, History, LoopMode};
+use limewave_core::notes::note_name;
 use limewave_core::save::Destination;
 use limewave_core::sfz::bind::{self, Binding};
+use limewave_core::sfz::format_number;
 use limewave_core::sfz::model::{Instrument, Keycenter, SfzLoopMode};
 use limewave_core::sfz::paths::same_file_key;
 
 use crate::app::{FileEntry, PendingAction, Session};
-use crate::audio::voice::{InstrumentPlay, Playback, RegionPlay, ampeg_to_adsr};
+use crate::audio::voice::{Adsr, InstrumentPlay, Playback, RegionPlay, ampeg_to_adsr};
 
 /// The first source given to instrument regions. Session sources count up from 1 and never
 /// get this far, so a region's voice is never taken for a session's.
@@ -104,11 +106,14 @@ impl InstrumentState {
         self.preview_changes += 1;
     }
 
-    /// Records the drag preview as one undo step, if there is one.
+    /// Records the drag preview as one undo step, if there is one and it differs from the
+    /// instrument (a drag back to where it started is no step).
     pub fn commit_preview(&mut self) {
         if let Some(preview) = self.preview.take() {
             self.preview_changes += 1;
-            self.edit(|i| *i = preview);
+            if preview != *self.inst() {
+                self.edit(|i| *i = preview);
+            }
         }
     }
 
@@ -174,6 +179,18 @@ impl InstrumentState {
                 Keycenter::Note(n) => n,
                 Keycenter::Sample => 60,
             },
+        }
+    }
+
+    /// Whether `region`'s sample plays with a loop now (the sample's, or the region's own, spec
+    /// 4.3); a sample that is not loaded loops when the region says so.
+    pub fn region_loops(&self, files: &[FileEntry], region: usize) -> bool {
+        match self.region_sound(self.inst(), files, region) {
+            Some((_, edit)) => edit.loop_mode != LoopMode::Off,
+            None => matches!(
+                self.inst().region_info(region).loop_mode,
+                Some(SfzLoopMode::Continuous | SfzLoopMode::Sustain)
+            ),
         }
     }
 
@@ -300,14 +317,14 @@ pub fn play_map(st: &InstrumentState, files: &[FileEntry]) -> InstrumentPlay {
     }
 }
 
-/// Sets `region`'s key range, writing only the ends that change.
+/// Sets `region`'s key range as note names, writing only the ends that change.
 pub fn set_keys(inst: &mut Instrument, region: usize, lo: u8, hi: u8) {
     let info = inst.region_info(region);
     if info.lokey != lo {
-        inst.set(region, "lokey", &lo.to_string());
+        inst.set(region, "lokey", &note_name(lo));
     }
     if info.hikey != hi {
-        inst.set(region, "hikey", &hi.to_string());
+        inst.set(region, "hikey", &note_name(hi));
     }
 }
 
@@ -325,4 +342,70 @@ pub fn set_velocities(inst: &mut Instrument, region: usize, lo: u8, hi: u8) {
 /// The folder sample paths are relative to.
 fn sfz_dir(path: &Path) -> &Path {
     path.parent().unwrap_or(Path::new(""))
+}
+
+/// Writes number opcode `name` on `region` unless `value` already reads as `current` (what
+/// the region would get without the opcode, or has).
+fn set_number(inst: &mut Instrument, region: usize, name: &str, value: f64, current: f64) {
+    let text = format_number(value);
+    if text != format_number(current) {
+        inst.set(region, name, &text);
+    }
+}
+
+/// Sets `region`'s volume in dB, writing only when it differs from what the region has.
+pub fn set_volume(inst: &mut Instrument, region: usize, db: f32) {
+    let current = inst.region_info(region).volume;
+    set_number(inst, region, "volume", db.into(), current.into());
+}
+
+/// Sets `region`'s envelope from milliseconds and a 0..1 sustain: `ampeg_*` in seconds and
+/// percent, each written only when it differs from what the region has.
+pub fn set_envelope(inst: &mut Instrument, region: usize, adsr: &Adsr) {
+    let now = inst.region_info(region).ampeg;
+    let seconds = |ms: f32| f64::from(ms) / 1000.0;
+    set_number(
+        inst,
+        region,
+        "ampeg_attack",
+        seconds(adsr.attack_ms),
+        now.attack.into(),
+    );
+    set_number(
+        inst,
+        region,
+        "ampeg_decay",
+        seconds(adsr.decay_ms),
+        now.decay.into(),
+    );
+    set_number(
+        inst,
+        region,
+        "ampeg_sustain",
+        f64::from(adsr.sustain) * 100.0,
+        now.sustain.into(),
+    );
+    set_number(
+        inst,
+        region,
+        "ampeg_release",
+        seconds(adsr.release_ms),
+        now.release.into(),
+    );
+}
+
+/// Sets how `region` plays (spec 5.3). Normal writes `loop_continuous` when its sample
+/// `loops` and `no_loop` otherwise; nothing is written when the region already plays so.
+pub fn set_playback(inst: &mut Instrument, region: usize, playback: Playback, loops: bool) {
+    let (mode, text) = match playback {
+        Playback::OneShot => (SfzLoopMode::OneShot, "one_shot"),
+        Playback::Sustain => (SfzLoopMode::Sustain, "loop_sustain"),
+        Playback::Normal if loops => (SfzLoopMode::Continuous, "loop_continuous"),
+        Playback::Normal => (SfzLoopMode::NoLoop, "no_loop"),
+    };
+    let current = inst.region_info(region).loop_mode;
+    // Without `loop_mode` a region already plays as its sample does.
+    if current != Some(mode) && !(playback == Playback::Normal && current.is_none()) {
+        inst.set(region, "loop_mode", text);
+    }
 }

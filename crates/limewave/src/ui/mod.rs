@@ -10,6 +10,7 @@ pub mod keymap;
 pub mod new_dialog;
 pub mod overview;
 pub mod record_panel;
+pub mod region_inspector;
 pub mod regions;
 pub mod save_dialog;
 pub mod seam;
