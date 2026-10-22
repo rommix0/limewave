@@ -55,9 +55,14 @@ fn rate_hash(rate: u32) -> u64 {
     h.finish()
 }
 
-/// The typed rate, if Convert can convert to it: valid and not the current rate.
+/// The typed rate, if Convert can convert to it: valid and not the current rate. A file whose
+/// current rate is 0 (its header gives none) converts to nothing.
 fn usable(typed: &Result<u32, String>, current: u32) -> Option<u32> {
-    typed.as_ref().ok().copied().filter(|&r| r != current)
+    typed
+        .as_ref()
+        .ok()
+        .copied()
+        .filter(|&r| current != 0 && r != current)
 }
 
 /// The modal, while `app.ui.rate_dialog` is set. Convert starts the conversion; the result,
@@ -129,7 +134,12 @@ pub fn rate_dialog(ctx: &egui::Context, app: &mut LimewaveApp) {
         ui.add_space(4.0);
         let line = ui.text_style_height(&egui::TextStyle::Body) + ui.spacing().item_spacing.y;
         fixed_height(ui, MESSAGE_LINES * line, |ui| {
-            if let Err(why) = &typed {
+            if current == 0 {
+                ui.colored_label(
+                    colors::END,
+                    "This file's sample rate is unknown (0 Hz), so it can't be converted",
+                );
+            } else if let Err(why) = &typed {
                 ui.colored_label(colors::END, why);
             } else if rate.is_none() {
                 ui.colored_label(colors::END, "That is the current rate");

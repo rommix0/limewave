@@ -12,9 +12,14 @@ const FRAMES: usize = 8000;
 
 /// A harness showing a 440 Hz mono 16-bit sine of 8000 frames at 44.1 kHz on its own.
 fn harness() -> Harness<'static, LimewaveApp> {
+    harness_with_header_rate(44100)
+}
+
+/// [`harness`] for a file whose `fmt` chunk says `header_rate` (the audio is the same).
+fn harness_with_header_rate(header_rate: u32) -> Harness<'static, LimewaveApp> {
     let bytes = wav_bytes(
         &[sine(440.0, 44100, FRAMES, 0.5)],
-        44100,
+        header_rate,
         SampleFormat::Int { bits: 16 },
         Vec::new(),
     );
@@ -151,4 +156,24 @@ fn common_rates_fill_the_field() {
     assert_eq!(field_text(&h), "22050");
     h.get_by_label("Content above 11025 Hz will be removed");
     assert!(convert_enabled(&h));
+}
+
+#[test]
+fn a_zero_hz_file_cannot_be_converted_and_the_dialog_does_not_panic() {
+    let mut h = harness_with_header_rate(0);
+    open_dialog(&mut h);
+    h.get_by_label("Current rate: 0 Hz");
+    h.get_by_label("This file's sample rate is unknown (0 Hz), so it can't be converted");
+    assert!(!convert_enabled(&h));
+    // Any valid rate used to divide by zero in the length preview.
+    type_rate(&mut h, "44100");
+    assert_eq!(field_text(&h), "44100");
+    assert!(!convert_enabled(&h), "still off with a valid rate typed");
+    h.get_by_label("This file's sample rate is unknown (0 Hz), so it can't be converted");
+    // Enter in the field does not start a conversion either.
+    h.key_press(Key::Enter);
+    h.run();
+    h.state_mut().wait_for_renders();
+    h.run();
+    assert_eq!(session(h.state()).rate(), 0, "nothing was converted");
 }

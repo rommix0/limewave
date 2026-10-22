@@ -29,8 +29,13 @@ const TABLE_STEPS: usize = 1024;
 const CUTOFF: f64 = 0.475;
 
 /// The number of frames `frames` input frames make when the rate changes from `from` to
-/// `to`: `round(frames * to / from)`, halves rounding up. Zero frames stay zero.
+/// `to`: `round(frames * to / from)`, halves rounding up. Zero frames stay zero. A `from` of 0
+/// (a file whose header gives no rate) has no meaningful length, so it gives 0 instead of
+/// dividing by zero; `to` may be anything.
 pub fn resampled_len(frames: usize, from: u32, to: u32) -> usize {
+    if from == 0 {
+        return 0;
+    }
     let num = frames as u128 * to as u128;
     let den = from as u128;
     ((2 * num + den) / (2 * den)) as usize
@@ -38,6 +43,9 @@ pub fn resampled_len(frames: usize, from: u32, to: u32) -> usize {
 
 /// `audio` (one `Vec` per channel) converted from `from` to `to` hertz. Every output channel
 /// is [`resampled_len`] long. When the rates are equal this is a plain copy.
+///
+/// Both rates must be above 0 (callers keep `to` within `MIN_RATE..=MAX_RATE` and refuse a
+/// `from` of 0, as `resample_edit` does): the filter's cutoff and positions divide by them.
 pub fn resample(audio: &[Vec<f32>], from: u32, to: u32) -> Vec<Vec<f32>> {
     if from == to {
         return audio.to_vec();
@@ -175,6 +183,12 @@ mod tests {
         assert_eq!(resampled_len(44_100, 44_100, 31_250), 31_250);
         assert_eq!(resampled_len(3, 2, 1), 2); // 1.5 rounds up
         assert_eq!(resampled_len(0, 44_100, 8_000), 0);
+    }
+
+    #[test]
+    fn a_zero_source_rate_gives_no_frames_instead_of_dividing_by_zero() {
+        assert_eq!(resampled_len(1000, 0, 44_100), 0);
+        assert_eq!(resampled_len(0, 0, 0), 0);
     }
 
     #[test]
