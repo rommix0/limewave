@@ -931,13 +931,6 @@ fn rsb_sample_converts_and_its_regions_scale() {
     assert_eq!(s.doc.format.sample_rate, 44_100);
     // These instruments set no loop of their own, so the sample's `smpl` loop is what plays.
     let (mode, start, end) = wav_loop;
-    eprintln!(
-        "DBG {wav_loop:?} {:?}",
-        steps
-            .iter()
-            .map(|a| format!("{:?}", a.op))
-            .collect::<Vec<_>>()
-    );
     assert_ne!(mode, LoopMode::Off, "the library sample has a loop");
     assert_eq!(
         (s.edit().loop_mode, s.edit().loop_start, s.edit().loop_end),
