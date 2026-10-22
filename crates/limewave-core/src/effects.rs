@@ -67,6 +67,8 @@ pub enum SpliceKind {
     SpectrumLoop,
     /// Audio removed with nothing in its place (Crop to selection).
     Cut,
+    /// Samples redrawn by hand with the pencil; the length is unchanged.
+    Draw,
 }
 
 /// The finished audio that a splice step puts in place of its range.

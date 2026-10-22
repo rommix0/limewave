@@ -69,6 +69,8 @@ Notes play when the **Audition** toggle is on and no text field has focus.
 | Mouse wheel over the waveform | Zoom around the cursor |
 | Drag the overview box | Scroll |
 | Drag either edge of the overview box | Zoom, keeping the other edge in place |
+| Drag a sample dot (zoomed in until samples show as dots) | Move that sample up or down; drag sideways to draw over the samples you pass, like a pencil. Each stroke is one undo step. |
+| Hold Shift while drawing samples | Fine control: the sample moves a tenth as far as the pointer |
 
 Note names follow the convention that MIDI note 60 is C4.
 

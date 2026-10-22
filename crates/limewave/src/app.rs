@@ -11,8 +11,8 @@ use eframe::egui::{self, Event, Key, KeyboardShortcut, Modifiers};
 use limewave_core::document::{WavDocument, load_wav};
 use limewave_core::dsp::{PeakPyramid, mono_sum};
 use limewave_core::edit::{
-    EditState, History, Marker, crop_to_loop, crop_to_selection, set_loop_to_selection,
-    set_trim_to_selection, trim_after_loop,
+    EditState, History, Marker, crop_to_loop, crop_to_selection, redraw_samples,
+    set_loop_to_selection, set_trim_to_selection, trim_after_loop,
 };
 use limewave_core::effects::{
     AppliedEffect, Effect, Op, apply_effect, generated_ranges, mirror_edit, peak, plan_effect,
@@ -259,6 +259,23 @@ impl Session {
             _ => e.clone(),
         };
         next.effects.push(a);
+        self.apply(next, engine);
+        true
+    }
+
+    /// Redraws channel `channel` from frame `first` on with `values` (the pencil), as one history
+    /// entry. Returns false, changing nothing, when nothing changes.
+    pub fn redraw_samples(
+        &mut self,
+        channel: usize,
+        first: usize,
+        values: &[f32],
+        engine: Option<&AudioEngine>,
+    ) -> bool {
+        let Some(next) = redraw_samples(self.edit(), &self.processed, channel, first, values)
+        else {
+            return false;
+        };
         self.apply(next, engine);
         true
     }

@@ -283,6 +283,43 @@ pub fn crop_to_selection(
     Ok(c.clamped(original_frames))
 }
 
+/// Redraws samples by hand: `values` replace channel `channel` of `processed` from frame
+/// `first` on, as one undoable effect step that keeps the file length. Values are held to full
+/// scale. Returns `None` when the range does not fit, a value is not finite, or nothing
+/// changes.
+pub fn redraw_samples(
+    e: &EditState,
+    processed: &[Vec<f32>],
+    channel: usize,
+    first: usize,
+    values: &[f32],
+) -> Option<EditState> {
+    let frames = processed.first().map_or(0, Vec::len);
+    let last = first.checked_add(values.len())?.checked_sub(1)?;
+    if channel >= processed.len() || last >= frames || values.iter().any(|v| !v.is_finite()) {
+        return None;
+    }
+    let mut audio: Vec<Vec<f32>> = processed.iter().map(|c| c[first..=last].to_vec()).collect();
+    for (to, v) in audio[channel].iter_mut().zip(values) {
+        *to = v.clamp(-1.0, 1.0);
+    }
+    if audio[channel] == processed[channel][first..=last] {
+        return None;
+    }
+    let mut r = e.clone();
+    r.effects.push(AppliedEffect {
+        op: Op::Splice(Arc::new(Splice {
+            kind: SpliceKind::Draw,
+            audio,
+            // An empty range: nothing is tinted as generated.
+            generated: (1, 0),
+        })),
+        first,
+        last,
+    });
+    Some(r)
+}
+
 /// Linear undo/redo history of edit states, tracking which one was last saved.
 pub struct History {
     entries: Vec<EditState>,
@@ -785,5 +822,47 @@ mod tests {
         let want: Vec<f32> = (100..600).map(|i| -(i as f32)).collect();
         assert_eq!(out[0], want);
         assert_eq!((c.start, c.end), (0, 499));
+    }
+
+    fn quiet(frames: usize, channels: usize) -> Vec<Vec<f32>> {
+        (0..channels)
+            .map(|c| (0..frames).map(|i| (c * 1000 + i) as f32 / 1e4).collect())
+            .collect()
+    }
+
+    #[test]
+    fn redraw_samples_changes_only_the_drawn_channel_and_frames() {
+        let audio = quiet(100, 2);
+        let e = EditState::default_for(100);
+        let r = redraw_samples(&e, &audio, 1, 40, &[0.5, -0.25]).unwrap();
+        assert_eq!(r.effects.len(), 1);
+        let out = crate::effects::process(&audio, &r.effects);
+        let mut want = audio.clone();
+        want[1][40] = 0.5;
+        want[1][41] = -0.25;
+        assert_eq!(out, want);
+        // Hand-drawn samples are not tinted as generated audio.
+        assert!(crate::effects::generated_ranges(&r.effects).is_empty());
+        assert_eq!(r.clone().clamped(100), r);
+    }
+
+    #[test]
+    fn redraw_samples_keeps_values_within_full_scale() {
+        let audio = quiet(10, 1);
+        let e = EditState::default_for(10);
+        let r = redraw_samples(&e, &audio, 0, 3, &[1.5, -2.0]).unwrap();
+        let out = crate::effects::process(&audio, &r.effects);
+        assert_eq!(&out[0][3..5], &[1.0, -1.0]);
+    }
+
+    #[test]
+    fn redraw_samples_refuses_no_change_and_out_of_range() {
+        let audio = quiet(10, 1);
+        let e = EditState::default_for(10);
+        assert!(redraw_samples(&e, &audio, 0, 2, &[audio[0][2]]).is_none());
+        assert!(redraw_samples(&e, &audio, 0, 2, &[]).is_none());
+        assert!(redraw_samples(&e, &audio, 1, 2, &[0.5]).is_none());
+        assert!(redraw_samples(&e, &audio, 0, 9, &[0.5, 0.5]).is_none());
+        assert!(redraw_samples(&e, &audio, 0, 2, &[f32::NAN]).is_none());
     }
 }

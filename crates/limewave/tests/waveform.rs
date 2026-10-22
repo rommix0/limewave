@@ -11,7 +11,7 @@ use eframe::egui::{
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
 use limewave::app::{FileEntry, LimewaveApp, Session};
-use limewave::ui::waveform::flag_hit_point;
+use limewave::ui::waveform::{flag_hit_point, sample_point};
 use limewave_core::document::load_wav_bytes;
 use limewave_core::dsp::{Crossing, is_crossing, is_upward};
 use limewave_core::edit::{LoopMode, Marker};
@@ -458,6 +458,106 @@ fn an_edge_dragged_past_the_other_stops_at_the_closest_zoom() {
     );
     assert!(view.frames_per_px >= limewave::ui::coords::MIN_FRAMES_PER_PX);
     assert!(visible_frames(&h) < 200.0, "zoomed right in");
+}
+
+/// Zooms all the way in on `frame`, so the samples show as dots.
+fn zoom_in_on(h: &mut Harness<'static, LimewaveApp>, frame: usize) {
+    let FileEntry::Loaded(s) = &mut h.state_mut().files[0] else {
+        unreachable!()
+    };
+    let mut view = s.view.unwrap();
+    view.frames_per_px = 1.0 / 16.0;
+    view.first = frame as f64 - 20.0;
+    s.view = Some(view);
+    h.run();
+}
+
+/// Where sample `frame` of the mono test file is drawn.
+fn dot(h: &Harness<'static, LimewaveApp>, frame: usize) -> Pos2 {
+    let s = session(h);
+    sample_point(waveform_rect(h), &s.view.unwrap(), &s.processed, 0, frame)
+}
+
+/// The frames of the processed audio that differ from the file as opened.
+fn changed_frames(h: &Harness<'static, LimewaveApp>) -> Vec<usize> {
+    let s = session(h);
+    (0..s.doc.audio[0].len())
+        .filter(|&f| s.processed[0][f] != s.doc.audio[0][f])
+        .collect()
+}
+
+#[test]
+fn dragging_a_sample_dot_moves_that_sample_as_one_undo_step() {
+    let mut h = looped_harness();
+    zoom_in_on(&mut h, 2000);
+    let from = dot(&h, 2000);
+    let to = from + eframe::egui::vec2(0.0, -30.0);
+    drag(&mut h, from, to);
+    assert_eq!(changed_frames(&h), vec![2000]);
+    let at = dot(&h, 2000);
+    assert!(
+        (at.y - to.y).abs() < 0.5,
+        "the sample follows the pointer: {at:?}"
+    );
+    assert!(h.state().ui.selection.is_none(), "drawing does not select");
+
+    h.state_mut().undo();
+    h.run();
+    assert!(changed_frames(&h).is_empty(), "one undo puts it back");
+    assert!(!session(&h).history.is_dirty());
+}
+
+#[test]
+fn a_sideways_pencil_drag_redraws_the_samples_it_passes() {
+    let mut h = looped_harness();
+    zoom_in_on(&mut h, 2000);
+    let from = dot(&h, 2000);
+    let to = pos2(dot(&h, 2010).x, from.y - 40.0);
+    drag(&mut h, from, to);
+    // The line starts on the grabbed sample, which stays where it was.
+    assert_eq!(changed_frames(&h), (2001..=2010).collect::<Vec<_>>());
+    let ys: Vec<f32> = (2000..=2010).map(|f| dot(&h, f).y).collect();
+    assert!(
+        ys.windows(2).all(|w| w[1] < w[0]),
+        "a straight rising line: {ys:?}"
+    );
+    assert!((ys[10] - to.y).abs() < 0.5);
+    // The stroke is one undo step.
+    h.state_mut().undo();
+    h.run();
+    assert!(changed_frames(&h).is_empty());
+}
+
+#[test]
+fn the_pencil_stops_at_full_scale_and_shift_draws_finely() {
+    let mut h = looped_harness();
+    zoom_in_on(&mut h, 2000);
+    let from = dot(&h, 2000);
+    let above = pos2(from.x, waveform_rect(&h).top() - 200.0);
+    drag(&mut h, from, above);
+    assert_eq!(session(&h).processed[0][2000], 1.0);
+
+    let from = dot(&h, 2005);
+    h.event(Event::ModifiersChanged(Modifiers::SHIFT));
+    h.step();
+    drag(&mut h, from, from + eframe::egui::vec2(0.0, 50.0));
+    h.event(Event::ModifiersChanged(Modifiers::NONE));
+    h.step();
+    let moved = dot(&h, 2005).y - from.y;
+    assert!(
+        (moved - 5.0).abs() < 0.5,
+        "a tenth of the pointer's 50 points: {moved}"
+    );
+}
+
+#[test]
+fn pressing_away_from_the_samples_still_selects_when_zoomed_in() {
+    let mut h = looped_harness();
+    zoom_in_on(&mut h, 2000);
+    let from = dot(&h, 2000) + eframe::egui::vec2(0.0, 60.0);
+    drag(&mut h, from, from + eframe::egui::vec2(80.0, 0.0));
+    assert!(changed_frames(&h).is_empty());
+    assert!(h.state().ui.selection.is_some());
 }
 
 #[test]

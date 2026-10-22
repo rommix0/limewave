@@ -1,5 +1,5 @@
 //! The main waveform: time ruler, one lane per channel, markers, and the mouse handling for
-//! dragging markers, zooming and scrolling.
+//! dragging markers, zooming, scrolling and redrawing samples with the pencil.
 
 use std::sync::Arc;
 
@@ -48,6 +48,130 @@ enum Gesture {
     Select {
         anchor: f64,
     },
+    /// Redrawing samples with the pencil; the stroke is kept beside the gesture.
+    Pencil,
+}
+
+/// How close to a sample dot, in points, a press grabs it.
+const SAMPLE_GRAB_PX: f32 = 5.0;
+/// How far the pencil moves for each point the pointer moves while Shift is held.
+const FINE_DRAW: f32 = 0.1;
+
+/// A pencil stroke in progress: the redrawn samples of one channel from frame `first` on.
+#[derive(Clone)]
+struct PencilStroke {
+    channel: usize,
+    first: usize,
+    values: Vec<f32>,
+    /// The frame drawn last.
+    at: usize,
+    /// The height the pencil draws at. It starts on the grabbed sample and follows the pointer,
+    /// a tenth as far while Shift is held.
+    y: f32,
+    /// The pointer's height when last seen.
+    pointer_y: f32,
+}
+
+impl PencilStroke {
+    fn new(channel: usize, frame: usize, value: f32, y: f32, pointer_y: f32) -> PencilStroke {
+        PencilStroke {
+            channel,
+            first: frame,
+            values: vec![value],
+            at: frame,
+            y,
+            pointer_y,
+        }
+    }
+
+    /// The drawn value at `frame`, if the stroke covers it.
+    fn value(&self, frame: usize) -> Option<f32> {
+        frame
+            .checked_sub(self.first)
+            .and_then(|i| self.values.get(i))
+            .copied()
+    }
+
+    /// Draws `value` at `frame`, and the frames passed over since the last one on a straight
+    /// line between them. `original` is the channel drawn on, for frames reached the first time.
+    fn draw_to(&mut self, frame: usize, value: f32, original: &[f32]) {
+        if frame < self.first {
+            let mut grown = original[frame..self.first].to_vec();
+            grown.append(&mut self.values);
+            self.values = grown;
+            self.first = frame;
+        }
+        let end = self.first + self.values.len();
+        if frame >= end {
+            self.values.extend_from_slice(&original[end..=frame]);
+        }
+        let from = self.value(self.at).unwrap_or(value);
+        let steps = self.at.abs_diff(frame);
+        for f in self.at.min(frame)..=self.at.max(frame) {
+            let t = if steps == 0 {
+                1.0
+            } else {
+                f.abs_diff(self.at) as f32 / steps as f32
+            };
+            self.values[f - self.first] = from + (value - from) * t;
+        }
+        self.at = frame;
+    }
+}
+
+/// The lane of channel `i` of `channels` in the waveform `rect`.
+fn lane_rect(rect: Rect, channels: usize, i: usize) -> Rect {
+    let top = rect.top() + RULER_HEIGHT;
+    let height = (rect.bottom() - top) / channels.max(1) as f32;
+    Rect::from_min_size(
+        pos2(rect.left(), top + i as f32 * height),
+        vec2(rect.width(), height),
+    )
+}
+
+/// The height of the sample value `v` in `lane`; values past full scale sit at the edge.
+fn sample_y(lane: Rect, v: f32) -> f32 {
+    lane.center().y - v.clamp(-1.0, 1.0) * lane.height() * 0.45
+}
+
+/// The sample value at height `y` in `lane`, held to full scale.
+fn sample_value(lane: Rect, y: f32) -> f32 {
+    ((lane.center().y - y) / (lane.height() * 0.45)).clamp(-1.0, 1.0)
+}
+
+/// The channel and frame of the sample dot under `pos`, when zoomed in far enough for the
+/// samples to show as dots.
+fn sample_at(
+    rect: Rect,
+    view: &ViewTransform,
+    audio: &[Vec<f32>],
+    pos: Pos2,
+) -> Option<(usize, usize)> {
+    let total = audio.first().map_or(0, Vec::len);
+    if view.frames_per_px >= 1.0 || total == 0 {
+        return None;
+    }
+    let channel =
+        (0..audio.len()).find(|&i| lane_rect(rect, audio.len(), i).y_range().contains(pos.y))?;
+    let frame = frame_at(view, pos.x, rect.left(), total);
+    let dot = sample_point(rect, view, audio, channel, frame);
+    ((dot.x - pos.x).abs() <= SAMPLE_GRAB_PX && (dot.y - pos.y).abs() <= SAMPLE_GRAB_PX)
+        .then_some((channel, frame))
+}
+
+/// Where the dot of sample `frame` of channel `channel` is drawn in the waveform `rect`.
+pub fn sample_point(
+    rect: Rect,
+    view: &ViewTransform,
+    audio: &[Vec<f32>],
+    channel: usize,
+    frame: usize,
+) -> Pos2 {
+    let lane = lane_rect(rect, audio.len(), channel);
+    pos2(
+        view.frame_to_x(frame as f64, rect.left()),
+        sample_y(lane, audio[channel][frame]),
+    )
 }
 
 fn with_alpha(c: Color32, alpha: u8) -> Color32 {
@@ -202,6 +326,7 @@ pub fn waveform_view(
         ui.data_mut(|d| d.insert_temp(entry_id(), true));
     }
     let drag_id = response.id.with("drag");
+    let pencil_id = response.id.with("pencil");
     if response.drag_started_by(PointerButton::Primary)
         && let Some(press) = ui.input(|i| i.pointer.press_origin())
     {
@@ -212,8 +337,18 @@ pub fn waveform_view(
                 marker,
                 grab_offset: marker_frame(e, marker) as f64 - view.x_to_frame(press.x, left),
             }),
-            None => Gesture::Select {
-                anchor: view.x_to_frame(press.x, left),
+            None => match sample_at(rect, &view, &s.processed, press) {
+                Some((channel, frame)) => {
+                    let value = s.processed[channel][frame];
+                    let lane = lane_rect(rect, s.processed.len(), channel);
+                    let stroke =
+                        PencilStroke::new(channel, frame, value, sample_y(lane, value), press.y);
+                    ui.data_mut(|d| d.insert_temp(pencil_id, stroke));
+                    Gesture::Pencil
+                }
+                None => Gesture::Select {
+                    anchor: view.x_to_frame(press.x, left),
+                },
             },
         };
         ui.data_mut(|d| d.insert_temp(drag_id, Some(gesture)));
@@ -238,12 +373,36 @@ pub fn waveform_view(
                 ui_state.selection =
                     Some(dragged_selection(s, anchor, to, ui_state.snap && !shift));
             }
+            (Gesture::Pencil, Some(pos)) => {
+                if let Some(mut stroke) = ui.data(|d| d.get_temp::<PencilStroke>(pencil_id)) {
+                    let lane = lane_rect(rect, s.processed.len(), stroke.channel);
+                    let dy = pos.y - stroke.pointer_y;
+                    stroke.pointer_y = pos.y;
+                    let step = if shift { dy * FINE_DRAW } else { dy };
+                    let value = sample_value(lane, stroke.y + step);
+                    stroke.y = sample_y(lane, value);
+                    let frame = frame_at(&view, pos.x, left, total);
+                    stroke.draw_to(frame, value, &s.processed[stroke.channel]);
+                    ui.data_mut(|d| d.insert_temp(pencil_id, stroke));
+                }
+            }
             _ => {}
         }
         if response.drag_stopped() {
             ui.data_mut(|d| d.insert_temp(drag_id, None::<Gesture>));
-            if matches!(gesture, Gesture::Marker(_)) {
-                s.commit_preview(engine);
+            match gesture {
+                Gesture::Marker(_) => s.commit_preview(engine),
+                Gesture::Pencil => {
+                    let stroke = ui.data_mut(|d| {
+                        let stroke = d.get_temp::<PencilStroke>(pencil_id);
+                        d.remove::<PencilStroke>(pencil_id);
+                        stroke
+                    });
+                    if let Some(stroke) = stroke {
+                        s.redraw_samples(stroke.channel, stroke.first, &stroke.values, engine);
+                    }
+                }
+                Gesture::Select { .. } => {}
             }
         }
     }
@@ -274,17 +433,42 @@ pub fn waveform_view(
     let flags = marker_flags(&painter, rect, &view, s.shown_edit());
     let hovered = match gesture {
         Some(Gesture::Marker(drag)) => Some(drag.marker),
-        Some(Gesture::Select { .. }) => None,
+        Some(Gesture::Select { .. } | Gesture::Pencil) => None,
         None => response
             .hover_pos()
             .and_then(|p| marker_at(s.shown_edit(), &view, left, &flag_rects(&flags), p)),
     };
+    // The sample the pencil is on, or the one a press would grab.
+    let stroke = ui.data(|d| d.get_temp::<PencilStroke>(pencil_id));
+    let dot = match gesture {
+        Some(Gesture::Pencil) => stroke.as_ref().map(|st| (st.channel, st.at)),
+        Some(_) => None,
+        None if hovered.is_some() => None,
+        None => response
+            .hover_pos()
+            .and_then(|p| sample_at(rect, &view, &s.processed, p)),
+    };
     if hovered.is_some() {
         ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
+    } else if dot.is_some() {
+        ui.ctx().set_cursor_icon(CursorIcon::ResizeVertical);
     }
 
     let ruler_color = ui.visuals().weak_text_color();
-    draw(&painter, rect, s, &view, hovered, ruler_color, &flags);
+    let hover = Hover {
+        marker: hovered,
+        dot,
+    };
+    draw(
+        &painter,
+        rect,
+        s,
+        &view,
+        hover,
+        stroke.as_ref(),
+        ruler_color,
+        &flags,
+    );
     draw_selection(&painter, rect, &view, ui_state);
     for c in cursors {
         let x = view.frame_to_x(c.frame, left);
@@ -467,17 +651,24 @@ fn draw_selection(painter: &egui::Painter, rect: Rect, view: &ViewTransform, ui_
     }
 }
 
+/// What the pointer is over: a marker, or the sample dot it would grab (or is drawing).
+struct Hover {
+    marker: Option<Marker>,
+    dot: Option<(usize, usize)>,
+}
+
+#[allow(clippy::too_many_arguments)]
 fn draw(
     painter: &egui::Painter,
     rect: Rect,
     s: &Session,
     view: &ViewTransform,
-    hovered: Option<Marker>,
+    hover: Hover,
+    pencil: Option<&PencilStroke>,
     ruler_color: Color32,
     flags: &[Flag],
 ) {
     let left = rect.left();
-    let width = rect.width();
     let e = s.shown_edit();
     let lanes_top = rect.top() + RULER_HEIGHT;
     let lanes = Rect::from_min_max(pos2(left, lanes_top), rect.max);
@@ -485,14 +676,10 @@ fn draw(
     let x_of = |f: usize| view.frame_to_x(f as f64, left);
     let visible_x = |f: usize| x_of(f).clamp(left, rect.right());
 
-    // Lanes, one per channel.
-    let channels = s.processed.len().max(1);
-    let lane_height = lanes.height() / channels as f32;
+    // Lanes, one per channel, with the pencil stroke in place of the samples it covers.
+    let channels = s.processed.len();
     for (i, (channel, peaks)) in s.processed.iter().zip(&s.peaks).enumerate() {
-        let lane = Rect::from_min_size(
-            pos2(left, lanes_top + i as f32 * lane_height),
-            vec2(width, lane_height),
-        );
+        let lane = lane_rect(rect, channels, i);
         if i > 0 {
             painter.hline(lane.x_range(), lane.top(), Stroke::new(1.0, colors::PANEL));
         }
@@ -501,7 +688,10 @@ fn draw(
             lane.center().y,
             Stroke::new(1.0, with_alpha(Color32::WHITE, 16)),
         );
-        draw_lane(painter, lane, view, channel, peaks);
+        let stroke = pencil
+            .filter(|p| p.channel == i)
+            .map(|p| (p.first, &p.values[..]));
+        draw_lane(painter, lane, view, channel, peaks, stroke);
     }
 
     // Generated audio, then outside the trim and the loop region.
@@ -528,7 +718,7 @@ fn draw(
     // Markers: loop markers only while the loop is on.
     for flag in flags {
         let x = x_of(marker_frame(e, flag.marker));
-        let width = if hovered == Some(flag.marker) {
+        let width = if hover.marker == Some(flag.marker) {
             2.5
         } else {
             1.5
@@ -540,6 +730,20 @@ fn draw(
             flag.galley.clone(),
             colors::PANEL,
         );
+    }
+
+    // A ring around the sample the pencil is on or would grab.
+    if let Some((c, f)) = hover.dot
+        && view.frames_per_px < 1.0
+        && let Some(channel) = s.processed.get(c)
+        && f < channel.len()
+    {
+        let value = pencil
+            .filter(|p| p.channel == c)
+            .and_then(|p| p.value(f))
+            .unwrap_or(channel[f]);
+        let at = pos2(x_of(f), sample_y(lane_rect(rect, channels, c), value));
+        painter.circle_stroke(at, 4.5, Stroke::new(1.5, colors::NEON));
     }
 }
 
@@ -572,18 +776,18 @@ fn draw_crossfade(painter: &egui::Painter, lanes: Rect, view: &ViewTransform, e:
     ));
 }
 
-/// One channel: a min/max bar per pixel column, or the real samples when zoomed in.
+/// One channel: a min/max bar per pixel column, or the real samples when zoomed in, with
+/// `pencil` (a first frame and the values drawn from it) in place of the samples it covers.
 fn draw_lane(
     painter: &egui::Painter,
     lane: Rect,
     view: &ViewTransform,
     channel: &[f32],
     peaks: &PeakPyramid,
+    pencil: Option<(usize, &[f32])>,
 ) {
     let left = lane.left();
-    let mid = lane.center().y;
-    let half = lane.height() * 0.45;
-    let y_of = |v: f32| mid - v.clamp(-1.0, 1.0) * half;
+    let y_of = |v: f32| sample_y(lane, v);
     let stroke = Stroke::new(1.0, colors::WAVE);
     let total = channel.len();
 
@@ -591,7 +795,13 @@ fn draw_lane(
         let first = (view.x_to_frame(lane.left(), left).floor().max(1.0) as usize - 1).min(total);
         let last = (view.x_to_frame(lane.right(), left).ceil().max(0.0) as usize + 1).min(total);
         let points: Vec<Pos2> = (first..last)
-            .map(|f| pos2(view.frame_to_x(f as f64, left), y_of(channel[f])))
+            .map(|f| {
+                let v = pencil
+                    .and_then(|(first, values)| values.get(f.checked_sub(first)?))
+                    .copied()
+                    .unwrap_or(channel[f]);
+                pos2(view.frame_to_x(f as f64, left), y_of(v))
+            })
             .collect();
         let spacing = (1.0 / view.frames_per_px) as f32;
         let radius = (spacing / 3.0).clamp(1.0, 2.5);
@@ -688,6 +898,65 @@ fn draw_ruler(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_pencil_stroke_fills_the_frames_it_passes_over() {
+        let original = vec![0.0; 20];
+        let mut stroke = PencilStroke::new(0, 10, 0.0, 0.0, 0.0);
+        stroke.draw_to(10, 0.2, &original);
+        assert_eq!((stroke.first, stroke.values.clone()), (10, vec![0.2]));
+        // A jump of four frames draws a straight line from the last value.
+        stroke.draw_to(14, 0.6, &original);
+        assert_eq!(stroke.first, 10);
+        let want = [0.2, 0.3, 0.4, 0.5, 0.6];
+        assert!(
+            stroke
+                .values
+                .iter()
+                .zip(want)
+                .all(|(a, b)| (a - b).abs() < 1e-6)
+        );
+        // Going back left of the start grows the stroke at the front.
+        stroke.draw_to(8, 0.0, &original);
+        assert_eq!(stroke.first, 8);
+        assert_eq!(stroke.values.len(), 7);
+        assert_eq!(stroke.value(8), Some(0.0));
+        assert!(stroke.value(14).is_some_and(|v| (v - 0.6).abs() < 1e-6));
+        assert_eq!(stroke.value(15), None);
+        assert_eq!(stroke.at, 8);
+    }
+
+    #[test]
+    fn a_pencil_stroke_keeps_the_original_where_it_skips_ahead_of_its_start() {
+        let original: Vec<f32> = (0..10).map(|i| i as f32 / 10.0).collect();
+        let mut stroke = PencilStroke::new(0, 2, 0.2, 0.0, 0.0);
+        stroke.draw_to(5, 0.2, &original);
+        assert_eq!(stroke.values, vec![0.2; 4]);
+    }
+
+    #[test]
+    fn samples_are_grabbed_only_near_their_dots_and_when_zoomed_in() {
+        let rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(400.0, 222.0));
+        let audio = vec![vec![0.0; 100], vec![0.5; 100]];
+        let near = ViewTransform {
+            first: 0.0,
+            frames_per_px: 0.1,
+        };
+        let dot = sample_point(rect, &near, &audio, 1, 20);
+        assert_eq!(sample_at(rect, &near, &audio, dot), Some((1, 20)));
+        assert_eq!(
+            sample_at(rect, &near, &audio, dot + vec2(3.0, -3.0)),
+            Some((1, 20))
+        );
+        assert_eq!(sample_at(rect, &near, &audio, dot + vec2(0.0, 12.0)), None);
+        // Zoomed out, the samples are bars, not dots.
+        let far = ViewTransform {
+            first: 0.0,
+            frames_per_px: 1.0,
+        };
+        let dot = sample_point(rect, &far, &audio, 0, 20);
+        assert_eq!(sample_at(rect, &far, &audio, dot), None);
+    }
 
     #[test]
     fn crossfade_ramp_is_not_drawn_for_backward_loops() {
