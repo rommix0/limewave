@@ -1,7 +1,6 @@
 //! Saving an instrument: the `.sfz` and the WAVs it plays (spec 7).
 
 use std::collections::{HashMap, HashSet};
-use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
 use super::bind::{Binding, write_back};
@@ -194,8 +193,8 @@ struct Job {
     index: usize,
     source: PathBuf,
     target: PathBuf,
-    /// An open handle on the source when the WAV is copied as it is; `None` when it is rebuilt.
-    copy: Option<std::fs::File>,
+    /// Whether the WAV is copied as it is (else it is rebuilt).
+    copy: bool,
     in_place: bool,
 }
 
@@ -213,9 +212,9 @@ struct Job {
 /// skipped, changed ones are overwritten after a `.bak`.
 ///
 /// Nothing is replaced until everything that can fail beforehand has passed: the targets are
-/// checked, every WAV to be copied is opened, and every backup (the `.sfz`'s too) is made. Then
-/// the WAVs are written, and the `.sfz` last. A failed backup or open aborts with nothing
-/// replaced (backups already made stay).
+/// checked, every WAV to be copied is checked readable, and every backup (the `.sfz`'s too) is
+/// made. Then the WAVs are written, and the `.sfz` last. A failed backup or read check aborts
+/// with nothing replaced (backups already made stay).
 pub fn save_instrument(
     inst: &Instrument,
     sfz_path: &Path,
@@ -303,7 +302,17 @@ pub fn save_instrument(
         }
     }
 
-    // Phase 1: decide each WAV, open what is copied, make every backup.
+    // Moved samples are named relative to the default folder. When that lies inside the new
+    // folder, it is created too, so a system that does not fold `..` in the text still
+    // resolves it.
+    let target_dir = sfz_target.parent().unwrap_or(Path::new(""));
+    let default_path = out.default_path().replace('\\', "/");
+    let default_folder = (plans.iter().any(|p| p.moved_text.is_some())
+        && !is_absolute_text(&default_path))
+    .then(|| normalize(&target_dir.join(&default_path)))
+    .filter(|d| inside(target_dir, d).is_some_and(|rel| rel.components().next().is_some()));
+
+    // Phase 1: decide each WAV, check what is copied can be read, make every backup.
     let mut jobs = Vec::new();
     for plan in plans {
         let rewrite = samples
@@ -314,11 +323,12 @@ pub fn save_instrument(
         if in_place && !rewrite {
             continue;
         }
-        let copy = if rewrite {
-            None
-        } else {
-            Some(std::fs::File::open(&plan.source)?)
-        };
+        let copy = !rewrite;
+        if copy {
+            // Only a check that the source can be read; it is opened again to copy, so a big
+            // instrument never holds many files open at once.
+            drop(std::fs::File::open(&plan.source)?);
+        }
         jobs.push(Job {
             index: plan.index,
             source: plan.source,
@@ -350,19 +360,17 @@ pub fn save_instrument(
     };
 
     // Phase 2: write the WAVs, then the `.sfz`.
+    if let Some(dir) = default_folder {
+        std::fs::create_dir_all(dir)?;
+    }
     for job in jobs {
-        let bytes = match job.copy {
-            Some(mut file) => {
-                let mut bytes = Vec::new();
-                file.read_to_end(&mut bytes)?;
-                bytes
-            }
-            None => {
-                let s = samples[job.index]
-                    .as_ref()
-                    .expect("a rebuilt sample is loaded");
-                build_wav_bytes(s.doc, &wav_edit_for_save(s.doc, s.edit, write_smpl))
-            }
+        let bytes = if job.copy {
+            std::fs::read(&job.source)?
+        } else {
+            let s = samples[job.index]
+                .as_ref()
+                .expect("a rebuilt sample is loaded");
+            build_wav_bytes(s.doc, &wav_edit_for_save(s.doc, s.edit, write_smpl))
         };
         write_atomic(&job.target, &job.source, &bytes)?;
     }
@@ -764,6 +772,8 @@ mod tests {
         o.save(&Destination::Folder(out.clone()), false).unwrap();
         let saved = text(&out.join("a.sfz"));
         assert!(saved.contains("sample=../samples/y.wav"), "{saved}");
+        // The default folder the text climbs out of exists, for systems that do not fold `..`.
+        assert!(out.join("Kit").is_dir());
         reopen_all_found(&out.join("a.sfz"));
     }
 
