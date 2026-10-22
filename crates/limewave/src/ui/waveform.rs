@@ -615,7 +615,7 @@ fn dragged_edit(
     snap: bool,
 ) -> EditState {
     let mut to = target.round().max(0.0) as usize;
-    let window = snap_window(s.doc.format.sample_rate);
+    let window = snap_window(s.rate());
     if snap {
         let crossing = loop_crossing(s.edit().loop_mode);
         match marker {
@@ -642,7 +642,7 @@ fn dragged_selection(s: &Session, a: f64, b: f64, snap: bool) -> (usize, usize) 
     let at = |f: f64| f.round().clamp(0.0, last_frame) as usize;
     let (mut first, mut last) = (at(a.min(b)), at(a.max(b)));
     if snap {
-        let window = snap_window(s.doc.format.sample_rate);
+        let window = snap_window(s.rate());
         first = snap_loop_start(&s.mono, first, window);
         last = snap_loop_end(&s.mono, last, window).max(first);
     }
@@ -741,7 +741,7 @@ fn draw(
         draw_crossfade(painter, lanes, view, e);
     }
 
-    draw_ruler(painter, rect, view, s.doc.format.sample_rate, ruler_color);
+    draw_ruler(painter, rect, view, s.rate(), ruler_color);
 
     // Markers: loop markers only while the loop is on.
     for flag in flags {

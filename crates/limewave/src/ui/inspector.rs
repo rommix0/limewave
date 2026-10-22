@@ -36,7 +36,7 @@ fn shifted_root(n: u8, semitones: i16) -> Option<u8> {
 }
 
 /// "16-bit PCM, 44100 Hz, mono" and the like.
-fn format_text(s: &Session) -> String {
+pub(crate) fn format_text(s: &Session) -> String {
     let f = &s.doc.format;
     let sample = match f.format {
         SampleFormat::Int { bits } => format!("{bits}-bit PCM"),
@@ -47,7 +47,7 @@ fn format_text(s: &Session) -> String {
         2 => "stereo".to_owned(),
         n => format!("{n} channels"),
     };
-    format!("{sample}, {} Hz, {channels}", f.sample_rate)
+    format!("{sample}, {} Hz, {channels}", s.rate())
 }
 
 fn loop_mode_text(m: LoopMode) -> &'static str {
@@ -390,7 +390,7 @@ fn loop_section(
         });
 
     ui.add_enabled_ui(loop_on && !backward, |ui| {
-        let rate = s.doc.format.sample_rate;
+        let rate = s.rate();
         let max = shown.max_crossfade();
         let mut ms = frames_to_ms(shown.crossfade, rate);
         ui.horizontal(|ui| {

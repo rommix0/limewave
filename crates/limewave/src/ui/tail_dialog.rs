@@ -99,7 +99,7 @@ impl TailPlot {
 fn cut_and_from(s: &Session) -> (usize, usize) {
     let e = s.edit();
     let cut = e.end.min(s.frames().saturating_sub(1)) + 1;
-    let lead = (PREVIEW_LEAD_S * f64::from(s.doc.format.sample_rate)) as usize;
+    let lead = (PREVIEW_LEAD_S * f64::from(s.rate())) as usize;
     let from = cut.saturating_sub(lead).max(e.start.min(cut - 1));
     (cut, from)
 }
@@ -143,7 +143,7 @@ pub fn tail_dialog(ctx: &egui::Context, app: &mut LimewaveApp) {
         return;
     };
     let (cut, from) = cut_and_from(s);
-    let rate = s.doc.format.sample_rate;
+    let rate = s.rate();
 
     // The analysis, as soon as the dialog opens.
     let analysis_key = app.render_key(selection_hash(selection));

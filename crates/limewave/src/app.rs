@@ -16,7 +16,7 @@ use limewave_core::edit::{
 };
 use limewave_core::effects::{
     AppliedEffect, Effect, Op, apply_effect, generated_ranges, mirror_edit, peak, plan_effect,
-    process, silence_bounds,
+    process, rate_after, resample_map, resample_map_end, silence_bounds,
 };
 use limewave_core::notes::note_name;
 use limewave_core::render::render;
@@ -263,14 +263,14 @@ impl Session {
         self.preview.as_ref().unwrap_or_else(|| self.edit())
     }
 
+    /// The sample rate of the current edit: the file's, or the rate of its last conversion.
+    pub fn rate(&self) -> u32 {
+        rate_after(self.doc.format.sample_rate, &self.edit().effects)
+    }
+
     /// The buffer the audio engine plays for the current edit.
     pub fn play_buffer(&self) -> PlayBuffer {
-        play_buffer(
-            &self.processed,
-            self.doc.format.sample_rate,
-            self.edit(),
-            self.source,
-        )
+        play_buffer(&self.processed, self.rate(), self.edit(), self.source)
     }
 
     /// Records `e` (clamped to the file) as the new current edit.
@@ -405,7 +405,8 @@ impl Session {
         let source = next_source();
         let rendered = match engine {
             Some(engine) => {
-                let buffer = play_buffer(&audio, self.doc.format.sample_rate, edit, source);
+                let rate = rate_after(self.doc.format.sample_rate, &edit.effects);
+                let buffer = play_buffer(&audio, rate, edit, source);
                 let rendered = Vec::clone(&buffer.audio);
                 engine.set_buffer(buffer);
                 rendered
@@ -487,7 +488,7 @@ impl Session {
         let e = &self.published;
         PlayBuffer {
             audio: Arc::clone(&self.rendered),
-            rate: self.doc.format.sample_rate,
+            rate: rate_after(self.doc.format.sample_rate, &e.effects),
             start: e.start,
             end: e.end,
             loop_mode: e.loop_mode,
@@ -2187,6 +2188,22 @@ impl LimewaveApp {
         self.ui.play_from = self.ui.play_from.filter(|&f| f < frames);
     }
 
+    /// Records `e`, a rate conversion of the selected file, as one history entry. The
+    /// selection and the play-from point move with the audio through the conversion step(s)
+    /// that `e` adds: the selection's last frame as an inclusive end, the others as starts.
+    /// Undo and redo leave them to the usual clamping.
+    pub fn apply_rate_edit(&mut self, e: EditState) {
+        if let Some(s) = self.selected_session() {
+            let steps = &e.effects[s.edit().effects.len().min(e.effects.len())..];
+            self.ui.selection = self.ui.selection.map(|(first, last)| {
+                let first = resample_map(steps, first);
+                (first, resample_map_end(steps, last).max(first))
+            });
+            self.ui.play_from = self.ui.play_from.map(|f| resample_map(steps, f));
+        }
+        self.apply_dialog_edit(e);
+    }
+
     /// Records `e`, a dialog's rendered edit, as one history entry of the selected file. The
     /// selection and play-from point are kept inside the new length at once, and a file that
     /// grew is refit in the view so its new audio shows.
@@ -3177,7 +3194,7 @@ mod tests {
     use crate::render_worker::spawn_render;
     use egui_kittest::kittest::{NodeT, Queryable};
     use limewave_core::document::load_wav_bytes;
-    use limewave_core::edit::LoopMode;
+    use limewave_core::edit::{LoopMode, resample_edit};
     use limewave_core::effects::{FadeCurve, MonoSource, Splice, SpliceKind};
     use limewave_core::spectrum_loop::SpectrumLoopError;
     use limewave_core::tail::TailError;
@@ -4651,5 +4668,58 @@ mod tests {
         let s = app.selected_session().unwrap();
         assert_eq!(s.frames(), 1500);
         assert_eq!(s.view, None, "refit to show the new audio");
+    }
+
+    /// The conversion of the selected file to `to` Hz, as the rate dialog builds it.
+    fn converted(app: &LimewaveApp, to: u32) -> EditState {
+        let s = app.selected_session().unwrap();
+        resample_edit(
+            s.edit(),
+            &s.processed,
+            to,
+            s.doc.format.sample_rate,
+            s.doc.frames,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn converting_changes_the_rate_everywhere_and_undo_restores_it() {
+        let mut app = app_with(short_session());
+        let e = converted(&app, 31_250);
+        app.apply_rate_edit(e);
+        let s = app.selected_session().unwrap();
+        assert_eq!(s.rate(), 31_250);
+        assert_eq!(s.play_buffer().rate, 31_250);
+        assert_eq!(s.published_buffer().rate, 31_250);
+        assert!(crate::ui::inspector::format_text(s).contains("31250 Hz"));
+
+        app.undo();
+        let s = app.selected_session().unwrap();
+        assert_eq!(s.rate(), 44_100);
+        assert_eq!(s.play_buffer().rate, 44_100);
+        assert_eq!(s.published_buffer().rate, 44_100);
+        assert!(crate::ui::inspector::format_text(s).contains("44100 Hz"));
+
+        app.redo();
+        assert_eq!(app.selected_session().unwrap().rate(), 31_250);
+    }
+
+    #[test]
+    fn converting_scales_the_selection_and_play_from() {
+        let bytes = wav_bytes(
+            &[sine(220.0, 44100, 44_100, 0.5)],
+            44100,
+            SampleFormat::Int { bits: 16 },
+            Vec::new(),
+        );
+        let doc = load_wav_bytes(PathBuf::from("long.wav"), &bytes).unwrap();
+        let mut app = app_with(Session::new(doc));
+        app.ui.selection = Some((4410, 8820));
+        app.ui.play_from = Some(4410);
+        let e = converted(&app, 22_050);
+        app.apply_rate_edit(e);
+        assert_eq!(app.ui.selection, Some((2205, 4410)));
+        assert_eq!(app.ui.play_from, Some(2205));
     }
 }

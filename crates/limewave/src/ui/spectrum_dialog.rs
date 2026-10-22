@@ -190,7 +190,7 @@ pub fn spectrum_dialog(ctx: &egui::Context, app: &mut LimewaveApp) {
         return;
     };
     let range = source_range(s, selection);
-    let rate = s.doc.format.sample_rate;
+    let rate = s.rate();
 
     // The analysis, as soon as the dialog opens.
     let analysis_key = app.render_key(selection_hash(selection));
