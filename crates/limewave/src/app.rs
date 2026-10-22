@@ -1738,6 +1738,9 @@ impl LimewaveApp {
         let mut save = None;
         egui::Panel::top("toolbar").show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
+                // A widget that does not fit moves whole to the next row; its text is never
+                // split into the leftover width.
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
                 if ui.button("Open file…").clicked()
                     && let Some(p) = rfd::FileDialog::new()
                         .add_filter("WAV audio", &["wav", "WAV"])

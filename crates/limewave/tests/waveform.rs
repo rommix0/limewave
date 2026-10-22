@@ -62,13 +62,18 @@ fn looped_harness() -> Harness<'static, LimewaveApp> {
 
 /// `looped_harness` with `step_dt` seconds between frames.
 fn looped_harness_with_dt(step_dt: f32) -> Harness<'static, LimewaveApp> {
+    looped_harness_sized(eframe::egui::vec2(1100.0, 700.0), step_dt)
+}
+
+/// `looped_harness` in a window of `size`, with `step_dt` seconds between frames.
+fn looped_harness_sized(size: eframe::egui::Vec2, step_dt: f32) -> Harness<'static, LimewaveApp> {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("loop.wav");
     std::fs::write(&path, looped_bytes()).unwrap();
     let mut app = LimewaveApp::for_test();
     app.open_file(path);
     let mut harness = Harness::builder()
-        .with_size(eframe::egui::vec2(1400.0, 700.0))
+        .with_size(size)
         .with_step_dt(step_dt)
         // The seam readout uses an arrow that the test font set lacks.
         .allow_missing_glyphs()
@@ -554,7 +559,8 @@ fn the_pencil_stops_at_full_scale_and_shift_draws_finely() {
 fn pressing_away_from_the_samples_still_selects_when_zoomed_in() {
     let mut h = looped_harness();
     zoom_in_on(&mut h, 2000);
-    let from = dot(&h, 2000) + eframe::egui::vec2(0.0, 60.0);
+    // Above the dot: below it the lane, a toolbar row shorter than it once was, would end.
+    let from = dot(&h, 2000) + eframe::egui::vec2(0.0, -60.0);
     drag(&mut h, from, from + eframe::egui::vec2(80.0, 0.0));
     assert!(changed_frames(&h).is_empty());
     assert!(h.state().ui.selection.is_some());
@@ -582,7 +588,7 @@ fn opening_a_long_stereo_file_renders_quickly() {
     app.files = vec![FileEntry::Loaded(Box::new(session))];
     app.select(0);
     let mut h = Harness::builder()
-        .with_size(eframe::egui::vec2(1400.0, 700.0))
+        .with_size(eframe::egui::vec2(1100.0, 700.0))
         // The seam readout uses an arrow that the test font set lacks.
         .allow_missing_glyphs()
         .build_ui_state(|ui, app: &mut LimewaveApp| app.show(ui), app);
@@ -653,7 +659,7 @@ fn tail_harness() -> Harness<'static, LimewaveApp> {
     app.files = vec![FileEntry::Loaded(Box::new(s))];
     app.select(0);
     let mut h = Harness::builder()
-        .with_size(eframe::egui::vec2(1400.0, 700.0))
+        .with_size(eframe::egui::vec2(1100.0, 700.0))
         .with_step_dt(0.25)
         // The seam readout uses an arrow that the test font set lacks.
         .allow_missing_glyphs()
@@ -825,4 +831,23 @@ fn escape_turns_draw_off_first() {
     h.key_press(Key::Escape);
     h.run();
     assert_eq!(h.state().ui.selection, None);
+}
+
+#[test]
+fn a_wrapped_toolbar_costs_only_its_own_row() {
+    // Before the Draw toggle the waveform was 170 points tall at this size. The toolbar may wrap
+    // one row now, but its last widgets must not be squeezed into the leftover width of a row.
+    let h = looped_harness();
+    let height = waveform_rect(&h).height();
+    assert!(height >= 140.0, "the waveform is {height} points tall");
+    assert!(h.get_by_label("Audition").rect().height() < 30.0);
+}
+
+#[test]
+fn the_toolbar_fits_one_row_in_a_1280_window() {
+    let h = looped_harness_sized(eframe::egui::vec2(1280.0, 700.0), 0.25);
+    let open = h.get_by_label("Open file…").rect();
+    assert_eq!(h.get_by_label("✏ Draw").rect().top(), open.top());
+    assert_eq!(h.get_by_label("Audition").rect().top(), open.top());
+    assert!(waveform_rect(&h).top() < 140.0);
 }
