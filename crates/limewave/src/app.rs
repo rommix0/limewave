@@ -880,6 +880,7 @@ impl LimewaveApp {
     /// stops the rest.
     pub fn save_all(&mut self) -> bool {
         let mut results = Vec::new();
+        let mut stopped = false;
         for i in 0..self.files.len() {
             let FileEntry::Loaded(s) = &self.files[i] else {
                 continue;
@@ -889,7 +890,11 @@ impl LimewaveApp {
             }
             if s.untitled {
                 if !self.save_untitled(i) {
-                    return false;
+                    // A failed untitled save left its result in `save_results`; a cancel
+                    // left nothing. Either way the earlier results still count.
+                    results.extend(self.save_results.take().unwrap_or_default());
+                    stopped = true;
+                    break;
                 }
                 continue;
             }
@@ -899,11 +904,11 @@ impl LimewaveApp {
                 .unwrap_or_else(|| Destination::Folder(default_folder(&s.doc.path)));
             results.extend(self.save_without_dialog(i, destination));
         }
-        let ok = results.iter().all(|(_, r)| r.is_ok());
-        if !ok {
+        let failed = results.iter().any(|(_, r)| r.is_err());
+        if failed {
             self.save_results = Some(results);
         }
-        ok
+        !failed && !stopped
     }
 
     /// Saves file `i` to `destination` with nobody to ask: a folder save that would replace

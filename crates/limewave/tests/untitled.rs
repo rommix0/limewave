@@ -6,6 +6,7 @@ use egui_kittest::Harness;
 use limewave::app::{FileEntry, LimewaveApp, NewName, PendingAction, Session};
 use limewave_core::document::new_document;
 use limewave_core::edit::{EditState, LoopMode};
+use limewave_core::save::Destination;
 use limewave_core::wav::SampleFormat;
 
 /// Adds a silent 16-bit mono untitled document and returns its index.
@@ -177,4 +178,41 @@ fn the_batch_save_dialog_leaves_untitled_files_out() {
     let chosen = app.ui.save_dialog.chosen(&app.files);
     assert_eq!(chosen, vec![0]);
     assert!(!chosen.contains(&untitled));
+}
+
+#[test]
+fn save_all_stopped_by_a_cancelled_picker_still_reports_earlier_failures() {
+    let dir = tempfile::tempdir().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tone.wav");
+    let bytes = limewave_core::testwav::wav_bytes(
+        &[limewave_core::testwav::sine(440.0, 44100, 2000, 0.5)],
+        44100,
+        SampleFormat::Int { bits: 16 },
+        Vec::new(),
+    );
+    std::fs::write(&path, &bytes).unwrap();
+    // A different file with the same name where the first file remembers saving to: a
+    // save without a dialog refuses to replace it.
+    std::fs::write(elsewhere.path().join("tone.wav"), b"not the same file").unwrap();
+
+    let mut app = LimewaveApp::for_test();
+    app.open_file(path);
+    let s = session(&mut app, 0);
+    s.destination = Some(Destination::Folder(elsewhere.path().to_path_buf()));
+    let e = EditState {
+        loop_mode: LoopMode::Forward,
+        loop_start: 100,
+        loop_end: 800,
+        ..s.edit().clone()
+    };
+    s.apply(e, None);
+    add(&mut app);
+
+    // The test picker cancels.
+    assert!(!app.save_all());
+    let results = app.save_results.as_ref().expect("the failure is shown");
+    assert_eq!(results.len(), 1);
+    assert!(results[0].1.is_err());
+    assert!(session(&mut app, 1).untitled);
 }
