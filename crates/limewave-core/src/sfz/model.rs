@@ -418,11 +418,30 @@ impl Instrument {
         self.regions().iter().filter(|&&r| r < at).count()
     }
 
-    /// Removes a region's header and every token up to the next header.
+    /// Takes a region's header and the tokens after it out of the file. A
+    /// `#define` is file-wide, so it stays where it was.
+    fn take_region(&mut self, h: usize) -> Vec<Token> {
+        let end = self.span_end(h);
+        let mut taken = Vec::new();
+        let mut at = 0;
+        self.file.tokens.retain_mut(|t| {
+            let inside = (h..end).contains(&at);
+            at += 1;
+            if inside && !matches!(t, Token::Define { .. }) {
+                taken.push(t.clone());
+                false
+            } else {
+                true
+            }
+        });
+        taken
+    }
+
+    /// Removes a region's header and the tokens after it up to the next
+    /// header, comments included. `#define`s in that span stay.
     pub fn delete_region(&mut self, region: usize) {
         if let Some(&h) = self.regions().get(region) {
-            let end = self.span_end(h);
-            self.file.tokens.drain(h..end);
+            self.take_region(h);
         }
     }
 
@@ -431,8 +450,7 @@ impl Instrument {
         let (Some(&h), true) = (self.regions().get(region), group < self.groups().len()) else {
             return region;
         };
-        let end = self.span_end(h);
-        let moved: Vec<Token> = self.file.tokens.drain(h..end).collect();
+        let moved = self.take_region(h);
         let at = self.group_end(group);
         self.file.tokens.splice(at..at, moved);
         self.regions().iter().filter(|&&r| r < at).count()
@@ -658,6 +676,41 @@ mod tests {
         assert_eq!(n, 1);
         assert_eq!(samples(&i), ["e.wav", "c.wav", "d.wav", "b.wav"]);
         assert_eq!(i.group_of(1), Some(0));
+        assert_eq!(i.group_of(2), Some(1));
+    }
+
+    #[test]
+    fn delete_keeps_defines_between_regions() {
+        let mut i = inst("<region> sample=a.wav\n#define $X 3\n<region> volume=$X");
+        i.delete_region(0);
+        assert_eq!(i.regions().len(), 1);
+        assert_eq!(i.region_info(0).volume, 3.0);
+        assert_eq!(i.file.tokens.len(), 3);
+    }
+
+    #[test]
+    fn move_keeps_defines_in_place() {
+        let mut i = inst(
+            "<group> <region> sample=a.wav\n#define $X 3\n<region> volume=$X \
+             <group> <region> sample=c.wav",
+        );
+        let n = i.move_region(0, 1);
+        assert_eq!(n, 2);
+        // The define stays before the region that uses it, outside the moved span.
+        assert_eq!(
+            i.file.tokens[..4],
+            [
+                Token::Header(HeaderKind::Group),
+                Token::Define {
+                    name: "$X".into(),
+                    value: "3".into()
+                },
+                Token::Header(HeaderKind::Region),
+                op("volume", "$X"),
+            ]
+        );
+        assert_eq!(i.region_info(0).volume, 3.0);
+        assert_eq!(i.region_info(2).sample.as_deref(), Some("a.wav"));
         assert_eq!(i.group_of(2), Some(1));
     }
 
