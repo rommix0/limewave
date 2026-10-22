@@ -140,6 +140,23 @@ pub fn fmt_with_channels(fmt: &[u8], channels: u16) -> Vec<u8> {
     out
 }
 
+/// A plain 16-byte `fmt ` payload for `fmt`: tag 1 (PCM) or 3 (float), channels, rate, byte
+/// rate, block align and bits per sample.
+pub fn fmt_bytes(fmt: &WavFormat) -> Vec<u8> {
+    let (tag, bits) = match fmt.format {
+        SampleFormat::Int { bits } => (TAG_PCM, bits),
+        SampleFormat::Float { bits } => (TAG_FLOAT, bits),
+    };
+    let mut out = Vec::with_capacity(16);
+    out.extend_from_slice(&tag.to_le_bytes());
+    out.extend_from_slice(&fmt.channels.to_le_bytes());
+    out.extend_from_slice(&fmt.sample_rate.to_le_bytes());
+    out.extend_from_slice(&(fmt.sample_rate * u32::from(fmt.block_align)).to_le_bytes());
+    out.extend_from_slice(&fmt.block_align.to_le_bytes());
+    out.extend_from_slice(&bits.to_le_bytes());
+    out
+}
+
 /// Reads one sample from exactly `bytes_per_sample` bytes of a supported format.
 fn decode_sample(b: &[u8], format: SampleFormat) -> f32 {
     match format {

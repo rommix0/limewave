@@ -1,7 +1,7 @@
 //! Synthetic WAV builders for tests.
 
 use crate::riff::{Chunk, RiffFile, write_riff};
-use crate::wav::{SampleFormat, WavFormat, encode_frames};
+use crate::wav::{SampleFormat, WavFormat, encode_frames, fmt_bytes};
 
 /// A sine wave of `frames` samples at `freq` Hz.
 pub fn sine(freq: f32, rate: u32, frames: usize, amp: f32) -> Vec<f32> {
@@ -18,10 +18,7 @@ pub fn wav_bytes(
     format: SampleFormat,
     extra: Vec<Chunk>,
 ) -> Vec<u8> {
-    let (tag, bits) = match format {
-        SampleFormat::Int { bits } => (1u16, bits),
-        SampleFormat::Float { bits } => (3u16, bits),
-    };
+    let (SampleFormat::Int { bits } | SampleFormat::Float { bits }) = format;
     let n_channels = u16::try_from(channels.len()).expect("too many channels");
     let block_align = n_channels * (bits / 8);
     let fmt = WavFormat {
@@ -30,17 +27,9 @@ pub fn wav_bytes(
         format,
         block_align,
     };
-    let mut fmt_data = Vec::with_capacity(16);
-    fmt_data.extend_from_slice(&tag.to_le_bytes());
-    fmt_data.extend_from_slice(&n_channels.to_le_bytes());
-    fmt_data.extend_from_slice(&rate.to_le_bytes());
-    fmt_data.extend_from_slice(&(rate * u32::from(block_align)).to_le_bytes());
-    fmt_data.extend_from_slice(&block_align.to_le_bytes());
-    fmt_data.extend_from_slice(&bits.to_le_bytes());
-
     let mut chunks = vec![Chunk {
         id: *b"fmt ",
-        data: fmt_data,
+        data: fmt_bytes(&fmt),
     }];
     chunks.extend(extra);
     chunks.push(Chunk {

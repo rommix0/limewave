@@ -29,6 +29,9 @@ pub enum Destination {
     /// Over `doc.path` itself, without a backup. Only for a document that was reopened
     /// from a file this program saved, when it is saved again to the same place.
     ReplaceSaved,
+    /// Exactly this path, whatever the document is called. A different file already there is
+    /// first copied to a numbered `.bak` next to it.
+    File(PathBuf),
 }
 
 /// What a successful save wrote.
@@ -429,7 +432,8 @@ fn write_atomic(target: &Path, source: &Path, bytes: &[u8]) -> Result<(), SaveEr
 /// over the original; a different file it replaces is backed up first.
 /// `OverwriteWithBackup` first backs up the original. A failed backup aborts the save
 /// with [`SaveError::Backup`] before anything is written. `ReplaceSaved` writes over
-/// `doc.path` with no backup. The write itself is atomic.
+/// `doc.path` with no backup. `File` writes exactly that path, backing up a different file
+/// there as `Folder` does. The write itself is atomic.
 pub fn save_wav(
     doc: &WavDocument,
     e: &EditState,
@@ -447,11 +451,15 @@ pub fn save_wav(
                 return Err(SaveError::WouldOverwriteOriginal(target));
             }
             std::fs::create_dir_all(dir)?;
-            let backup = match std::fs::symlink_metadata(&target) {
-                Ok(_) => Some(make_backup(&target)?),
-                Err(_) => None,
-            };
+            let backup = backup_existing(&target)?;
             (target, backup)
+        }
+        Destination::File(target) => {
+            if let Some(dir) = target.parent().filter(|d| !d.as_os_str().is_empty()) {
+                std::fs::create_dir_all(dir)?;
+            }
+            let backup = backup_existing(target)?;
+            (target.clone(), backup)
         }
         Destination::OverwriteWithBackup => {
             let backup = make_backup(&doc.path)?;
@@ -464,6 +472,14 @@ pub fn save_wav(
         written: target,
         backup,
     })
+}
+
+/// A numbered backup of `target` when something is there, else `None`.
+fn backup_existing(target: &Path) -> Result<Option<PathBuf>, SaveError> {
+    match std::fs::symlink_metadata(target) {
+        Ok(_) => make_backup(target).map(Some),
+        Err(_) => Ok(None),
+    }
 }
 
 /// Backup name number `n` for `original`: `<name>.bak` for 0, else `<name>.<n>.bak`.

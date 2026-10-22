@@ -6,9 +6,9 @@ use crate::cue::check_markers;
 use crate::edit::{EditState, LoopMode};
 use crate::error::{LoadError, WavError};
 use crate::meta::{info_get, info_warnings, read_acid, read_inst};
-use crate::riff::{Chunk, RiffFile, find, parse_riff};
-use crate::smpl::{Smpl, smpl_to_tuning};
-use crate::wav::{WavFormat, decode, parse_fmt};
+use crate::riff::{Chunk, RiffFile, find, parse_riff, write_riff};
+use crate::smpl::{Smpl, SmplLoop, sample_period, smpl_to_tuning};
+use crate::wav::{SampleFormat, WavFormat, decode, encode_frames, fmt_bytes, parse_fmt};
 
 /// A WAV file as read from disk. The original chunks are kept in `riff` so that unknown
 /// chunks survive a save.
@@ -100,6 +100,79 @@ fn fallback_tuning(chunks: &[Chunk]) -> Option<(u8, f32)> {
         .or_else(|| body(b"acid").and_then(read_acid).map(|root| (root, 0.0)))
 }
 
+/// A document that exists only in memory (a blank sample or a recording), named `path` but not
+/// yet on disk. `audio` is 1 or 2 channels of equal, non-zero length; callers check that first.
+/// The `smpl` chunk carries `root` and, with `whole_loop`, a forward loop over every frame, so
+/// the document's initial edit has them. Float files also get a `fact` chunk.
+pub fn new_document(
+    path: PathBuf,
+    audio: Vec<Vec<f32>>,
+    rate: u32,
+    format: SampleFormat,
+    root: u8,
+    whole_loop: bool,
+) -> WavDocument {
+    let frames = audio.first().map_or(0, Vec::len);
+    assert!(
+        (1..=2).contains(&audio.len()) && frames > 0 && audio.iter().all(|c| c.len() == frames),
+        "a new document needs 1 or 2 equal, non-empty channels"
+    );
+    let (SampleFormat::Int { bits } | SampleFormat::Float { bits }) = format;
+    let channels = audio.len() as u16;
+    let fmt = WavFormat {
+        channels,
+        sample_rate: rate,
+        format,
+        block_align: channels * (bits / 8),
+    };
+    let frame_count = u32::try_from(frames).unwrap_or(u32::MAX);
+    let smpl = Smpl {
+        manufacturer: 0,
+        product: 0,
+        sample_period: sample_period(rate),
+        unity_note: u32::from(root),
+        pitch_fraction: 0,
+        smpte_format: 0,
+        smpte_offset: 0,
+        loops: if whole_loop {
+            vec![SmplLoop {
+                cue_id: 0,
+                loop_type: 0,
+                start: 0,
+                end: frame_count - 1,
+                fraction: 0,
+                play_count: 0,
+            }]
+        } else {
+            Vec::new()
+        },
+        sampler_data: Vec::new(),
+    };
+    let mut chunks = vec![Chunk {
+        id: *b"fmt ",
+        data: fmt_bytes(&fmt),
+    }];
+    if matches!(format, SampleFormat::Float { .. }) {
+        chunks.push(Chunk {
+            id: *b"fact",
+            data: frame_count.to_le_bytes().to_vec(),
+        });
+    }
+    chunks.push(Chunk {
+        id: *b"smpl",
+        data: smpl.to_bytes(),
+    });
+    chunks.push(Chunk {
+        id: *b"data",
+        data: encode_frames(&audio, &fmt),
+    });
+    let bytes = write_riff(&RiffFile {
+        chunks,
+        warnings: Vec::new(),
+    });
+    load_wav_bytes(path, &bytes).expect("a document built from its own bytes loads")
+}
+
 /// The edit state implied by a file's `smpl` chunk (root note, tuning and the first loop),
 /// plus the warnings raised while converting it. Without a `smpl` chunk, the root and tuning
 /// come from `inst` or `acid` in `chunks`, when present.
@@ -164,6 +237,7 @@ impl WavDocument {
 mod tests {
     use super::*;
     use crate::riff::Chunk;
+    use crate::save::{Destination, save_wav};
     use crate::testwav::{sine, wav_bytes};
     use crate::wav::SampleFormat;
 
@@ -418,5 +492,144 @@ mod tests {
         assert_eq!(doc.path, path);
         let missing = std::env::temp_dir().join("limewave_no_such_file.wav");
         assert!(matches!(load_wav(&missing), Err(LoadError::Io(_))));
+    }
+
+    fn float32() -> SampleFormat {
+        SampleFormat::Float { bits: 32 }
+    }
+
+    fn save_to(doc: &WavDocument, e: &EditState, path: &Path) -> WavDocument {
+        save_wav(doc, e, &Destination::File(path.to_path_buf())).unwrap();
+        load_wav(path).unwrap()
+    }
+
+    #[test]
+    fn new_document_saves_and_reloads_silence() {
+        let dir = tempfile::tempdir().unwrap();
+        for ch in 1..=2usize {
+            for fmt in [
+                SampleFormat::Int { bits: 16 },
+                SampleFormat::Int { bits: 24 },
+                float32(),
+            ] {
+                for rate in [44_100, 48_000] {
+                    let doc = new_document(
+                        "Untitled 1.wav".into(),
+                        vec![vec![0.0; 441]; ch],
+                        rate,
+                        fmt,
+                        60,
+                        false,
+                    );
+                    let path = dir.path().join("a.wav");
+                    let back = save_to(&doc, &doc.initial_edit(), &path);
+                    assert_eq!(back.frames, 441);
+                    assert!(back.audio.iter().flatten().all(|&v| v == 0.0));
+                    assert_eq!(usize::from(back.format.channels), ch);
+                    assert_eq!(back.format.sample_rate, rate);
+                    assert_eq!(back.format.format, fmt);
+                    assert_eq!(back.smpl.as_ref().map(|s| s.unity_note), Some(60));
+                    assert_eq!(back.initial_edit().loop_mode, LoopMode::Off);
+                    let bytes = std::fs::read(&path).unwrap();
+                    assert!(bytes.windows(4).any(|w| w == b"ISFT"));
+                    let fact = find(&back.riff.chunks, b"fact");
+                    if fmt == float32() {
+                        let i = fact.expect("float files carry a fact chunk");
+                        assert_eq!(back.riff.chunks[i].data[..4], 441u32.to_le_bytes());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn new_document_whole_loop_and_root() {
+        let doc = new_document(
+            "Untitled 1.wav".into(),
+            vec![vec![0.0; 100]],
+            44_100,
+            PCM16,
+            69,
+            true,
+        );
+        let check = |e: EditState| {
+            assert_eq!(e.root, 69);
+            assert_eq!(e.loop_mode, LoopMode::Forward);
+            assert_eq!((e.loop_start, e.loop_end), (0, 99));
+        };
+        check(doc.initial_edit());
+        let dir = tempfile::tempdir().unwrap();
+        let back = save_to(&doc, &doc.initial_edit(), &dir.path().join("a.wav"));
+        check(back.initial_edit());
+    }
+
+    #[test]
+    fn a_recorded_take_round_trips_within_precision() {
+        let take = sine(440.0, 48_000, 4800, 0.5);
+        let dir = tempfile::tempdir().unwrap();
+        for (fmt, tol) in [
+            (PCM16, 2.0 / 32768.0),
+            (SampleFormat::Int { bits: 24 }, 2.0 / 8_388_608.0),
+            (float32(), 0.0),
+        ] {
+            let doc = new_document(
+                "Recording 1.wav".into(),
+                vec![take.clone()],
+                48_000,
+                fmt,
+                60,
+                false,
+            );
+            let back = save_to(&doc, &doc.initial_edit(), &dir.path().join("a.wav"));
+            assert_eq!(back.frames, take.len());
+            for (a, b) in back.audio[0].iter().zip(&take) {
+                assert!((a - b).abs() <= tol, "{fmt:?}: {a} vs {b}");
+            }
+        }
+    }
+
+    #[test]
+    fn redrawn_samples_on_a_new_document_are_saved() {
+        let doc = new_document(
+            "Untitled 1.wav".into(),
+            vec![vec![0.0; 100]],
+            44_100,
+            PCM16,
+            60,
+            false,
+        );
+        let e = crate::edit::redraw_samples(&doc.initial_edit(), &doc.audio, 0, 10, &[0.5, -0.5])
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let back = save_to(&doc, &e, &dir.path().join("a.wav"));
+        let tol = 2.0 / 32768.0;
+        for (n, &v) in back.audio[0].iter().enumerate() {
+            let want = match n {
+                10 => 0.5,
+                11 => -0.5,
+                _ => 0.0,
+            };
+            assert!((v - want).abs() <= tol, "sample {n}: {v}");
+        }
+    }
+
+    #[test]
+    fn file_destination_backs_up_a_different_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.wav");
+        std::fs::write(&path, b"junk").unwrap();
+        let doc = new_document(
+            "Untitled 1.wav".into(),
+            vec![vec![0.0; 10]],
+            44_100,
+            PCM16,
+            60,
+            false,
+        );
+        let out = save_wav(&doc, &doc.initial_edit(), &Destination::File(path.clone())).unwrap();
+        assert_eq!(out.written, path);
+        let backup = out.backup.expect("the existing file is backed up");
+        assert_eq!(std::fs::read(backup).unwrap(), b"junk");
+        assert_eq!(load_wav(&path).unwrap().frames, 10);
     }
 }
