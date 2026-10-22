@@ -393,6 +393,13 @@ pub fn resample_map(effects: &[AppliedEffect], f: usize) -> usize {
     })
 }
 
+/// [`resample_map`] for an inclusive end position (End, a loop end, an SFZ `end`): it maps as
+/// the position one past it, so an end on the last frame lands on the new last frame and a
+/// loop keeps its length to within a frame. Saturates, so 0 stays at 0.
+pub fn resample_map_end(effects: &[AppliedEffect], f: usize) -> usize {
+    resample_map(effects, f.saturating_add(1)).saturating_sub(1)
+}
+
 /// Replays `effects` in order on a copy of the original audio.
 pub fn process(original: &[Vec<f32>], effects: &[AppliedEffect]) -> Vec<Vec<f32>> {
     let mut audio = original.to_vec();
@@ -1241,5 +1248,25 @@ mod tests {
         // Other steps are ignored by resample_map.
         assert_eq!(resample_map(&effects, 1000), 500);
         assert_eq!(resample_map(&effects[1..], 1000), 1000);
+    }
+
+    #[test]
+    fn an_end_position_maps_as_the_position_one_past_it() {
+        let half = [AppliedEffect {
+            op: Op::Resample(Arc::new(Resample {
+                from: 1000,
+                to: 500,
+                audio: vec![vec![0.0; 500]],
+            })),
+            first: 0,
+            last: 999,
+        }];
+        // The last frame lands on the new last frame; 100 maps as 101, which is 50.5 -> 51.
+        assert_eq!(resample_map_end(&half, 999), 499);
+        assert_eq!(resample_map_end(&half, 100), 50);
+        assert_eq!(resample_map_end(&half, 0), 0);
+        // No conversion leaves it alone, and the top of the range does not overflow.
+        assert_eq!(resample_map_end(&[], 7), 7);
+        let _ = resample_map_end(&half, usize::MAX);
     }
 }

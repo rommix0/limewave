@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 use super::model::{Instrument, Keycenter, LoopDir, RegionInfo, SfzLoopMode};
 use super::paths::{find_sample, same_file_key, sample_path};
 use super::write::format_number;
-use crate::edit::{EditState, LoopMode};
+use crate::edit::{EditState, LoopMode, resample_markers};
+use crate::effects::{AppliedEffect, Op, resample_map, resample_map_end};
 use crate::notes::{note_name, parse_note};
 
 /// One WAV and the regions that play it.
@@ -186,6 +187,29 @@ fn shift_for_trim(inst: &mut Instrument, region: usize, shift: i64, max: i64) {
     }
 }
 
+/// Scales the sample-relative opcodes a region has, own or inherited, through the conversion
+/// steps `steps`, so they keep pointing at the same audio: `offset` and `loop_start` directly,
+/// `end` and `loop_end` (inclusive last frames) as the position one past them. A scaled
+/// inherited value is written at region level.
+fn scale_for_resample(inst: &mut Instrument, region: usize, steps: &[AppliedEffect]) {
+    for name in ["offset", "end", "loop_start", "loop_end"] {
+        let Some((text, _)) = inst.get(region, name) else {
+            continue;
+        };
+        let Ok(v) = text.trim().parse::<usize>() else {
+            continue;
+        };
+        let new = if matches!(name, "end" | "loop_end") {
+            resample_map_end(steps, v)
+        } else {
+            resample_map(steps, v)
+        };
+        if new != v {
+            put(inst, region, name, new);
+        }
+    }
+}
+
 /// `key` as key opcode text spelt like `existing`, the text the opcode has now: a number when
 /// that is one, a note name when that is one, else a note name when `name_when_new` and a
 /// number otherwise.
@@ -300,8 +324,24 @@ fn write_tuning_and_loop(
 
 /// Writes a sample edit into the instrument (spec 7.2). Trimming moves the
 /// sample-relative opcodes of every region using it; a change to root key,
-/// fine tune or loop sets explicit opcodes on the regions that follow it.
+/// fine tune or loop sets explicit opcodes on the regions that follow it. A conversion
+/// to another rate (a step `after` has and `before` does not) scales every such region's
+/// frame opcodes, followers or not, and writes no tuning.
 pub fn write_back(inst: &mut Instrument, b: &SampleBinding, before: &EditState, after: &EditState) {
+    // `before` is the reference state, whose steps are a prefix of `after`'s.
+    let new_steps = &after.effects[before.effects.len().min(after.effects.len())..];
+    // Scale first, and compare against `before` in the new frames, so a loop the user did
+    // not touch is not written again and the trim below sees only the user's own change.
+    let scaled;
+    let before = if new_steps.iter().any(|a| matches!(a.op, Op::Resample(_))) {
+        for &region in &b.regions {
+            scale_for_resample(inst, region, new_steps);
+        }
+        scaled = resample_markers(before, new_steps);
+        &scaled
+    } else {
+        before
+    };
     // Trim first: the loop points written below are already relative to the
     // new start and must not be shifted again.
     let shift = after.start as i64 - before.start as i64;
@@ -326,6 +366,7 @@ pub fn write_back(inst: &mut Instrument, b: &SampleBinding, before: &EditState, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::edit::resample_edit;
     use crate::sfz::model::Level;
     use crate::sfz::parse::parse;
     use crate::sfz::write::write;
@@ -1101,5 +1142,80 @@ mod tests {
         write_back(&mut i, &all_follow(1), &before, &after);
         assert_eq!(value(&i, 0, "loop_start").as_deref(), Some("70"));
         assert_eq!(value(&i, 0, "loop_end").as_deref(), Some("170"));
+    }
+
+    /// A 44,100 Hz second of silence looped at 4410..=8820, and the same converted to 22,050 Hz.
+    fn halved() -> (EditState, EditState) {
+        let mut before = EditState::default_for(44_100);
+        (before.loop_mode, before.loop_start, before.loop_end) = (LoopMode::Forward, 4410, 8820);
+        let after = resample_edit(&before, &[vec![0.0; 44_100]], 22_050, 44_100, 44_100).unwrap();
+        (before, after)
+    }
+
+    #[test]
+    fn a_converted_sample_scales_every_regions_frame_opcodes() {
+        let mut i = inst(
+            "<region> sample=a.wav offset=441 loop_start=4410 loop_end=8820 \
+             <region> sample=a.wav pitch_keycenter=70 tune=12 loop_start=100 loop_end=200",
+        );
+        let (before, after) = halved();
+        let b = SampleBinding {
+            path: PathBuf::new(),
+            regions: vec![0, 1],
+            follows: vec![true, false],
+        };
+        write_back(&mut i, &b, &before, &after);
+        assert_eq!(value(&i, 0, "offset").as_deref(), Some("221"));
+        assert_eq!(
+            (
+                value(&i, 0, "loop_start").as_deref(),
+                value(&i, 0, "loop_end").as_deref()
+            ),
+            (Some("2205"), Some("4410"))
+        );
+        assert_eq!(
+            (
+                value(&i, 1, "loop_start").as_deref(),
+                value(&i, 1, "loop_end").as_deref()
+            ),
+            (Some("50"), Some("100"))
+        );
+        // Tuning is untouched, and the follower gets no loop or tuning opcode it did not have.
+        assert_eq!(value(&i, 1, "tune").as_deref(), Some("12"));
+        assert_eq!(value(&i, 0, "tune"), None);
+        assert_eq!(value(&i, 0, "loop_mode"), None);
+        assert_eq!(value(&i, 0, "end"), None);
+    }
+
+    #[test]
+    fn a_conversion_and_a_loop_move_write_the_moved_loop_once() {
+        let mut i = inst("<region> sample=a.wav loop_start=4410 loop_end=8820");
+        let (before, mut after) = halved();
+        after.loop_end = 5000; // moved in the new frames
+        write_back(&mut i, &all_follow(1), &before, &after);
+        assert_eq!(value(&i, 0, "loop_start").as_deref(), Some("2205"));
+        assert_eq!(value(&i, 0, "loop_end").as_deref(), Some("5000"));
+    }
+
+    #[test]
+    fn an_inherited_value_is_scaled_and_written_at_region_level() {
+        let mut i = inst(
+            "<group> loop_start=100 <region> sample=a.wav\n\
+             <region> sample=b.wav",
+        );
+        let (before, after) = halved();
+        write_back(&mut i, &all_follow(1), &before, &after);
+        assert_eq!(i.get(0, "loop_start"), Some(("50".into(), Level::Region)));
+        // The group, and a region of another sample, are unchanged.
+        assert_eq!(i.get(1, "loop_start"), Some(("100".into(), Level::Group)));
+    }
+
+    #[test]
+    fn a_conversion_alone_writes_nothing_to_a_follower_with_no_frame_opcodes() {
+        let mut i = inst("<region> sample=a.wav");
+        let (before, after) = halved();
+        let was = write(&i.file);
+        write_back(&mut i, &all_follow(1), &before, &after);
+        assert_eq!(write(&i.file), was);
     }
 }

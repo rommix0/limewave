@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::dsp::resample::{MAX_RATE, MIN_RATE, resample, resampled_len};
 use crate::effects::{
     AppliedEffect, Op, Resample, Splice, SpliceKind, frames_after, output_frames, rate_after,
-    resample_map,
+    resample_map, resample_map_end,
 };
 
 /// How the sample loops on playback.
@@ -325,6 +325,22 @@ pub fn redraw_samples(
     Some(r)
 }
 
+/// `e` with Start, End and the loop points moved through the conversion steps in `steps`:
+/// Start and the loop start directly, End and the loop end as the position one past them (see
+/// [`resample_map`]). At a tiny rate a start and its end can cross; an end never lies before its
+/// start. Nothing else changes.
+pub fn resample_markers(e: &EditState, steps: &[AppliedEffect]) -> EditState {
+    let mut r = e.clone();
+    (r.start, r.end) = (resample_map(steps, e.start), resample_map_end(steps, e.end));
+    (r.loop_start, r.loop_end) = (
+        resample_map(steps, e.loop_start),
+        resample_map_end(steps, e.loop_end),
+    );
+    r.end = r.end.max(r.start);
+    r.loop_end = r.loop_end.max(r.loop_start);
+    r
+}
+
 /// Converts the processed audio to the rate `to`, as one undoable effect step. `file_rate` is
 /// the rate of the file on disk; the rate converted from is [`rate_after`] the steps so far.
 /// The audio is rendered here, from `processed`.
@@ -355,17 +371,7 @@ pub fn resample_edit(
         first: 0,
         last: frames - 1,
     };
-    let scale = |f| resample_map(std::slice::from_ref(&step), f);
-    // An inclusive end marker maps as the position one past it, so an End on the last frame
-    // lands on the new last frame and a loop keeps its length to within a frame. Both steps
-    // saturate: a frame at the top of the range stays there, and position 0 stays at 0.
-    let scale_end = |f: usize| scale(f.saturating_add(1)).saturating_sub(1);
-    let mut r = e.clone();
-    (r.start, r.end) = (scale(e.start), scale_end(e.end));
-    (r.loop_start, r.loop_end) = (scale(e.loop_start), scale_end(e.loop_end));
-    // At a tiny rate a start and its end can cross; an end never lies before its start.
-    r.end = r.end.max(r.start);
-    r.loop_end = r.loop_end.max(r.loop_start);
+    let mut r = resample_markers(e, std::slice::from_ref(&step));
     r.crossfade = resampled_len(e.crossfade, from, to);
     // A loop that the scaling leaves under 2 frames cannot play.
     if r.loop_mode != LoopMode::Off && r.loop_end + 1 - r.loop_start < 2 {
