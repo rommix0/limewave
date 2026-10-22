@@ -397,6 +397,11 @@ impl<T: Clone + PartialEq> History<T> {
         true
     }
 
+    /// The saved entry; `None` once a push dropped it from the history.
+    pub fn saved(&self) -> Option<&T> {
+        self.saved.map(|i| &self.entries[i].0)
+    }
+
     pub fn mark_saved(&mut self) {
         self.saved = Some(self.cursor);
     }
@@ -692,6 +697,20 @@ mod tests {
         assert_eq!(h.cursor(), 1, "an equal push adds nothing");
         h.redo();
         assert_eq!(h.cursor(), 2);
+    }
+
+    #[test]
+    fn saved_is_the_saved_entry_until_a_push_drops_it() {
+        let mut h = History::new(1);
+        assert_eq!(h.saved(), Some(&1));
+        h.push(2);
+        h.mark_saved();
+        h.push(3);
+        assert_eq!(h.saved(), Some(&2));
+        h.undo();
+        h.undo();
+        h.push(4);
+        assert_eq!(h.saved(), None);
     }
 
     #[test]

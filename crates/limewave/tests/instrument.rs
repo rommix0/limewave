@@ -7,7 +7,7 @@ use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
 use limewave::app::{FileEntry, LimewaveApp, PendingAction};
 use limewave::instrument::InstrumentState;
-use limewave::ui::regions::{RegionListAction, unassigned_wavs};
+use limewave::ui::regions::{RegionListAction, unassigned_wavs, unsaved_regions};
 use limewave_core::edit::EditState;
 use limewave_core::riff::Chunk;
 use limewave_core::sfz::Keycenter;
@@ -661,4 +661,92 @@ fn add_unassigned_names_the_wav_relative_to_the_instrument() {
     );
     assert!(st(&h).region_file(1).is_some(), "the new region is bound");
     assert_eq!(st(&h).region_file(1), h.state().selected);
+}
+
+#[test]
+fn rows_with_unsaved_changes_show_a_dot() {
+    let (dir, mut h) = open_text(
+        "<group> <region> sample=a.wav lokey=0 hikey=60\n\
+         <region> sample=b.wav lokey=61 hikey=127\n",
+    );
+    let dots = |h: &Harness<'static, LimewaveApp>| unsaved_regions(st(h), &h.state().files);
+    assert_eq!(dots(&h), [false, false]);
+
+    // A new region is unsaved while the others stay clean; undo takes the dot away.
+    h.state_mut()
+        .region_action(RegionListAction::AddUnassigned(dir.path().join("c.wav")));
+    assert_eq!(dots(&h), [false, false, true]);
+    h.state_mut().undo();
+    assert_eq!(dots(&h), [false, false]);
+
+    // A changed opcode marks that region only, wherever it sits.
+    h.state_mut()
+        .instrument
+        .as_mut()
+        .unwrap()
+        .edit(|i| i.set(1, "volume", "-3"));
+    assert_eq!(dots(&h), [false, true]);
+    // Deleting the region before it moves it up a number, and it is still the changed one.
+    h.state_mut()
+        .region_action(RegionListAction::DeleteRegion(0));
+    assert_eq!(dots(&h), [true]);
+    h.state_mut().undo();
+    h.state_mut().undo();
+    assert_eq!(dots(&h), [false, false]);
+    h.run();
+}
+
+#[test]
+fn saved_state_clears_the_dots_and_untitled_marks_all() {
+    let (dir, mut h) = open_text(
+        "<group> <region> sample=a.wav lokey=0 hikey=60\n\
+         <region> sample=b.wav lokey=61 hikey=127\n",
+    );
+    h.state_mut()
+        .region_action(RegionListAction::AddUnassigned(dir.path().join("c.wav")));
+    let st_mut = h.state_mut().instrument.as_mut().unwrap();
+    st_mut.history.mark_saved();
+    assert_eq!(
+        unsaved_regions(st(&h), &h.state().files),
+        [false, false, false]
+    );
+    // After a push drops the saved entry, everything is unsaved.
+    h.state_mut().undo();
+    h.state_mut()
+        .region_action(RegionListAction::AddUnassigned(dir.path().join("c.wav")));
+    assert!(st(&h).history.saved().is_none());
+    assert_eq!(
+        unsaved_regions(st(&h), &h.state().files),
+        [true, true, true]
+    );
+    // An untitled instrument counts everything too, saved entry or not.
+    h.state_mut()
+        .instrument
+        .as_mut()
+        .unwrap()
+        .history
+        .mark_saved();
+    assert_eq!(
+        unsaved_regions(st(&h), &h.state().files),
+        [false, false, false]
+    );
+    h.state_mut().instrument.as_mut().unwrap().untitled = true;
+    assert_eq!(
+        unsaved_regions(st(&h), &h.state().files),
+        [true, true, true]
+    );
+}
+
+#[test]
+fn unassigned_count_follows_add_and_undo() {
+    let (dir, mut h) = open_text("<group> <region> sample=a.wav\n");
+    h.run();
+    h.get_by_label("Unassigned WAVs (2)");
+    h.state_mut()
+        .region_action(RegionListAction::AddUnassigned(dir.path().join("c.wav")));
+    h.run();
+    h.get_by_label("Unassigned WAVs (1)");
+    h.state_mut().undo();
+    h.run();
+    h.get_by_label("Unassigned WAVs (2)");
 }

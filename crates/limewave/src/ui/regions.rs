@@ -9,7 +9,8 @@ use eframe::egui::{
 };
 use limewave_core::edit::LoopMode;
 use limewave_core::notes::note_name;
-use limewave_core::sfz::model::{Keycenter, RegionInfo, SfzLoopMode};
+use limewave_core::sfz::model::{Instrument, Keycenter, RegionInfo, SfzLoopMode};
+use limewave_core::sfz::parse::Token;
 use limewave_core::sfz::paths::same_file_key;
 
 use crate::app::FileEntry;
@@ -88,6 +89,54 @@ pub fn unassigned_wavs(st: &InstrumentState, files: &[FileEntry]) -> Vec<PathBuf
     found
 }
 
+/// What identifies a region across edits: its group and its own tokens, header included.
+fn region_keys(inst: &Instrument) -> Vec<String> {
+    let tokens = &inst.file.tokens;
+    inst.regions()
+        .into_iter()
+        .enumerate()
+        .map(|(n, h)| {
+            let end = tokens[h + 1..]
+                .iter()
+                .position(|t| matches!(t, Token::Header(_)))
+                .map_or(tokens.len(), |p| h + 1 + p);
+            format!("{:?}{:?}", inst.group_of(n), &tokens[h..end])
+        })
+        .collect()
+}
+
+/// Per region, whether a save would write something for it: its sample is unsaved, or the
+/// region is not as it was in the saved instrument. Regions are compared by content, as their
+/// numbers shift when others are added or removed. Everything counts while the instrument has
+/// never been saved.
+pub fn unsaved_regions(st: &InstrumentState, files: &[FileEntry]) -> Vec<bool> {
+    let count = st.inst().regions().len();
+    let changed: Vec<bool> = match st.history.saved() {
+        Some(saved) if !st.untitled => {
+            if st.history.is_dirty() {
+                let old: HashSet<String> = region_keys(saved).into_iter().collect();
+                region_keys(st.inst())
+                    .iter()
+                    .map(|k| !old.contains(k))
+                    .collect()
+            } else {
+                vec![false; count]
+            }
+        }
+        _ => vec![true; count],
+    };
+    changed
+        .into_iter()
+        .enumerate()
+        .map(|(n, c)| {
+            c || st
+                .region_file(n)
+                .and_then(|i| files.get(i))
+                .is_some_and(FileEntry::is_dirty)
+        })
+        .collect()
+}
+
 /// [`unassigned_wavs`], read from the folders again only when the bound samples or the open
 /// files changed since the instrument's stored list. Returns the list with the key it belongs to.
 pub fn unassigned_cached(st: &InstrumentState, files: &[FileEntry]) -> (Vec<String>, Vec<PathBuf>) {
@@ -156,7 +205,13 @@ fn key_range(lo: u8, hi: u8) -> String {
     }
 }
 
-fn row_data(st: &InstrumentState, files: &[FileEntry], region: usize, info: &RegionInfo) -> Row {
+fn row_data(
+    st: &InstrumentState,
+    files: &[FileEntry],
+    region: usize,
+    info: &RegionInfo,
+    unsaved: bool,
+) -> Row {
     let sample_index = st.binding.region_sample.get(region).copied().flatten();
     let loaded = match st.region_file(region).and_then(|i| files.get(i)) {
         Some(FileEntry::Loaded(s)) => Some(s),
@@ -185,7 +240,7 @@ fn row_data(st: &InstrumentState, files: &[FileEntry], region: usize, info: &Reg
         root,
         range: key_range(info.lokey, info.hikey),
         looped,
-        unsaved: loaded.is_some_and(|s| s.unsaved()),
+        unsaved,
         missing: sample_index.is_none(),
     }
 }
@@ -237,8 +292,14 @@ pub fn region_list(
 
     // Each region's row is worked out once, here.
     let group_of: Vec<Option<usize>> = (0..regions).map(|r| inst.group_of(r)).collect();
+    let unsaved = unsaved_regions(st, files);
     let rows: Vec<(Option<usize>, Row)> = (0..regions)
-        .map(|r| (group_of[r], row_data(st, files, r, &inst.region_info(r))))
+        .map(|r| {
+            (
+                group_of[r],
+                row_data(st, files, r, &inst.region_info(r), unsaved[r]),
+            )
+        })
         .collect();
 
     ScrollArea::vertical()
@@ -317,7 +378,7 @@ fn region_row(ui: &mut Ui, row: &Row, selected: bool, action: &mut Option<Region
             ui.label(RichText::new("\u{27f2}").small().color(colors::LOOP));
         }
         if row.unsaved {
-            ui.label(RichText::new("\u{25cf}").small().color(colors::LOOP));
+            dirty_dot(ui);
         }
         if row.missing {
             ui.label(RichText::new("missing").small().color(colors::END));
