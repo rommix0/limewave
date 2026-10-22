@@ -89,6 +89,8 @@ pub struct Session {
     /// Set by a save that mixed a crossfade into the file (the inspector says so); cleared
     /// by the next edit, undo or redo.
     pub just_saved: bool,
+    /// A new document that exists only in memory: unsaved until a save gives it a file.
+    pub untitled: bool,
     /// What the waveform shows; `None` until the first draw fits the whole file.
     pub view: Option<ViewTransform>,
     /// The edit being dragged, not yet in the history.
@@ -139,6 +141,7 @@ impl Session {
             predicted: None,
             destination: None,
             just_saved: false,
+            untitled: false,
             view: None,
             preview: None,
             last_preview_push: None,
@@ -150,6 +153,12 @@ impl Session {
 
     pub fn edit(&self) -> &EditState {
         self.history.current()
+    }
+
+    /// Whether closing now would lose something: edits since the last save, or a document
+    /// that was never saved.
+    pub fn unsaved(&self) -> bool {
+        self.history.is_dirty() || self.untitled
     }
 
     /// The length of the file after the current edit's effects: what the views show and
@@ -469,7 +478,7 @@ impl FileEntry {
     }
 
     fn is_dirty(&self) -> bool {
-        matches!(self, FileEntry::Loaded(s) if s.history.is_dirty())
+        matches!(self, FileEntry::Loaded(s) if s.unsaved())
     }
 }
 
@@ -589,6 +598,26 @@ const ENVELOPE_KEY: &str = "envelope";
 /// The key "Release plays after loop end" is saved under, as `"1"` or `"0"`.
 const RELEASE_AFTER_LOOP_KEY: &str = "release_after_loop";
 
+/// Which numbered name [`LimewaveApp::next_name`] hands out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NewName {
+    /// "Untitled N.wav", for a new blank sample.
+    Untitled,
+    /// "Recording N.wav", for a recording.
+    Recording,
+}
+
+/// Asks where to save a file called the given name; `None` when the user cancels.
+pub type SavePicker = Box<dyn FnMut(&str) -> Option<PathBuf>>;
+
+/// The system's save-file dialog, offering WAV files.
+fn system_save_picker(name: &str) -> Option<PathBuf> {
+    rfd::FileDialog::new()
+        .add_filter("WAV audio", &["wav", "WAV"])
+        .set_file_name(name)
+        .save_file()
+}
+
 pub struct LimewaveApp {
     pub files: Vec<FileEntry>,
     pub selected: Option<usize>,
@@ -599,6 +628,13 @@ pub struct LimewaveApp {
     pub pending: Option<PendingAction>,
     /// The results of the last save, shown until the user closes them.
     pub save_results: Option<Vec<SaveResult>>,
+    /// Asks where an untitled file goes. Tests replace it.
+    pub save_picker: SavePicker,
+    /// The next numbers for [`NewName::Untitled`] and [`NewName::Recording`]. They never reset.
+    next_untitled: u32,
+    next_recording: u32,
+    /// The window title last sent, so it is sent only when it changes.
+    sent_title: Option<String>,
     /// The selected file's Start frame, read by the MIDI thread for each note-on.
     start_frame: Arc<AtomicUsize>,
     /// The sequence number and note of the last MIDI note-on, written by the MIDI thread (see
@@ -659,7 +695,9 @@ impl LimewaveApp {
 
     /// An app with no audio engine and no MIDI, for tests.
     pub fn for_test() -> Self {
-        Self::build(egui::Context::default(), None, None)
+        let mut app = Self::build(egui::Context::default(), None, None);
+        app.save_picker = Box::new(|_| None);
+        app
     }
 
     pub(crate) fn build(
@@ -676,6 +714,10 @@ impl LimewaveApp {
             ui: UiState::default(),
             pending: None,
             save_results: None,
+            save_picker: Box::new(system_save_picker),
+            next_untitled: 1,
+            next_recording: 1,
+            sent_title: None,
             start_frame: Arc::new(AtomicUsize::new(0)),
             midi_last_note: Arc::new(AtomicU32::new(0)),
             midi: None,
@@ -717,6 +759,58 @@ impl LimewaveApp {
         self.loader = Some(folder::load_in_background(paths, self.ctx.clone()));
     }
 
+    /// The next free "Untitled N.wav" or "Recording N.wav" (no folder).
+    pub fn next_name(&mut self, kind: NewName) -> PathBuf {
+        let (prefix, counter) = match kind {
+            NewName::Untitled => ("Untitled", &mut self.next_untitled),
+            NewName::Recording => ("Recording", &mut self.next_recording),
+        };
+        let name = format!("{prefix} {counter}.wav");
+        *counter += 1;
+        PathBuf::from(name)
+    }
+
+    /// Adds a new in-memory document to the file list and selects it. Any folder still
+    /// loading in the background keeps loading.
+    pub fn add_untitled(&mut self, doc: WavDocument) {
+        let mut session = Session::new(doc);
+        session.untitled = true;
+        self.files.push(FileEntry::Loaded(Box::new(session)));
+        self.single_file = false;
+        self.select(self.files.len() - 1);
+    }
+
+    /// Asks where the untitled file `i` goes and writes it there. On success it becomes an
+    /// ordinary file that saves back to that folder. Returns false when the user cancels or
+    /// the save fails (the results are then shown).
+    pub fn save_untitled(&mut self, i: usize) -> bool {
+        let name = self
+            .files
+            .get(i)
+            .map(FileEntry::file_name)
+            .unwrap_or_default();
+        let Some(path) = (self.save_picker)(&name) else {
+            return false;
+        };
+        let req = SaveRequest {
+            indices: vec![i],
+            destination: Destination::File(path.clone()),
+            trim_after_loop: None,
+        };
+        let results = perform_save(self, req);
+        if results.iter().any(|(_, r)| r.is_err()) {
+            self.save_results = Some(results);
+            return false;
+        }
+        if let Some(FileEntry::Loaded(s)) = self.files.get_mut(i) {
+            s.untitled = false;
+            s.destination = path
+                .parent()
+                .map(|dir| Destination::Folder(dir.to_path_buf()));
+        }
+        true
+    }
+
     /// Runs `action`, or asks first when it would discard unsaved edits.
     pub fn request(&mut self, action: PendingAction) {
         if self.dirty_count() > 0 {
@@ -753,6 +847,10 @@ impl LimewaveApp {
         let Some(FileEntry::Loaded(s)) = self.files.get(i) else {
             return;
         };
+        if s.untitled {
+            self.save_untitled(i);
+            return;
+        }
         match s.destination.clone() {
             Some(destination) => {
                 let results = self.save_without_dialog(i, destination);
@@ -766,7 +864,10 @@ impl LimewaveApp {
 
     /// Save as…: opens the dialog for the selected file.
     pub fn save_as(&mut self) {
-        if let Some(i) = self.selected {
+        let Some(i) = self.selected else { return };
+        if matches!(self.files.get(i), Some(FileEntry::Loaded(s)) if s.untitled) {
+            self.save_untitled(i);
+        } else {
             self.ui
                 .save_dialog
                 .open_for(i, &self.files, !self.single_file);
@@ -774,15 +875,22 @@ impl LimewaveApp {
     }
 
     /// Saves every file with unsaved edits to its remembered destination, or to the default
-    /// folder next to it. Returns true when all of them saved; otherwise the results are
-    /// shown.
+    /// folder next to it; untitled files ask for a file one at a time. Returns true when all
+    /// of them saved; otherwise the results are shown. A cancelled or failed untitled save
+    /// stops the rest.
     pub fn save_all(&mut self) -> bool {
         let mut results = Vec::new();
         for i in 0..self.files.len() {
             let FileEntry::Loaded(s) = &self.files[i] else {
                 continue;
             };
-            if !s.history.is_dirty() {
+            if !s.unsaved() {
+                continue;
+            }
+            if s.untitled {
+                if !self.save_untitled(i) {
+                    return false;
+                }
                 continue;
             }
             let destination = s
@@ -1383,6 +1491,18 @@ impl LimewaveApp {
         }
     }
 
+    /// Puts the selected file's name in the window title, sending it only when it changes.
+    fn update_title(&mut self, ctx: &egui::Context) {
+        let title = match self.selected.and_then(|i| self.files.get(i)) {
+            Some(entry) => format!("{} \u{2013} Limewave", entry.file_name()),
+            None => "Limewave".to_owned(),
+        };
+        if self.sent_title.as_ref() != Some(&title) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.sent_title = Some(title);
+        }
+    }
+
     fn handle_close_request(&mut self, ctx: &egui::Context) {
         let requested = ctx.input(|i| i.viewport().close_requested());
         if requested && !self.allow_close && self.dirty_count() > 0 {
@@ -1468,6 +1588,7 @@ impl LimewaveApp {
         }
         self.handle_close_request(&ctx);
         self.handle_shortcuts(&ctx);
+        self.update_title(&ctx);
         self.clamp_ui_to_file();
         self.sync_audio();
         self.handle_keyboard(&ctx);

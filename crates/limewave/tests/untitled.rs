@@ -1,0 +1,180 @@
+//! Untitled documents: in memory only, unsaved from the moment they exist, saved through a
+//! file picker.
+
+use eframe::egui::vec2;
+use egui_kittest::Harness;
+use limewave::app::{FileEntry, LimewaveApp, NewName, PendingAction, Session};
+use limewave_core::document::new_document;
+use limewave_core::edit::{EditState, LoopMode};
+use limewave_core::wav::SampleFormat;
+
+/// Adds a silent 16-bit mono untitled document and returns its index.
+fn add(app: &mut LimewaveApp) -> usize {
+    let name = app.next_name(NewName::Untitled);
+    app.add_untitled(new_document(
+        name,
+        vec![vec![0.0; 1000]],
+        44_100,
+        SampleFormat::Int { bits: 16 },
+        60,
+        false,
+    ));
+    app.files.len() - 1
+}
+
+fn session(app: &mut LimewaveApp, i: usize) -> &mut Session {
+    match &mut app.files[i] {
+        FileEntry::Loaded(s) => s,
+        _ => panic!("file is not loaded"),
+    }
+}
+
+fn harness(app: LimewaveApp) -> Harness<'static, LimewaveApp> {
+    let mut h = Harness::builder()
+        .with_size(vec2(1280.0, 900.0))
+        .allow_missing_glyphs()
+        .build_ui_state(|ui, app: &mut LimewaveApp| app.show(ui), app);
+    h.run();
+    h
+}
+
+#[test]
+fn untitled_files_count_as_unsaved_from_creation() {
+    let mut app = LimewaveApp::for_test();
+    add(&mut app);
+    assert_eq!(app.dirty_count(), 1);
+    assert_eq!(app.files[0].file_name(), "Untitled 1.wav");
+    assert_eq!(app.selected, Some(0));
+
+    add(&mut app);
+    assert_eq!(app.files[1].file_name(), "Untitled 2.wav");
+    assert_eq!(app.selected, Some(1));
+    assert_eq!(app.dirty_count(), 2);
+
+    let mut h = harness(app);
+    h.run();
+    assert_eq!(h.state().dirty_count(), 2);
+}
+
+#[test]
+fn recordings_have_their_own_counter() {
+    let mut app = LimewaveApp::for_test();
+    assert_eq!(
+        app.next_name(NewName::Recording).to_string_lossy(),
+        "Recording 1.wav"
+    );
+    assert_eq!(
+        app.next_name(NewName::Untitled).to_string_lossy(),
+        "Untitled 1.wav"
+    );
+    assert_eq!(
+        app.next_name(NewName::Recording).to_string_lossy(),
+        "Recording 2.wav"
+    );
+}
+
+#[test]
+fn opening_a_folder_with_an_untitled_file_asks_first() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = LimewaveApp::for_test();
+    add(&mut app);
+    app.request(PendingAction::OpenFolder(dir.path().to_path_buf()));
+    assert!(app.pending.is_some());
+    assert_eq!(app.files.len(), 1);
+}
+
+#[test]
+fn save_all_with_a_cancelled_picker_keeps_the_held_action_waiting() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = LimewaveApp::for_test();
+    add(&mut app);
+    app.request(PendingAction::OpenFolder(dir.path().to_path_buf()));
+    app.resolve_pending_save_all();
+    assert_eq!(app.files.len(), 1, "the held action did not run");
+    assert!(session(&mut app, 0).untitled);
+    assert_eq!(app.dirty_count(), 1);
+}
+
+#[test]
+fn saving_an_untitled_file_makes_it_an_ordinary_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("mine.wav");
+    let mut app = LimewaveApp::for_test();
+    add(&mut app);
+    let picked = target.clone();
+    app.save_picker = Box::new(move |name| {
+        assert_eq!(name, "Untitled 1.wav");
+        Some(picked.clone())
+    });
+    app.save();
+
+    let s = session(&mut app, 0);
+    assert!(!s.untitled);
+    assert!(!s.unsaved());
+    assert!(s.doc.path.ends_with("mine.wav"));
+    assert!(target.exists());
+    assert_eq!(app.dirty_count(), 0);
+    assert!(app.save_results.is_none());
+
+    // An edit and a second save replace the same file without leaving a backup.
+    let s = session(&mut app, 0);
+    let e = EditState {
+        loop_mode: LoopMode::Forward,
+        loop_start: 100,
+        loop_end: 800,
+        ..s.edit().clone()
+    };
+    s.apply(e, None);
+    assert_eq!(app.dirty_count(), 1);
+    app.save_picker = Box::new(|_| panic!("the second save does not ask"));
+    app.save();
+    assert_eq!(app.dirty_count(), 0);
+    assert!(app.save_results.is_none());
+    let names: Vec<String> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, vec!["mine.wav".to_owned()], "no backup file");
+}
+
+#[test]
+fn a_cancelled_picker_leaves_the_file_untitled() {
+    let mut app = LimewaveApp::for_test();
+    add(&mut app);
+    app.save();
+    assert!(session(&mut app, 0).untitled);
+    assert_eq!(app.dirty_count(), 1);
+    assert!(app.save_results.is_none());
+}
+
+#[test]
+fn the_batch_save_dialog_leaves_untitled_files_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tone.wav");
+    let bytes = limewave_core::testwav::wav_bytes(
+        &[limewave_core::testwav::sine(440.0, 44100, 2000, 0.5)],
+        44100,
+        SampleFormat::Int { bits: 16 },
+        Vec::new(),
+    );
+    std::fs::write(&path, bytes).unwrap();
+
+    let mut app = LimewaveApp::for_test();
+    app.open_file(path);
+    let untitled = add(&mut app);
+    let s = session(&mut app, 0);
+    let e = EditState {
+        loop_mode: LoopMode::Forward,
+        loop_start: 100,
+        loop_end: 800,
+        ..s.edit().clone()
+    };
+    s.apply(e, None);
+
+    app.ui.save_dialog.open_for(0, &app.files, true);
+    app.ui.save_dialog.scope_all = true;
+    app.ui.save_dialog.only_changed = false;
+    let chosen = app.ui.save_dialog.chosen(&app.files);
+    assert_eq!(chosen, vec![0]);
+    assert!(!chosen.contains(&untitled));
+}

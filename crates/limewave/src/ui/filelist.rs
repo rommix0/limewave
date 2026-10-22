@@ -54,7 +54,7 @@ fn row(ui: &mut Ui, entry: &FileEntry, selected: bool) -> bool {
             thumbnail(&mut inner, s);
             inner.vertical(|ui| {
                 ui.horizontal(|ui| {
-                    if s.history.is_dirty() {
+                    if s.unsaved() {
                         dirty_dot(ui);
                     }
                     ui.add(egui::Label::new(name).truncate());

@@ -125,7 +125,8 @@ impl SaveDialogState {
             .collect()
     }
 
-    /// The loaded files the table lists: the current one, or all with `scope_all`.
+    /// The loaded files the table lists: the current one, or all with `scope_all`. Untitled
+    /// files are never listed: they need a file name first.
     fn scope<'a>(
         &self,
         files: &'a [FileEntry],
@@ -133,14 +134,14 @@ impl SaveDialogState {
         let all = self.scope_all && self.folder_mode;
         let current = self.current;
         files.iter().enumerate().filter_map(move |(i, f)| match f {
-            FileEntry::Loaded(s) if all || i == current => Some((i, s.as_ref())),
+            FileEntry::Loaded(s) if !s.untitled && (all || i == current) => Some((i, s.as_ref())),
             _ => None,
         })
     }
 
     /// Whether the save box of a file can be ticked.
     fn can_save(&self, s: &Session) -> bool {
-        !self.only_changed || s.history.is_dirty()
+        !self.only_changed || s.unsaved()
     }
 
     /// The files that will be saved.
@@ -339,11 +340,7 @@ fn dialog_body(ui: &mut Ui, st: &mut SaveDialogState, files: &[FileEntry]) {
             for (i, s) in rows {
                 let name = files[i].file_name();
                 let name = ui.label(name);
-                ui.label(if s.history.is_dirty() {
-                    "changed"
-                } else {
-                    "unchanged"
-                });
+                ui.label(if s.unsaved() { "changed" } else { "unchanged" });
                 let enabled = st.can_save(s);
                 let mut ticked = st.selected_files[i] && enabled;
                 let r = ui.add_enabled(enabled, egui::Checkbox::without_text(&mut ticked));
@@ -355,6 +352,12 @@ fn dialog_body(ui: &mut Ui, st: &mut SaveDialogState, files: &[FileEntry]) {
             }
         });
     ui.checkbox(&mut st.only_changed, "Only save files that changed");
+    if files
+        .iter()
+        .any(|f| matches!(f, FileEntry::Loaded(s) if s.untitled))
+    {
+        ui.weak("Untitled files are saved one at a time with Save as…");
+    }
 }
 
 /// The edit a save of `s` writes: its current edit, with End moved to the loop end plus
@@ -412,7 +415,7 @@ fn effective_destination(s: &Session, dest: &Destination) -> Destination {
 /// The rebased session keeps `s.source` when the save moved no frame (Start at 0, same frame
 /// count, and the same channel count as the processed audio), so voices still sounding keep
 /// following the file's edits. Otherwise it gets a new source.
-fn save_session(
+pub(crate) fn save_session(
     s: &mut Session,
     dest: &Destination,
     trim_after_loop: Option<usize>,
@@ -442,6 +445,7 @@ fn save_session(
         }
         Err(err) => {
             s.history.mark_saved();
+            s.untitled = false;
             s.destination = Some(dest.clone());
             Err(format!(
                 "saved to {}, but could not reopen it: {err}",
