@@ -7,12 +7,14 @@ use std::cell::RefCell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, I24, SampleFormat, SizedSample, StreamConfig, U24};
 use limewave_core::edit::LoopMode;
 
-use super::voice::{Adsr, MAX_VOICES, PlayBuffer, Voice};
+use super::voice::{Adsr, InstrumentPlay, PlayBuffer, Voice, velocity_gain};
+
+pub use super::voice::MAX_VOICES;
 
 /// Capacity of each command ring buffer.
 const COMMAND_CAPACITY: usize = 256;
@@ -22,9 +24,13 @@ const SCRATCH_FRAMES: usize = 16_384;
 /// A message from the UI or MIDI thread to the audio callback.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Command {
+    /// Plays `note` from frame `from` of the current buffer. With an instrument set it plays
+    /// every region matching `note` and `velocity` instead, each from its own start
+    /// ([`AudioEngine::set_instrument`]); without one `velocity` is ignored.
     NoteOn {
         note: u8,
         from: usize,
+        velocity: u8,
     },
     NoteOff {
         note: u8,
@@ -150,11 +156,17 @@ impl MixerState {
         }
     }
 
-    fn apply(&mut self, cmd: Command, buf: &PlayBuffer, device_rate: u32) {
+    fn apply(&mut self, cmd: Command, sources: &Sources, device_rate: u32) {
+        let buf = sources.current;
         match cmd {
-            Command::NoteOn { note, from } => {
-                self.note_on(note, from, None, None, buf, device_rate);
-            }
+            Command::NoteOn {
+                note,
+                from,
+                velocity,
+            } => match sources.instrument {
+                Some(instrument) => self.regions_on(note, velocity, instrument, device_rate),
+                None => self.note_on(note, from, None, None, buf, device_rate),
+            },
             Command::PreviewOn {
                 note,
                 from,
@@ -172,30 +184,31 @@ impl MixerState {
                 .flatten()
                 .filter(|v| v.note() == note)
                 .for_each(Voice::release),
+            // A one-shot ignores note-off, so Stop fades it out like a preview.
             Command::AllOff => {
                 for v in self.voices.iter_mut().flatten() {
-                    if v.is_preview() {
+                    if v.is_preview() || v.is_one_shot() {
                         v.fade_out(STEAL_FADE_MS);
                     } else {
                         v.release();
                     }
                 }
             }
+            // Instrument voices keep their region's envelope.
             Command::SetEnvelope(a) => {
                 let a = a.clamped();
                 self.adsr = a;
                 for v in self.voices.iter_mut().flatten() {
-                    v.set_release_ms(a.release_ms);
+                    if !v.is_instrument() {
+                        v.set_release_ms(a.release_ms);
+                    }
                 }
             }
         }
     }
 
-    /// Releases any voice already playing `note` (a preview fades out), then starts a new one in a free slot. With no
-    /// free slot a voice is stolen: the one that was playing `note`, else the oldest releasing
-    /// voice, else the oldest. The stolen voice fades out over [`STEAL_FADE_MS`] in a spare
-    /// slot rather than being cut. `preview` (`Some(hold_loop)`) starts a
-    /// [`Command::PreviewOn`] voice.
+    /// Releases any voice already playing `note` (a preview fades out), then starts a new one.
+    /// `preview` (`Some(hold_loop)`) starts a [`Command::PreviewOn`] voice.
     fn note_on(
         &mut self,
         note: u8,
@@ -205,33 +218,71 @@ impl MixerState {
         buf: &PlayBuffer,
         device_rate: u32,
     ) {
-        let mut existing = None;
-        for (i, slot) in self.voices.iter_mut().enumerate() {
-            if let Some(v) = slot.as_mut().filter(|v| v.note() == note) {
-                // A preview released here would play its whole held release under the new
-                // note, so it fades out instead.
-                if v.is_preview() {
-                    v.fade_out(STEAL_FADE_MS);
-                } else {
-                    v.release();
-                }
-                existing = Some(i);
+        self.release_note(note);
+        let voice = Voice::new(note, from, buf, device_rate, self.adsr, stop_at)
+            .release_past_loop(self.release_past_loop);
+        self.start(match preview {
+            Some(hold_loop) => voice.preview(hold_loop),
+            None => voice,
+        });
+    }
+
+    /// Releases any voice already playing `note`, then starts one voice for every region of
+    /// `instrument` matching `note` and `velocity` (spec §6.1), each from its region's start
+    /// with the region's envelope, playback mode and level.
+    fn regions_on(&mut self, note: u8, velocity: u8, instrument: &InstrumentPlay, rate: u32) {
+        self.release_note(note);
+        for r in instrument
+            .regions
+            .iter()
+            .filter(|r| r.matches(note, velocity))
+        {
+            let b = &r.buffer;
+            let gain = r.gain * velocity_gain(velocity, r.veltrack);
+            let voice = Voice::new(note, b.start, b, rate, r.adsr.clamped(), None)
+                .for_region(gain, r.playback);
+            self.start(voice);
+        }
+    }
+
+    /// Releases every voice playing `note`. A preview released here would play its whole held
+    /// release under the new note, so it fades out instead; a one-shot plays on.
+    fn release_note(&mut self, note: u8) {
+        for v in self
+            .voices
+            .iter_mut()
+            .flatten()
+            .filter(|v| v.note() == note)
+        {
+            if v.is_preview() {
+                v.fade_out(STEAL_FADE_MS);
+            } else {
+                v.release();
             }
         }
+    }
+
+    /// Puts `voice` in a free slot. With none free a voice is stolen: a released one playing
+    /// the same note, else the oldest releasing voice, else the oldest. The stolen voice fades
+    /// out over [`STEAL_FADE_MS`] in a spare slot rather than being cut.
+    fn start(&mut self, voice: Voice) {
         let slot = match self.voices.iter().position(Option::is_none) {
             Some(free) => free,
             None => {
-                let victim = existing.unwrap_or_else(|| self.victim());
+                let note = voice.note();
+                let victim = self
+                    .voices
+                    .iter()
+                    .rposition(|v| {
+                        v.as_ref()
+                            .is_some_and(|v| v.note() == note && v.is_releasing())
+                    })
+                    .unwrap_or_else(|| self.victim());
                 self.retire(victim);
                 victim
             }
         };
-        let voice = Voice::new(note, from, buf, device_rate, self.adsr, stop_at)
-            .release_past_loop(self.release_past_loop);
-        self.voices[slot] = Some(match preview {
-            Some(hold_loop) => voice.preview(hold_loop),
-            None => voice,
-        });
+        self.voices[slot] = Some(voice);
         self.age[slot] = self.counter;
         self.counter += 1;
     }
@@ -272,17 +323,43 @@ impl Default for MixerState {
     }
 }
 
-/// The body of the audio callback: applies pending commands (new notes play `current`), then
-/// fills interleaved `out` (cleared first) with the mixed voices, stolen ones still fading
-/// included, clamped to [-1, 1]. Each
-/// voice plays whichever of `current` and `previous` has its source; a voice whose source is
-/// in neither is dropped. Afterwards the voices' positions are published to `cursors`. Does not
+/// Everything the voices can play: the buffers and instrument maps the callback holds.
+#[derive(Clone, Copy)]
+pub struct Sources<'a> {
+    /// The buffer new notes play when no instrument is set, and play ranges and previews
+    /// always.
+    pub current: &'a PlayBuffer,
+    pub previous: &'a PlayBuffer,
+    /// The instrument new notes play, if one is set.
+    pub instrument: Option<&'a InstrumentPlay>,
+    pub previous_instrument: Option<&'a InstrumentPlay>,
+}
+
+impl<'a> Sources<'a> {
+    /// The buffer whose source is `source`: one of the two buffers, else a region of the
+    /// current then the previous instrument. Does not allocate.
+    fn find(&self, source: u64) -> Option<&'a PlayBuffer> {
+        let regions = [self.instrument, self.previous_instrument]
+            .into_iter()
+            .flatten()
+            .flat_map(|m| &m.regions)
+            .map(|r| &r.buffer);
+        [self.current, self.previous]
+            .into_iter()
+            .chain(regions)
+            .find(|b| b.source == source)
+    }
+}
+
+/// The body of the audio callback: applies pending commands (new notes play the current
+/// instrument, else the current buffer), then fills interleaved `out` (cleared first) with the
+/// mixed voices, stolen ones still fading included, clamped to [-1, 1]. Each voice plays
+/// whichever buffer or instrument region in `sources` has its source; a voice whose source is
+/// in none is dropped. Afterwards the voices' positions are published to `cursors`. Does not
 /// allocate.
-#[allow(clippy::too_many_arguments)]
 pub fn process(
     state: &mut MixerState,
-    current: &PlayBuffer,
-    previous: &PlayBuffer,
+    sources: &Sources,
     cmds: &mut rtrb::Consumer<Command>,
     cursors: &Cursors,
     out: &mut [f32],
@@ -290,15 +367,13 @@ pub fn process(
     device_rate: u32,
 ) {
     while let Ok(cmd) = cmds.pop() {
-        state.apply(cmd, current, device_rate);
+        state.apply(cmd, sources, device_rate);
     }
     out.fill(0.0);
     if channels > 0 {
         for slot in state.voices.iter_mut().chain(&mut state.dying) {
             let Some(v) = slot else { continue };
-            let buf = [current, previous]
-                .into_iter()
-                .find(|b| b.source == v.source());
+            let buf = sources.find(v.source());
             if !buf.is_some_and(|b| v.render_add(b, out, channels, device_rate)) {
                 *slot = None;
             }
@@ -322,6 +397,12 @@ struct Callback {
     /// only that list holds it. So dropping one of these here is never the last reference.
     current: Arc<PlayBuffer>,
     previous: Arc<PlayBuffer>,
+    instrument: Arc<ArcSwapOption<InstrumentPlay>>,
+    /// The instrument last loaded, and the last one with a different source before it, which
+    /// voices released on the previous instrument finish on. Like the buffers, never the last
+    /// reference: `AudioEngine::set_instrument` retires every instrument it swaps out.
+    current_instrument: Option<Arc<InstrumentPlay>>,
+    previous_instrument: Option<Arc<InstrumentPlay>>,
     ui_rx: rtrb::Consumer<Command>,
     midi_rx: rtrb::Consumer<Command>,
     cursors: Arc<Cursors>,
@@ -332,6 +413,7 @@ struct Callback {
 impl Callback {
     fn new(
         buffer: Arc<ArcSwap<PlayBuffer>>,
+        instrument: Arc<ArcSwapOption<InstrumentPlay>>,
         cursors: Arc<Cursors>,
         ui_rx: rtrb::Consumer<Command>,
         midi_rx: rtrb::Consumer<Command>,
@@ -344,6 +426,9 @@ impl Callback {
             previous: Arc::clone(&current),
             current,
             buffer,
+            current_instrument: instrument.load_full(),
+            previous_instrument: None,
+            instrument,
             ui_rx,
             midi_rx,
             cursors,
@@ -366,13 +451,29 @@ impl Callback {
                 self.previous = old;
             }
         }
+        // The same for the instrument; no instrument plays the part of the empty buffer.
+        let loaded = self.instrument.load_full();
+        let source = |m: &Option<Arc<InstrumentPlay>>| m.as_ref().map(|m| m.source);
+        if source(&loaded) == source(&self.current_instrument) {
+            self.current_instrument = loaded;
+        } else {
+            let old = std::mem::replace(&mut self.current_instrument, loaded);
+            if old.is_some() {
+                self.previous_instrument = old;
+            }
+        }
+        let sources = Sources {
+            current: &self.current,
+            previous: &self.previous,
+            instrument: self.current_instrument.as_deref(),
+            previous_instrument: self.previous_instrument.as_deref(),
+        };
         while let Ok(cmd) = self.midi_rx.pop() {
-            self.state.apply(cmd, &self.current, self.device_rate);
+            self.state.apply(cmd, &sources, self.device_rate);
         }
         process(
             &mut self.state,
-            &self.current,
-            &self.previous,
+            &sources,
             &mut self.ui_rx,
             &self.cursors,
             out,
@@ -393,6 +494,9 @@ pub struct AudioEngine {
     /// Buffers swapped out by `set_buffer` that the audio thread may still hold. Each is dropped
     /// here on the UI thread once nothing else holds it, so the audio thread never frees one.
     retired: RefCell<Vec<Arc<PlayBuffer>>>,
+    instrument: Arc<ArcSwapOption<InstrumentPlay>>,
+    /// Instruments swapped out by `set_instrument`, kept like `retired`.
+    retired_instruments: RefCell<Vec<Arc<InstrumentPlay>>>,
     cursors: Arc<Cursors>,
     ui_tx: rtrb::Producer<Command>,
     midi_tx: Option<rtrb::Producer<Command>>,
@@ -417,9 +521,11 @@ impl AudioEngine {
         let buffer = Arc::new(ArcSwap::from_pointee(empty_buffer(device_rate)));
         let (ui_tx, ui_rx) = rtrb::RingBuffer::new(COMMAND_CAPACITY);
         let (midi_tx, midi_rx) = rtrb::RingBuffer::new(COMMAND_CAPACITY);
+        let instrument = Arc::new(ArcSwapOption::empty());
         let cursors = Arc::new(Cursors::new());
         let cb = Callback::new(
             Arc::clone(&buffer),
+            Arc::clone(&instrument),
             Arc::clone(&cursors),
             ui_rx,
             midi_rx,
@@ -453,6 +559,8 @@ impl AudioEngine {
             _stream: Some(stream),
             buffer,
             retired: RefCell::new(Vec::new()),
+            instrument,
+            retired_instruments: RefCell::new(Vec::new()),
             cursors,
             ui_tx,
             midi_tx: Some(midi_tx),
@@ -467,6 +575,16 @@ impl AudioEngine {
         // After `swap`, a reader still holding an old buffer owns a counted reference, so a count
         // of 1 means only this list holds it and dropping it here is the final free.
         retired.retain(|b| Arc::strong_count(b) > 1);
+    }
+
+    /// Publishes the instrument new notes play, or `None` to play the buffer again. Voices
+    /// already sounding finish on the instrument they started on (spec §6).
+    pub fn set_instrument(&self, instrument: Option<InstrumentPlay>) {
+        let old = self.instrument.swap(instrument.map(Arc::new));
+        let mut retired = self.retired_instruments.borrow_mut();
+        retired.extend(old);
+        // As in `set_buffer`: a count of 1 means only this list holds it.
+        retired.retain(|m| Arc::strong_count(m) > 1);
     }
 
     /// The cursors of the voices sounding as of the last audio callback.
@@ -504,9 +622,11 @@ pub(crate) fn headless(device_rate: u32) -> (AudioEngine, HeadlessOutput) {
     let buffer = Arc::new(ArcSwap::from_pointee(empty_buffer(device_rate)));
     let (ui_tx, ui_rx) = rtrb::RingBuffer::new(COMMAND_CAPACITY);
     let (midi_tx, midi_rx) = rtrb::RingBuffer::new(COMMAND_CAPACITY);
+    let instrument = Arc::new(ArcSwapOption::empty());
     let cursors = Arc::new(Cursors::new());
     let cb = Callback::new(
         Arc::clone(&buffer),
+        Arc::clone(&instrument),
         Arc::clone(&cursors),
         ui_rx,
         midi_rx,
@@ -519,6 +639,8 @@ pub(crate) fn headless(device_rate: u32) -> (AudioEngine, HeadlessOutput) {
         _stream: None,
         buffer,
         retired: RefCell::new(Vec::new()),
+        instrument,
+        retired_instruments: RefCell::new(Vec::new()),
         cursors,
         ui_tx,
         midi_tx: Some(midi_tx),
@@ -558,7 +680,7 @@ impl HeadlessOutput {
 
 fn empty_buffer(rate: u32) -> PlayBuffer {
     PlayBuffer {
-        audio: Vec::new(),
+        audio: Arc::default(),
         rate,
         start: 0,
         end: 0,
@@ -619,7 +741,7 @@ fn report_stream_error(e: cpal::Error) {
 
 #[cfg(test)]
 mod tests {
-    use super::super::voice::Adsr;
+    use super::super::voice::{Adsr, Playback, RegionPlay, velocity_gain};
     use super::*;
     use limewave_core::edit::LoopMode;
 
@@ -635,7 +757,7 @@ mod tests {
     /// A looping stereo buffer of constant `value`, so every voice keeps sounding.
     fn constant(source: u64, value: f32) -> PlayBuffer {
         PlayBuffer {
-            audio: vec![vec![value; 4000], vec![value; 4000]],
+            audio: Arc::new(vec![vec![value; 4000], vec![value; 4000]]),
             rate: RATE,
             start: 0,
             end: 3999,
@@ -647,6 +769,9 @@ mod tests {
             source,
         }
     }
+
+    /// Notes 60 up to (not including) this one fill every voice slot.
+    const FULL: u8 = 60 + MAX_VOICES as u8;
 
     fn looping() -> PlayBuffer {
         constant(1, 0.25)
@@ -674,8 +799,18 @@ mod tests {
         frames: usize,
     ) -> Vec<f32> {
         let mut out = vec![0.7; frames * 2];
-        process(state, b, b, rx, cursors, &mut out, 2, RATE);
+        process(state, &plain(b), rx, cursors, &mut out, 2, RATE);
         out
+    }
+
+    /// Only `b` to play, and no instrument.
+    fn plain(b: &PlayBuffer) -> Sources<'_> {
+        Sources {
+            current: b,
+            previous: b,
+            instrument: None,
+            previous_instrument: None,
+        }
     }
 
     /// The left channel of interleaved stereo `out`.
@@ -690,7 +825,15 @@ mod tests {
         let swap = Arc::new(ArcSwap::from_pointee(first));
         let (tx, rx) = rtrb::RingBuffer::new(256);
         let (_, midi_rx) = rtrb::RingBuffer::new(256);
-        let cb = Callback::new(Arc::clone(&swap), Arc::default(), rx, midi_rx, 2, RATE);
+        let cb = Callback::new(
+            Arc::clone(&swap),
+            Arc::default(),
+            Arc::default(),
+            rx,
+            midi_rx,
+            2,
+            RATE,
+        );
         (cb, swap, tx)
     }
 
@@ -711,7 +854,12 @@ mod tests {
         let out = block(&mut state, &b, &mut rx, 64);
         assert!(out.iter().all(|s| *s == 0.0));
 
-        tx.push(Command::NoteOn { note: 60, from: 0 }).unwrap();
+        tx.push(Command::NoteOn {
+            note: 60,
+            from: 0,
+            velocity: 100,
+        })
+        .unwrap();
         let out = block(&mut state, &b, &mut rx, 64);
         assert!(
             out.iter().all(|s| (*s - 0.25).abs() < 1e-6),
@@ -725,15 +873,20 @@ mod tests {
         assert!(out.iter().all(|s| *s == 0.0));
         assert!(active(&state).is_empty());
 
-        // Nine notes: the oldest (60) is stolen and eight remain.
-        for note in 60..69 {
-            tx.push(Command::NoteOn { note, from: 0 }).unwrap();
+        // One note more than there are voices: the oldest (60) is stolen.
+        for note in 60..=FULL {
+            tx.push(Command::NoteOn {
+                note,
+                from: 0,
+                velocity: 100,
+            })
+            .unwrap();
         }
         let out = block(&mut state, &b, &mut rx, 64);
         let mut notes = active(&state);
         notes.sort_unstable();
-        assert_eq!(notes, (61..69).collect::<Vec<u8>>());
-        // Eight voices of 0.25 sum to 2.0; the output is clamped.
+        assert_eq!(notes, (61..=FULL).collect::<Vec<u8>>());
+        // The voices of 0.25 sum to more than 1; the output is clamped.
         assert!(out.iter().all(|s| *s == 1.0));
     }
 
@@ -743,8 +896,18 @@ mod tests {
         let (mut tx, mut rx) = rtrb::RingBuffer::new(256);
         let mut state = MixerState::new();
         // The default envelope: a 2 ms attack and a 30 ms (1440 frame) release.
-        tx.push(Command::NoteOn { note: 60, from: 0 }).unwrap();
-        tx.push(Command::NoteOn { note: 64, from: 0 }).unwrap();
+        tx.push(Command::NoteOn {
+            note: 60,
+            from: 0,
+            velocity: 100,
+        })
+        .unwrap();
+        tx.push(Command::NoteOn {
+            note: 64,
+            from: 0,
+            velocity: 100,
+        })
+        .unwrap();
         let out = block(&mut state, &b, &mut rx, 200);
         assert!(out[0] < 0.1, "the attack starts near silence");
         assert!(
@@ -768,7 +931,12 @@ mod tests {
         let b = looping();
         let (mut tx, mut rx) = rtrb::RingBuffer::new(256);
         let mut state = MixerState::new();
-        tx.push(Command::NoteOn { note: 60, from: 0 }).unwrap();
+        tx.push(Command::NoteOn {
+            note: 60,
+            from: 0,
+            velocity: 100,
+        })
+        .unwrap();
         block(&mut state, &b, &mut rx, 500);
         let quick = Adsr {
             attack_ms: 10.0,
@@ -787,7 +955,12 @@ mod tests {
         block(&mut state, &b, &mut rx, 240);
         assert!(active(&state).is_empty(), "the new 5 ms release applied");
 
-        tx.push(Command::NoteOn { note: 60, from: 0 }).unwrap();
+        tx.push(Command::NoteOn {
+            note: 60,
+            from: 0,
+            velocity: 100,
+        })
+        .unwrap();
         let out = left(&block(&mut state, &b, &mut rx, 600));
         let tol = 0.25 / 480.0 + 1e-6;
         assert!(
@@ -804,30 +977,50 @@ mod tests {
         let (mut tx, mut rx) = rtrb::RingBuffer::new(256);
         let mut state = MixerState::new();
         tx.push(Command::SetEnvelope(FLAT)).unwrap();
-        tx.push(Command::NoteOn { note: 60, from: 0 }).unwrap();
+        tx.push(Command::NoteOn {
+            note: 60,
+            from: 0,
+            velocity: 100,
+        })
+        .unwrap();
         block(&mut state, &b, &mut rx, 64);
         // A free slot exists: the old voice fades while the new one starts.
-        tx.push(Command::NoteOn { note: 60, from: 0 }).unwrap();
+        tx.push(Command::NoteOn {
+            note: 60,
+            from: 0,
+            velocity: 100,
+        })
+        .unwrap();
         block(&mut state, &b, &mut rx, 1);
         assert_eq!(active(&state), [60, 60]);
         block(&mut state, &b, &mut rx, 480);
         assert_eq!(active(&state), [60]);
 
         // All slots busy: retriggering restarts the note in place instead of stealing.
-        for note in 61..68 {
-            tx.push(Command::NoteOn { note, from: 0 }).unwrap();
+        for note in 61..FULL {
+            tx.push(Command::NoteOn {
+                note,
+                from: 0,
+                velocity: 100,
+            })
+            .unwrap();
         }
-        tx.push(Command::NoteOn { note: 61, from: 0 }).unwrap();
+        tx.push(Command::NoteOn {
+            note: 61,
+            from: 0,
+            velocity: 100,
+        })
+        .unwrap();
         block(&mut state, &b, &mut rx, 1);
         let mut notes = active(&state);
         notes.sort_unstable();
-        assert_eq!(notes, (60..68).collect::<Vec<u8>>());
+        assert_eq!(notes, (60..FULL).collect::<Vec<u8>>());
     }
 
     #[test]
     fn a_stolen_voice_fades_out_instead_of_cutting() {
-        // Eight voices of 0.1 stay below the output clamp, so every step shows.
-        let b = constant(1, 0.1);
+        // Every voice at 0.05 stays below the output clamp, so every step shows.
+        let b = constant(1, 0.05);
         let (mut tx, mut rx) = rtrb::RingBuffer::new(256);
         let mut state = MixerState::new();
         // A 5 ms (240 frame) attack, so the new note itself rises slowly too.
@@ -838,15 +1031,25 @@ mod tests {
             release_ms: 1000.0,
         };
         tx.push(Command::SetEnvelope(slow)).unwrap();
-        for note in 60..68 {
-            tx.push(Command::NoteOn { note, from: 0 }).unwrap();
+        for note in 60..FULL {
+            tx.push(Command::NoteOn {
+                note,
+                from: 0,
+                velocity: 100,
+            })
+            .unwrap();
         }
         let mut out = left(&block(&mut state, &b, &mut rx, 400));
-        tx.push(Command::NoteOn { note: 68, from: 0 }).unwrap();
+        tx.push(Command::NoteOn {
+            note: FULL,
+            from: 0,
+            velocity: 100,
+        })
+        .unwrap();
         out.extend(left(&block(&mut state, &b, &mut rx, 600)));
         assert!(
             (out[399] - 0.8).abs() < 1e-5,
-            "eight held voices: {}",
+            "every voice held: {}",
             out[399]
         );
 
@@ -854,10 +1057,10 @@ mod tests {
             .windows(2)
             .map(|w| (w[1] - w[0]).abs())
             .fold(0.0f32, f32::max);
-        assert!(worst <= 2.0 * 0.1 / 240.0 + 1e-6, "a step of {worst}");
+        assert!(worst <= 2.0 * 0.05 / 240.0 + 1e-6, "a step of {worst}");
         let mut notes = active(&state);
         notes.sort_unstable();
-        assert_eq!(notes, (61..69).collect::<Vec<u8>>());
+        assert_eq!(notes, (61..=FULL).collect::<Vec<u8>>());
         assert!((out[999] - 0.8).abs() < 1e-5, "the stolen voice is gone");
     }
 
@@ -871,17 +1074,28 @@ mod tests {
             ..FLAT
         }))
         .unwrap();
-        // 60 is the oldest and still held; 67 is the newest and releasing.
-        for note in 60..68 {
-            tx.push(Command::NoteOn { note, from: 0 }).unwrap();
+        // 60 is the oldest and still held; the newest is releasing.
+        for note in 60..FULL {
+            tx.push(Command::NoteOn {
+                note,
+                from: 0,
+                velocity: 100,
+            })
+            .unwrap();
         }
-        tx.push(Command::NoteOff { note: 67 }).unwrap();
+        tx.push(Command::NoteOff { note: FULL - 1 }).unwrap();
         block(&mut state, &b, &mut rx, 64);
-        tx.push(Command::NoteOn { note: 68, from: 0 }).unwrap();
+        tx.push(Command::NoteOn {
+            note: FULL,
+            from: 0,
+            velocity: 100,
+        })
+        .unwrap();
         block(&mut state, &b, &mut rx, 1);
         let mut notes = active(&state);
         notes.sort_unstable();
-        assert_eq!(notes, [60, 61, 62, 63, 64, 65, 66, 68]);
+        let want: Vec<u8> = (60..FULL - 1).chain([FULL]).collect();
+        assert_eq!(notes, want);
     }
 
     #[test]
@@ -891,7 +1105,12 @@ mod tests {
         let (mut cb, swap, mut tx) = callback(constant(1, 0.25));
         let mut retired = Vec::new();
         tx.push(Command::SetEnvelope(FLAT)).unwrap();
-        tx.push(Command::NoteOn { note: 60, from: 0 }).unwrap();
+        tx.push(Command::NoteOn {
+            note: 60,
+            from: 0,
+            velocity: 100,
+        })
+        .unwrap();
         render(&mut cb, 64);
         tx.push(Command::AllOff).unwrap();
         retired.push(swap.swap(Arc::new(empty_buffer(RATE))));
@@ -931,7 +1150,12 @@ mod tests {
         // Stands in for the UI's `retired` list: it keeps every swapped-out buffer alive.
         let mut retired = vec![swap.swap(Arc::new(constant(1, 0.25)))];
         tx.push(Command::SetEnvelope(FLAT)).unwrap();
-        tx.push(Command::NoteOn { note: 60, from: 0 }).unwrap();
+        tx.push(Command::NoteOn {
+            note: 60,
+            from: 0,
+            velocity: 100,
+        })
+        .unwrap();
         let out = render(&mut cb, 64);
         assert!(out.iter().all(|s| (*s - 0.25).abs() < 1e-6));
 
@@ -949,7 +1173,12 @@ mod tests {
         assert!(active(&cb.state).is_empty());
 
         // A new note plays the new file.
-        tx.push(Command::NoteOn { note: 60, from: 0 }).unwrap();
+        tx.push(Command::NoteOn {
+            note: 60,
+            from: 0,
+            velocity: 100,
+        })
+        .unwrap();
         let out = render(&mut cb, 4);
         assert!(out.iter().all(|s| (*s + 0.5).abs() < 1e-6), "{out:?}");
     }
@@ -959,7 +1188,12 @@ mod tests {
         let (mut cb, swap, mut tx) = callback(constant(1, 0.25));
         let mut retired = Vec::new();
         tx.push(Command::SetEnvelope(FLAT)).unwrap();
-        tx.push(Command::NoteOn { note: 60, from: 0 }).unwrap();
+        tx.push(Command::NoteOn {
+            note: 60,
+            from: 0,
+            velocity: 100,
+        })
+        .unwrap();
         render(&mut cb, 64);
         retired.push(swap.swap(Arc::new(constant(1, 0.75))));
         let out = render(&mut cb, 4);
@@ -970,7 +1204,12 @@ mod tests {
     fn a_voice_from_neither_buffer_is_dropped() {
         let (mut cb, swap, mut tx) = callback(constant(1, 0.25));
         let mut retired = Vec::new();
-        tx.push(Command::NoteOn { note: 60, from: 0 }).unwrap();
+        tx.push(Command::NoteOn {
+            note: 60,
+            from: 0,
+            velocity: 100,
+        })
+        .unwrap();
         render(&mut cb, 200);
         tx.push(Command::AllOff).unwrap();
         retired.push(swap.swap(Arc::new(constant(2, -0.5))));
@@ -991,7 +1230,12 @@ mod tests {
         let (mut tx, mut rx) = rtrb::RingBuffer::new(256);
         let mut state = MixerState::new();
         tx.push(Command::SetEnvelope(FLAT)).unwrap();
-        tx.push(Command::NoteOn { note: 60, from: 0 }).unwrap();
+        tx.push(Command::NoteOn {
+            note: 60,
+            from: 0,
+            velocity: 100,
+        })
+        .unwrap();
         block(&mut state, &b, &mut rx, 64);
         tx.push(Command::NoteOff { note: 60 }).unwrap();
         // As while a slider is dragged: the same envelope arrives every block.
@@ -1012,7 +1256,12 @@ mod tests {
         let (mut cb, swap, mut tx) = callback(empty_buffer(RATE));
         let mut retired = vec![swap.swap(Arc::new(constant(2, 0.25)))];
         tx.push(Command::SetEnvelope(FLAT)).unwrap();
-        tx.push(Command::NoteOn { note: 60, from: 0 }).unwrap();
+        tx.push(Command::NoteOn {
+            note: 60,
+            from: 0,
+            velocity: 100,
+        })
+        .unwrap();
         let mut out = left(&render(&mut cb, 64));
         for source in [3, 4] {
             tx.push(Command::AllOff).unwrap();
@@ -1033,11 +1282,15 @@ mod tests {
         let b = looping();
         let (mut tx, mut rx) = rtrb::RingBuffer::new(256);
         let mut state = MixerState::new();
-        tx.push(Command::NoteOn { note: 60, from: 0 }).unwrap();
+        tx.push(Command::NoteOn {
+            note: 60,
+            from: 0,
+            velocity: 100,
+        })
+        .unwrap();
         process(
             &mut state,
-            &b,
-            &b,
+            &plain(&b),
             &mut rx,
             &Cursors::new(),
             &mut [],
@@ -1054,7 +1307,12 @@ mod tests {
         let cursors = Cursors::new();
         assert!(cursors.read().is_empty());
         tx.push(Command::SetEnvelope(FLAT)).unwrap();
-        tx.push(Command::NoteOn { note: 60, from: 0 }).unwrap();
+        tx.push(Command::NoteOn {
+            note: 60,
+            from: 0,
+            velocity: 100,
+        })
+        .unwrap();
         block_with(&mut state, &b, &mut rx, &cursors, 480);
         let got = cursors.read();
         assert_eq!(got.len(), 1, "{got:?}");
@@ -1069,8 +1327,18 @@ mod tests {
         let mut state = MixerState::new();
         let cursors = Cursors::new();
         tx.push(Command::SetEnvelope(FLAT)).unwrap();
-        tx.push(Command::NoteOn { note: 60, from: 0 }).unwrap();
-        tx.push(Command::NoteOn { note: 64, from: 0 }).unwrap();
+        tx.push(Command::NoteOn {
+            note: 60,
+            from: 0,
+            velocity: 100,
+        })
+        .unwrap();
+        tx.push(Command::NoteOn {
+            note: 64,
+            from: 0,
+            velocity: 100,
+        })
+        .unwrap();
         block_with(&mut state, &b, &mut rx, &cursors, 64);
         assert_eq!(cursors.read().len(), 2);
 
@@ -1096,6 +1364,7 @@ mod tests {
         tx.push(Command::NoteOn {
             note: 60,
             from: 500,
+            velocity: 100,
         })
         .unwrap();
         block_with(&mut state, &b, &mut rx, &cursors, 64);
@@ -1129,7 +1398,7 @@ mod tests {
     /// [`constant`] with 0.75 after the loop end, so a voice that leaves the loop shows it.
     fn with_release_audio() -> PlayBuffer {
         let mut b = constant(1, 0.25);
-        for ch in &mut b.audio {
+        for ch in Arc::make_mut(&mut b.audio) {
             ch[3000..].fill(0.75);
         }
         b
@@ -1147,10 +1416,20 @@ mod tests {
         .unwrap();
         // 72 (an octave up, two frames a frame) starts with the setting off and keeps it; 60
         // starts with it on.
-        tx.push(Command::NoteOn { note: 72, from: 0 }).unwrap();
+        tx.push(Command::NoteOn {
+            note: 72,
+            from: 0,
+            velocity: 100,
+        })
+        .unwrap();
         block(&mut state, &b, &mut rx, 16);
         tx.push(Command::SetReleasePastLoop(true)).unwrap();
-        tx.push(Command::NoteOn { note: 60, from: 0 }).unwrap();
+        tx.push(Command::NoteOn {
+            note: 60,
+            from: 0,
+            velocity: 100,
+        })
+        .unwrap();
         block(&mut state, &b, &mut rx, 16);
         tx.push(Command::NoteOff { note: 72 }).unwrap();
         tx.push(Command::NoteOff { note: 60 }).unwrap();
@@ -1241,7 +1520,12 @@ mod tests {
         .unwrap();
         block(&mut state, &b, &mut rx, 200);
         // As "Play original" does while the preview holds on its loop.
-        tx.push(Command::NoteOn { note: 60, from: 0 }).unwrap();
+        tx.push(Command::NoteOn {
+            note: 60,
+            from: 0,
+            velocity: 100,
+        })
+        .unwrap();
         block(&mut state, &b, &mut rx, 480);
         assert_eq!(active(&state), [60], "the preview is gone within 10 ms");
         // Had it been released, it would reach the release audio (0.75) at frame 800.
@@ -1308,6 +1592,7 @@ mod tests {
         tx.push(Command::NoteOn {
             note: 60,
             from: 1500,
+            velocity: 100,
         })
         .unwrap();
         block_with(&mut state, &b, &mut rx, &cursors, 1600);
@@ -1318,5 +1603,346 @@ mod tests {
             assert!(now < last - 90.0, "{now} should be below {last}");
             last = now;
         }
+    }
+
+    /// A region over `keys` and `vels` playing `buffer` at its own level, with the flat
+    /// envelope and no velocity tracking.
+    fn region(buffer: PlayBuffer, keys: (u8, u8), vels: (u8, u8)) -> RegionPlay {
+        RegionPlay {
+            buffer,
+            lokey: keys.0,
+            hikey: keys.1,
+            lovel: vels.0,
+            hivel: vels.1,
+            gain: 1.0,
+            veltrack: 0.0,
+            playback: Playback::Normal,
+            adsr: FLAT,
+        }
+    }
+
+    fn instrument(source: u64, regions: Vec<RegionPlay>) -> Option<InstrumentPlay> {
+        Some(InstrumentPlay { regions, source })
+    }
+
+    fn note_on(note: u8, velocity: u8) -> Command {
+        Command::NoteOn {
+            note,
+            from: 0,
+            velocity,
+        }
+    }
+
+    fn sorted_sources(out: &HeadlessOutput) -> Vec<u64> {
+        let mut sources = out.voice_sources();
+        sources.sort_unstable();
+        sources
+    }
+
+    #[test]
+    fn a_note_plays_every_matching_region() {
+        let (mut engine, mut out) = headless(RATE);
+        engine.set_instrument(instrument(
+            100,
+            vec![
+                region(constant(11, 0.1), (0, 127), (1, 127)),
+                region(constant(12, 0.2), (0, 127), (1, 127)),
+                region(constant(13, 0.4), (70, 80), (1, 127)),
+            ],
+        ));
+        engine.send(note_on(60, 100));
+        let got = left(&out.render(64));
+        assert!(
+            got.iter().all(|s| (*s - 0.3).abs() < 1e-6),
+            "{:?}",
+            &got[..4]
+        );
+        assert_eq!(sorted_sources(&out), [11, 12]);
+    }
+
+    #[test]
+    fn a_region_voice_starts_at_the_region_start() {
+        let (mut engine, mut out) = headless(RATE);
+        // 0.75 after frame 3000: a voice honouring `from` would read it.
+        let mut b = with_release_audio();
+        b.source = 11;
+        b.start = 500;
+        engine.set_instrument(instrument(100, vec![region(b, (0, 127), (1, 127))]));
+        engine.send(Command::NoteOn {
+            note: 60,
+            from: 3500,
+            velocity: 100,
+        });
+        let got = left(&out.render(100));
+        assert!(
+            got.iter().all(|s| (*s - 0.25).abs() < 1e-6),
+            "{:?}",
+            &got[..4]
+        );
+        let cursors = engine.cursors();
+        assert_eq!(cursors.len(), 1);
+        assert_eq!(cursors[0].frame, 600.0);
+    }
+
+    #[test]
+    fn velocity_selects_layers() {
+        let (mut engine, mut out) = headless(RATE);
+        engine.set_instrument(instrument(
+            100,
+            vec![
+                region(constant(11, 0.1), (0, 127), (1, 63)),
+                region(constant(12, 0.2), (0, 127), (64, 127)),
+            ],
+        ));
+        engine.send(note_on(60, 100));
+        let got = left(&out.render(64));
+        assert!(
+            got.iter().all(|s| (*s - 0.2).abs() < 1e-6),
+            "{:?}",
+            &got[..4]
+        );
+        assert_eq!(out.voice_sources(), [12]);
+        engine.send(note_on(62, 30));
+        out.render(1);
+        assert_eq!(sorted_sources(&out), [11, 12]);
+    }
+
+    #[test]
+    fn velocity_gain_curve() {
+        assert_eq!(velocity_gain(127, 1.0), 1.0);
+        assert!((velocity_gain(64, 1.0) - (64.0f32 / 127.0).powi(2)).abs() < 1e-6);
+        assert_eq!(velocity_gain(10, 0.0), 1.0);
+        // Half way in dB: half the full curve's dB.
+        assert!((velocity_gain(64, 0.5) - 64.0 / 127.0).abs() < 1e-6);
+        assert_eq!(velocity_gain(0, 1.0), 0.0);
+        assert_eq!(velocity_gain(0, 0.5), 0.0);
+        assert_eq!(velocity_gain(0, 0.0), 1.0);
+    }
+
+    #[test]
+    fn velocity_tracking_scales_a_region() {
+        let (mut engine, mut out) = headless(RATE);
+        let mut r = region(constant(11, 0.5), (0, 127), (1, 127));
+        r.veltrack = 1.0;
+        engine.set_instrument(instrument(100, vec![r]));
+        engine.send(note_on(60, 64));
+        let got = left(&out.render(16));
+        let want = 0.5 * (64.0f32 / 127.0).powi(2);
+        assert!(
+            got.iter().all(|s| (*s - want).abs() < 1e-6),
+            "{:?}",
+            &got[..4]
+        );
+    }
+
+    /// The peak of the left channel while `r` plays note 60 for 1000 frames.
+    fn region_peak(r: RegionPlay) -> f32 {
+        let (mut engine, mut out) = headless(RATE);
+        engine.set_instrument(instrument(100, vec![r]));
+        engine.send(note_on(60, 100));
+        left(&out.render(1000))
+            .iter()
+            .fold(0.0f32, |p, s| p.max(s.abs()))
+    }
+
+    #[test]
+    fn region_gain_scales_output() {
+        let full = region_peak(region(constant(11, 0.5), (0, 127), (1, 127)));
+        let mut quiet = region(constant(11, 0.5), (0, 127), (1, 127));
+        // `volume=-6`.
+        quiet.gain = 10f32.powf(-6.0 / 20.0);
+        let ratio = region_peak(quiet) / full;
+        assert!((ratio - 0.5).abs() <= 0.005, "ratio {ratio}");
+    }
+
+    #[test]
+    fn one_shot_ignores_note_off_but_not_all_off() {
+        let (mut engine, mut out) = headless(RATE);
+        let mut r = region(constant(11, 0.25), (0, 127), (1, 127));
+        r.playback = Playback::OneShot;
+        engine.set_instrument(instrument(100, vec![r]));
+        engine.send(note_on(60, 100));
+        out.render(100);
+        engine.send(Command::NoteOff { note: 60 });
+        // Far longer than the 10 ms release.
+        let got = left(&out.render(1000));
+        assert!(
+            got.iter().all(|s| (*s - 0.25).abs() < 1e-6),
+            "still at full level"
+        );
+        assert_eq!(out.voice_sources(), [11]);
+        // Stop fades it out.
+        engine.send(Command::AllOff);
+        let got = left(&out.render(480));
+        assert!(got.windows(2).all(|w| w[1] <= w[0]), "a fade, not a cut");
+        assert!(out.voice_sources().is_empty(), "silenced by Stop");
+        assert!(left(&out.render(16)).iter().all(|s| *s == 0.0));
+    }
+
+    #[test]
+    fn one_shot_plays_through_the_loop_to_end() {
+        let (mut engine, mut out) = headless(RATE);
+        let mut b = with_release_audio();
+        b.source = 11;
+        let mut r = region(b, (0, 127), (1, 127));
+        r.playback = Playback::OneShot;
+        engine.set_instrument(instrument(100, vec![r]));
+        engine.send(note_on(60, 100));
+        // Held throughout: past the loop end at 2999 without wrapping, then it ends at 3999.
+        let got = left(&out.render(4100));
+        assert!(got[..3000].iter().all(|s| (*s - 0.25).abs() < 1e-6));
+        assert!(got[3000..4000].iter().all(|s| (*s - 0.75).abs() < 1e-6));
+        assert!(got[4000..].iter().all(|s| *s == 0.0));
+        assert!(out.voice_sources().is_empty());
+    }
+
+    /// Plays note 60 on a region with `playback`, holds it 16 frames and releases it
+    /// (a 1 s release), with the session's "Release plays after loop end" set to `session`.
+    fn release_region(playback: Playback, session: bool) -> (Vec<f32>, Vec<u64>) {
+        let (mut engine, mut out) = headless(RATE);
+        let mut b = with_release_audio();
+        b.source = 11;
+        let mut r = region(b, (0, 127), (1, 127));
+        r.playback = playback;
+        r.adsr.release_ms = 1000.0;
+        engine.set_instrument(instrument(100, vec![r]));
+        engine.send(Command::SetReleasePastLoop(session));
+        engine.send(note_on(60, 100));
+        out.render(16);
+        engine.send(Command::NoteOff { note: 60 });
+        let got = left(&out.render(4100));
+        (got, out.voice_sources())
+    }
+
+    #[test]
+    fn sustain_region_leaves_loop_on_release() {
+        let (got, voices) = release_region(Playback::Sustain, false);
+        // From frame 16, it reaches 3000 after 2984 frames and End after 3984.
+        assert!(got[2990] > 0.5, "plays past the loop end: {}", got[2990]);
+        assert!(got[4000..].iter().all(|s| *s == 0.0), "ended at End");
+        assert!(voices.is_empty());
+
+        // A Normal region stays in its loop, whatever the session setting.
+        let (got, voices) = release_region(Playback::Normal, true);
+        assert!(got.iter().all(|s| *s < 0.5), "never leaves the loop");
+        assert_eq!(voices, [11], "the 1 s release is still sounding");
+    }
+
+    #[test]
+    fn region_voices_keep_their_own_envelope() {
+        let (mut engine, mut out) = headless(RATE);
+        let mut r = region(constant(11, 0.25), (0, 127), (1, 127));
+        r.adsr.release_ms = 1000.0;
+        engine.set_instrument(instrument(100, vec![r]));
+        engine.send(note_on(60, 100));
+        out.render(16);
+        // The session envelope's 10 ms release does not reach the region's voice.
+        engine.set_envelope(FLAT);
+        engine.send(Command::NoteOff { note: 60 });
+        out.render(1000);
+        assert_eq!(out.voice_sources(), [11]);
+    }
+
+    #[test]
+    fn layers_beyond_voice_count_steal_not_stick() {
+        let (mut engine, mut out) = headless(RATE);
+        engine.set_instrument(instrument(
+            100,
+            vec![
+                region(constant(11, 0.01), (0, 127), (1, 127)),
+                region(constant(12, 0.02), (0, 127), (1, 127)),
+            ],
+        ));
+        for note in 60..72 {
+            engine.send(note_on(note, 100));
+        }
+        out.render(64);
+        let sources = sorted_sources(&out);
+        assert_eq!(sources.len(), MAX_VOICES, "every slot busy");
+        // The newest eight notes kept both layers.
+        assert_eq!(sources.iter().filter(|s| **s == 11).count(), 8);
+        for note in 60..72 {
+            engine.send(Command::NoteOff { note });
+        }
+        // The 10 ms (480 frame) release.
+        out.render(480);
+        assert!(out.voice_sources().is_empty(), "no voice left held");
+        assert!(left(&out.render(64)).iter().all(|s| *s == 0.0));
+    }
+
+    #[test]
+    fn a_released_region_finishes_on_the_previous_map() {
+        let (mut engine, mut out) = headless(RATE);
+        let mut r = region(constant(11, 0.25), (0, 127), (1, 127));
+        r.adsr.release_ms = 1000.0;
+        engine.set_instrument(instrument(100, vec![r]));
+        engine.send(note_on(60, 100));
+        out.render(16);
+        engine.send(Command::NoteOff { note: 60 });
+        // Another instrument, as when a different one is opened.
+        engine.set_instrument(instrument(
+            200,
+            vec![region(constant(21, -0.5), (0, 127), (1, 127))],
+        ));
+        let got = left(&out.render(100));
+        assert!(got.iter().all(|s| *s > 0.2), "A's release sounds on");
+        assert_eq!(out.voice_sources(), [11]);
+        assert_eq!(engine.retired_instruments.borrow().len(), 1, "A is kept");
+        // A third instrument pushes A out of the callback, and its voice with it.
+        engine.set_instrument(instrument(300, Vec::new()));
+        out.render(16);
+        assert!(out.voice_sources().is_empty());
+        // Only the retired list held A then, so the next swap frees it here.
+        engine.set_instrument(None);
+        assert!(
+            engine
+                .retired_instruments
+                .borrow()
+                .iter()
+                .all(|m| m.source != 100)
+        );
+    }
+
+    #[test]
+    fn without_an_instrument_velocity_is_ignored() {
+        let (mut engine, mut out) = headless(RATE);
+        engine.set_buffer(constant(1, 0.25));
+        engine.set_envelope(FLAT);
+        engine.set_instrument(instrument(
+            100,
+            vec![region(constant(11, 0.5), (0, 127), (1, 127))],
+        ));
+        engine.set_instrument(None);
+        engine.send(note_on(60, 1));
+        let got = left(&out.render(64));
+        assert!(
+            got.iter().all(|s| (*s - 0.25).abs() < 1e-6),
+            "{:?}",
+            &got[..4]
+        );
+        assert_eq!(out.voice_sources(), [1]);
+    }
+
+    #[test]
+    fn play_range_and_previews_ignore_the_instrument() {
+        let (mut engine, mut out) = headless(RATE);
+        engine.set_buffer(constant(1, 0.25));
+        engine.set_envelope(FLAT);
+        engine.set_instrument(instrument(
+            100,
+            vec![region(constant(11, 0.5), (0, 127), (1, 127))],
+        ));
+        engine.send(Command::PlayRange {
+            note: 60,
+            from: 0,
+            to: 3000,
+        });
+        engine.send(Command::PreviewOn {
+            note: 62,
+            from: 0,
+            hold_loop: true,
+        });
+        out.render(16);
+        assert_eq!(out.voice_sources(), [1, 1]);
     }
 }

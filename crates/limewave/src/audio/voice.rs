@@ -1,10 +1,13 @@
 //! Audition voice: pitched, interpolated playback of a rendered buffer.
 
+use std::sync::Arc;
+
 use limewave_core::edit::{EditState, LoopMode};
 use limewave_core::render::render;
+use limewave_core::sfz::Ampeg;
 
 /// Maximum simultaneous audition voices.
-pub const MAX_VOICES: usize = 8;
+pub const MAX_VOICES: usize = 16;
 /// Longest attack, decay or release time in milliseconds.
 const MAX_STAGE_MS: f32 = 10_000.0;
 
@@ -73,6 +76,18 @@ impl Adsr {
     }
 }
 
+/// An instrument region's `ampeg_*` values as an [`Adsr`]: seconds to milliseconds and the
+/// sustain percentage to 0…1, clamped.
+pub fn ampeg_to_adsr(a: &Ampeg) -> Adsr {
+    Adsr {
+        attack_ms: a.attack * 1000.0,
+        decay_ms: a.decay * 1000.0,
+        sustain: a.sustain / 100.0,
+        release_ms: a.release * 1000.0,
+    }
+    .clamped()
+}
+
 /// Output frames an envelope stage of `ms` lasts at `rate`.
 fn stage_frames(ms: f32, rate: u32) -> u32 {
     // `as` saturates, so a negative or NaN time is 0 frames.
@@ -82,7 +97,8 @@ fn stage_frames(ms: f32, rate: u32) -> u32 {
 /// A rendered sample (crossfade applied) plus the markers needed to play it.
 #[derive(Clone, Debug)]
 pub struct PlayBuffer {
-    pub audio: Vec<Vec<f32>>,
+    /// Shared, so the regions of an instrument can each hold a cheap copy.
+    pub audio: Arc<Vec<Vec<f32>>>,
     pub rate: u32,
     pub start: usize,
     pub end: usize,
@@ -98,7 +114,7 @@ pub struct PlayBuffer {
 
 pub fn play_buffer(doc_audio: &[Vec<f32>], rate: u32, e: &EditState, source: u64) -> PlayBuffer {
     PlayBuffer {
-        audio: render(doc_audio, e),
+        audio: Arc::new(render(doc_audio, e)),
         rate,
         start: e.start,
         end: e.end,
@@ -109,6 +125,65 @@ pub fn play_buffer(doc_audio: &[Vec<f32>], rate: u32, e: &EditState, source: u64
         cents: e.cents,
         source,
     }
+}
+
+/// How an instrument region's voice ends (spec §6.2).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Playback {
+    /// Released in place: a looped region keeps looping through its release.
+    Normal,
+    /// Ignores the loop and note-off and plays to End.
+    OneShot,
+    /// Loops while held, then leaves the loop on release and plays on to End.
+    Sustain,
+}
+
+/// One region of an instrument, ready to play.
+#[derive(Clone, Debug)]
+pub struct RegionPlay {
+    /// The region's sample with the region's start, end, loop and pitch. Its `source` is the
+    /// region's own and stays the same while the region is edited.
+    pub buffer: PlayBuffer,
+    pub lokey: u8,
+    pub hikey: u8,
+    pub lovel: u8,
+    pub hivel: u8,
+    /// Linear gain, from the region's `volume`.
+    pub gain: f32,
+    /// How much velocity changes the level, 0 to 1 ([`velocity_gain`]).
+    pub veltrack: f32,
+    pub playback: Playback,
+    pub adsr: Adsr,
+}
+
+impl RegionPlay {
+    /// Whether a note-on with `note` and `velocity` plays this region.
+    pub fn matches(&self, note: u8, velocity: u8) -> bool {
+        (self.lokey..=self.hikey).contains(&note) && (self.lovel..=self.hivel).contains(&velocity)
+    }
+}
+
+/// An instrument's regions as the engine plays them. `source` tells one instrument (or a
+/// rebuilt one) from another, as [`PlayBuffer::source`] does for files.
+#[derive(Clone, Debug)]
+pub struct InstrumentPlay {
+    pub regions: Vec<RegionPlay>,
+    pub source: u64,
+}
+
+/// The level a note of `velocity` plays at (spec §6.2): with `veltrack` 1 it is
+/// `(velocity/127)²`, with 0 velocity changes nothing, and in between the curve is mixed
+/// linearly in dB, which makes it `(velocity/127)^(2 × veltrack)`. A NaN `veltrack` counts
+/// as 1.
+pub fn velocity_gain(velocity: u8, veltrack: f32) -> f32 {
+    let track = if veltrack.is_nan() {
+        1.0
+    } else {
+        veltrack.clamp(0.0, 1.0)
+    };
+    let curve = (f32::from(velocity.min(127)) / 127.0).powi(2);
+    // 0 to a positive power is 0 and anything to the power 0 is 1, so no log of 0 is taken.
+    curve.powf(track)
 }
 
 /// Frames of source advanced per output frame for `note`. A sample recorded `cents` flat at
@@ -261,6 +336,12 @@ pub struct Voice {
     hold_release: bool,
     /// The envelope level of the last frame played.
     level: f32,
+    /// Scales every frame: an instrument region's level and velocity, else 1.
+    gain: f32,
+    /// Plays an instrument region: it keeps the region's envelope when the session's changes.
+    instrument: bool,
+    /// Ignores the loop and [`Voice::release`] and plays to End ([`Playback::OneShot`]).
+    one_shot: bool,
 }
 
 impl Voice {
@@ -292,7 +373,27 @@ impl Voice {
             leaving: false,
             hold_release: false,
             level: 0.0,
+            gain: 1.0,
+            instrument: false,
+            one_shot: false,
         }
+    }
+
+    /// Makes this an instrument region's voice (spec §6.2): scaled by `gain` (a non-finite
+    /// gain is silent), keeping its own envelope, and ending as `playback` says. A
+    /// [`Playback::Sustain`] voice leaves the loop when released; a [`Playback::Normal`] one
+    /// stays in it; a [`Playback::OneShot`] voice ignores the loop from the start and plays
+    /// straight through to End, ignoring note-off.
+    pub fn for_region(mut self, gain: f32, playback: Playback) -> Voice {
+        self.gain = if gain.is_finite() { gain.max(0.0) } else { 0.0 };
+        self.instrument = true;
+        self.past_loop = playback == Playback::Sustain;
+        if playback == Playback::OneShot {
+            self.one_shot = true;
+            self.leaving = true;
+            self.forward = true;
+        }
+        self
     }
 
     /// Sets whether a release leaves the loop and plays on to End (v0.3 §7.3).
@@ -320,8 +421,12 @@ impl Voice {
 
     /// Starts the release from the current level; it takes effect on the next `render_add`.
     /// With [`Voice::release_past_loop`] set, the voice also turns forward and stops wrapping,
-    /// so it plays through the loop end and ends at End like a one-shot.
+    /// so it plays through the loop end and ends at End like a one-shot. A one-shot region's
+    /// voice ignores it; only [`Voice::fade_out`] stops one early.
     pub fn release(&mut self) {
+        if self.one_shot {
+            return;
+        }
         if self.stage != Stage::Release {
             self.stage = Stage::Release;
             self.stage_pos = 0;
@@ -365,6 +470,16 @@ impl Voice {
     /// Whether this is a preview voice ([`Voice::preview`]) that has not been faded out.
     pub fn is_preview(&self) -> bool {
         self.hold_release
+    }
+
+    /// Whether this voice plays a [`Playback::OneShot`] region.
+    pub fn is_one_shot(&self) -> bool {
+        self.one_shot
+    }
+
+    /// Whether this voice plays an instrument region ([`Voice::for_region`]).
+    pub fn is_instrument(&self) -> bool {
+        self.instrument
     }
 
     pub fn note(&self) -> u8 {
@@ -430,7 +545,7 @@ impl Voice {
                 self.dead = true;
                 return false;
             }
-            let gain = self.next_level(device_rate);
+            let gain = self.next_level(device_rate) * self.gain;
             let l = region.sample(&region.chans[0], self.pos, self.forward);
             let r = if stereo {
                 region.sample(&region.chans[1], self.pos, self.forward)
@@ -600,7 +715,7 @@ mod tests {
     fn buf(audio: Vec<Vec<f32>>, mode: LoopMode, loop_start: usize, loop_end: usize) -> PlayBuffer {
         let frames = audio.first().map_or(0, Vec::len);
         PlayBuffer {
-            audio,
+            audio: Arc::new(audio),
             rate: RATE,
             start: 0,
             end: frames.saturating_sub(1),
@@ -1130,6 +1245,52 @@ mod tests {
         let (out, alive) = render_frames(&mut v, &b, 241);
         assert!(!alive, "gone after 5 ms");
         assert!(out.windows(2).all(|w| w[1] < w[0]));
+    }
+
+    #[test]
+    fn ampeg_converts_seconds_and_percent() {
+        let a = Ampeg {
+            attack: 0.005,
+            decay: 1.5,
+            sustain: 40.0,
+            release: 0.25,
+        };
+        let got = ampeg_to_adsr(&a);
+        assert!((got.attack_ms - 5.0).abs() < 1e-4, "{got:?}");
+        assert!((got.decay_ms - 1500.0).abs() < 1e-3, "{got:?}");
+        assert!((got.sustain - 0.4).abs() < 1e-6, "{got:?}");
+        assert!((got.release_ms - 250.0).abs() < 1e-3, "{got:?}");
+        // The SFZ defaults: no attack, decay or release, full sustain.
+        let zero = Ampeg {
+            attack: 0.0,
+            decay: 0.0,
+            sustain: 100.0,
+            release: 0.0,
+        };
+        assert_eq!(ampeg_to_adsr(&zero), adsr(0.0, 0.0, 1.0, 0.0));
+        // Out of range values are clamped.
+        let wild = Ampeg {
+            attack: 20.0,
+            decay: -1.0,
+            sustain: 150.0,
+            release: f32::NAN,
+        };
+        assert_eq!(ampeg_to_adsr(&wild), adsr(10_000.0, 0.0, 1.0, 30.0));
+    }
+
+    #[test]
+    fn a_one_shot_region_voice_ignores_release_and_the_loop() {
+        let b = ones_then_twos();
+        let mut v = Voice::new(60, 1500, &b, RATE, FLAT, None).for_region(0.5, Playback::OneShot);
+        render_frames(&mut v, &b, 10);
+        v.release();
+        assert!(!v.is_releasing());
+        // 1510..=1999 at 0.5, then 2000..=2999 at 1.0, then it ends.
+        let (out, alive) = render_frames(&mut v, &b, 1600);
+        assert!(!alive);
+        assert!(out[..490].iter().all(|s| *s == 0.5));
+        assert!(out[490..1490].iter().all(|s| *s == 1.0));
+        assert!(out[1490..].iter().all(|s| *s == 0.0));
     }
 
     #[test]

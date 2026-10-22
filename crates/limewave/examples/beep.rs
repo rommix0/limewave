@@ -1,6 +1,7 @@
 //! Manual check: plays a one-second 440 Hz tone through the default output device.
 
 use std::f32::consts::TAU;
+use std::sync::Arc;
 use std::thread::sleep;
 use std::time::Duration;
 
@@ -20,7 +21,7 @@ fn main() {
     let rate = 48_000;
     let sine = (0..rate).map(|i| 0.3 * (TAU * 440.0 * i as f32 / rate as f32).sin());
     engine.set_buffer(PlayBuffer {
-        audio: vec![sine.collect()],
+        audio: Arc::new(vec![sine.collect()]),
         rate,
         start: 0,
         end: rate as usize - 1,
@@ -31,7 +32,11 @@ fn main() {
         cents: 0.0,
         source: 1,
     });
-    engine.send(Command::NoteOn { note: 60, from: 0 });
+    engine.send(Command::NoteOn {
+        note: 60,
+        from: 0,
+        velocity: 100,
+    });
     sleep(Duration::from_millis(1000));
     engine.send(Command::NoteOff { note: 60 });
     sleep(Duration::from_millis(100));

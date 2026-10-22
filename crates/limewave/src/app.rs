@@ -376,7 +376,7 @@ impl Session {
         let rendered = match engine {
             Some(engine) => {
                 let buffer = play_buffer(&audio, self.doc.format.sample_rate, edit, source);
-                let rendered = buffer.audio.clone();
+                let rendered = Vec::clone(&buffer.audio);
                 engine.set_buffer(buffer);
                 rendered
             }
@@ -516,6 +516,8 @@ pub struct UiState {
     pub midi_learn: Option<u32>,
     /// The audition envelope, shared by every file and remembered between runs.
     pub envelope: Adsr,
+    /// The velocity of notes played from the computer keyboard, the on-screen keys and Play.
+    pub velocity: u8,
     /// "Release plays after loop end" (v0.3 §7.3): released looped notes leave the loop and
     /// play on to End. Off by default and remembered between runs.
     pub release_after_loop: bool,
@@ -555,6 +557,7 @@ impl Default for UiState {
             effect_dialog: None,
             midi_learn: None,
             envelope: Adsr::DEFAULT,
+            velocity: DEFAULT_VELOCITY,
             release_after_loop: false,
             midi_connected: false,
             message: None,
@@ -574,6 +577,9 @@ pub enum PendingAction {
     OpenFile(PathBuf),
     OpenFolder(PathBuf),
 }
+
+/// The velocity of notes from the computer keyboard and the on-screen keys.
+const DEFAULT_VELOCITY: u8 = 100;
 
 /// How long the UI keeps repainting after a note-on while it waits for the voice's cursor.
 const CURSOR_WAIT: Duration = Duration::from_millis(250);
@@ -1161,7 +1167,12 @@ impl LimewaveApp {
     fn note_on(&mut self, note: u8) {
         self.ui.held.insert(note);
         let from = self.start_frame.load(Ordering::Relaxed);
-        self.send(Command::NoteOn { note, from });
+        let velocity = self.ui.velocity;
+        self.send(Command::NoteOn {
+            note,
+            from,
+            velocity,
+        });
     }
 
     fn note_off(&mut self, note: u8) {
@@ -1189,7 +1200,12 @@ impl LimewaveApp {
         ) else {
             return;
         };
-        self.send(Command::NoteOn { note, from });
+        let velocity = self.ui.velocity;
+        self.send(Command::NoteOn {
+            note,
+            from,
+            velocity,
+        });
     }
 
     /// Selects Start...End.

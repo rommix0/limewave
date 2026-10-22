@@ -139,17 +139,18 @@ fn take(slot: &Slot) -> rtrb::Producer<Command> {
         .expect("the MIDI producer is taken once per connection")
 }
 
-/// Maps a raw MIDI message to a command. Note-on with velocity 0 is a note-off; every other
-/// message is ignored.
+/// Maps a raw MIDI message to a command, a note-on keeping its velocity. Note-on with
+/// velocity 0 is a note-off; every other message is ignored.
 fn parse_midi(msg: &[u8], start_frame: &AtomicUsize) -> Option<Command> {
     let &[status, note, velocity, ..] = msg else {
         return None;
     };
-    let note = note & 0x7f;
+    let (note, velocity) = (note & 0x7f, velocity & 0x7f);
     match status & 0xf0 {
         0x90 if velocity > 0 => Some(Command::NoteOn {
             note,
             from: start_frame.load(Ordering::Relaxed),
+            velocity,
         }),
         0x80 | 0x90 => Some(Command::NoteOff { note }),
         _ => None,
@@ -179,7 +180,14 @@ mod tests {
         let start = AtomicUsize::new(7);
         let last = AtomicU32::new(0);
         forward(&slot, &[0x90, 60, 1], &start, &last);
-        assert_eq!(rx.pop(), Ok(Command::NoteOn { note: 60, from: 7 }));
+        assert_eq!(
+            rx.pop(),
+            Ok(Command::NoteOn {
+                note: 60,
+                from: 7,
+                velocity: 1
+            })
+        );
         let mut tx = take(&slot);
         // Once taken, messages are dropped instead of panicking.
         forward(&slot, &[0x80, 60, 0], &start, &last);
@@ -228,7 +236,8 @@ mod tests {
             parse_midi(&[0x93, 60, 100], &start),
             Some(Command::NoteOn {
                 note: 60,
-                from: 1234
+                from: 1234,
+                velocity: 100
             })
         );
         assert_eq!(
@@ -238,6 +247,19 @@ mod tests {
         assert_eq!(
             parse_midi(&[0x8f, 62, 64], &start),
             Some(Command::NoteOff { note: 62 })
+        );
+    }
+
+    #[test]
+    fn midi_velocity_reaches_note_on() {
+        let start = AtomicUsize::new(5);
+        assert_eq!(
+            parse_midi(&[0x90, 60, 77], &start),
+            Some(Command::NoteOn {
+                note: 60,
+                from: 5,
+                velocity: 77
+            })
         );
     }
 
