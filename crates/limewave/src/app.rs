@@ -915,9 +915,13 @@ impl LimewaveApp {
         let Some(mut path) = (self.save_picker)(&name) else {
             return false;
         };
-        // Some pickers return the typed name without the filter's extension.
-        if path.extension().is_none() {
-            path.set_extension("wav");
+        // Some pickers return the typed name without the filter's extension. A name with a dot
+        // ("kick.01") keeps it, with ".wav" added after.
+        let is_wav = path
+            .extension()
+            .is_some_and(|x| x.eq_ignore_ascii_case("wav"));
+        if !is_wav {
+            path.as_mut_os_string().push(".wav");
         }
         let req = SaveRequest {
             indices: vec![i],

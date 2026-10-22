@@ -156,6 +156,29 @@ fn a_picked_name_without_an_extension_gets_wav() {
 }
 
 #[test]
+fn a_picked_name_with_a_dot_but_no_wav_gets_wav_added() {
+    for (picked, saved) in [
+        ("kick.01", "kick.01.wav"),
+        ("pad v1.2", "pad v1.2.wav"),
+        ("Loud.WAV", "Loud.WAV"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = LimewaveApp::for_test();
+        add(&mut app);
+        let path = dir.path().join(picked);
+        app.save_picker = Box::new(move |_| Some(path.clone()));
+        app.save();
+        let s = session(&mut app, 0);
+        assert!(
+            s.doc.path.ends_with(saved),
+            "{picked} saved as {:?}",
+            s.doc.path
+        );
+        assert!(dir.path().join(saved).exists(), "{picked}");
+    }
+}
+
+#[test]
 fn a_cancelled_picker_leaves_the_file_untitled() {
     let mut app = LimewaveApp::for_test();
     add(&mut app);
