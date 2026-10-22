@@ -8,7 +8,7 @@ use super::model::Instrument;
 use super::paths::{is_absolute_text, normalize, same_file_key, sample_path, stays_inside};
 use super::write::write;
 use crate::document::WavDocument;
-use crate::edit::{EditState, LoopMode, resample_markers};
+use crate::edit::{EditState, resample_markers};
 use crate::effects::Op;
 use crate::error::SaveError;
 use crate::save::{
@@ -52,11 +52,7 @@ pub fn smpl_edit_for_save<'a>(
         std::borrow::Cow::Borrowed(edit)
     } else if edit.effects.iter().any(|a| matches!(a.op, Op::Resample(_))) {
         // A converted sample's own loop moves with its audio, since the instrument may not set one.
-        let mut e = resample_markers(&doc.initial_edit(), &edit.effects);
-        if e.loop_mode != LoopMode::Off && e.loop_end + 1 - e.loop_start < 2 {
-            e.loop_mode = LoopMode::Off;
-        }
-        std::borrow::Cow::Owned(e)
+        std::borrow::Cow::Owned(resample_markers(&doc.initial_edit(), &edit.effects))
     } else {
         std::borrow::Cow::Owned(doc.initial_edit())
     }
@@ -435,6 +431,7 @@ pub fn save_instrument(
 mod tests {
     use super::*;
     use crate::document::load_wav;
+    use crate::edit::LoopMode;
     use crate::riff::{Chunk, parse_riff};
     use crate::save::build_wav_bytes;
     use crate::sfz::bind::{bind, region_edit};

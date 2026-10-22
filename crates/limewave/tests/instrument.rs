@@ -13,7 +13,7 @@ use limewave::ui::keyboard::key_rect_in;
 use limewave::ui::keymap::box_rect;
 use limewave::ui::region_inspector::RegionEdit;
 use limewave::ui::regions::{RegionListAction, unassigned_wavs, unsaved_regions};
-use limewave_core::edit::{EditState, LoopMode};
+use limewave_core::edit::{EditState, LoopMode, resample_edit};
 use limewave_core::riff::Chunk;
 use limewave_core::sfz::{Keycenter, Level};
 use limewave_core::smpl::Smpl;
@@ -1837,4 +1837,69 @@ fn a_region_keeping_its_own_loop_says_so_above_the_waveform() {
     h.run();
     h.get_by_label(note);
     assert_eq!(st(&h).selected_region, Some(1), "editing is not blocked");
+}
+
+/// Converts the sample of region 0 (`a.wav`, 4410 frames at 44,100 Hz) to 22,050 Hz the way the
+/// rate dialog does, without saving the instrument.
+fn convert_a_to_22050(h: &mut Harness<'static, LimewaveApp>) {
+    h.state_mut().select_region(0);
+    let file = st(h).region_file(0).expect("region 0 has a sample");
+    let e = {
+        let FileEntry::Loaded(s) = &h.state().files[file] else {
+            panic!("the sample is not loaded");
+        };
+        resample_edit(
+            s.edit(),
+            &s.processed,
+            22_050,
+            s.doc.format.sample_rate,
+            s.doc.frames,
+        )
+        .expect("the sample converts")
+    };
+    h.state_mut().apply_rate_edit(e);
+    h.run();
+}
+
+#[test]
+fn a_converted_sample_plays_from_the_scaled_offset_to_the_scaled_end() {
+    let (_dir, mut h) = open_text(
+        "<region> sample=a.wav offset=1000 end=4000 lokey=0 hikey=60\n\
+         <region> sample=a.wav lokey=61\n",
+    );
+    convert_a_to_22050(&mut h);
+    let map = play_map(st(&h), &h.state().files);
+    let (cut, whole) = (&map.regions[0].buffer, &map.regions[1].buffer);
+    assert_eq!(cut.rate, 22_050);
+    assert_eq!(cut.audio[0].len(), 2205);
+    // `offset` is a start, `end` an inclusive last frame (R3): 1000 -> 500, 4000 -> 2000.
+    assert_eq!((cut.start, cut.end), (500, 2000));
+    assert_eq!(
+        (whole.start, whole.end),
+        (0, 2204),
+        "no opcodes: the whole sample"
+    );
+}
+
+#[test]
+fn a_converted_samples_non_follower_keeps_its_own_loop_on_the_same_audio() {
+    let (_dir, mut h) = open_text(
+        "<region> sample=a.wav pitch_keycenter=60 lokey=0 hikey=60\n\
+         <region> sample=a.wav pitch_keycenter=72 loop_mode=loop_continuous \
+         loop_start=400 loop_end=2000 lokey=61\n",
+    );
+    assert_eq!(st(&h).binding.samples[0].follows, [true, false]);
+    convert_a_to_22050(&mut h);
+    let map = play_map(st(&h), &h.state().files);
+    let own = &map.regions[1].buffer;
+    // 400 -> 200 as a start, 2000 -> 1000 as an inclusive end.
+    assert_eq!(
+        (own.loop_mode, own.loop_start, own.loop_end),
+        (LoopMode::Forward, 200, 1000)
+    );
+    assert_eq!(
+        own.root, 72,
+        "the tuning is the region's own and does not change"
+    );
+    assert!(st(&h).region_loops(&h.state().files, 1));
 }

@@ -328,7 +328,8 @@ pub fn redraw_samples(
 /// `e` with Start, End and the loop points moved through the conversion steps in `steps`:
 /// Start and the loop start directly, End and the loop end as the position one past them (see
 /// [`resample_map`]). At a tiny rate a start and its end can cross; an end never lies before its
-/// start. Nothing else changes.
+/// start, and a loop that the scaling leaves under 2 frames cannot play, so it is turned off.
+/// Nothing else changes.
 pub fn resample_markers(e: &EditState, steps: &[AppliedEffect]) -> EditState {
     let mut r = e.clone();
     (r.start, r.end) = (resample_map(steps, e.start), resample_map_end(steps, e.end));
@@ -338,6 +339,9 @@ pub fn resample_markers(e: &EditState, steps: &[AppliedEffect]) -> EditState {
     );
     r.end = r.end.max(r.start);
     r.loop_end = r.loop_end.max(r.loop_start);
+    if r.loop_mode != LoopMode::Off && r.loop_end + 1 - r.loop_start < 2 {
+        r.loop_mode = LoopMode::Off;
+    }
     r
 }
 
@@ -373,10 +377,6 @@ pub fn resample_edit(
     };
     let mut r = resample_markers(e, std::slice::from_ref(&step));
     r.crossfade = resampled_len(e.crossfade, from, to);
-    // A loop that the scaling leaves under 2 frames cannot play.
-    if r.loop_mode != LoopMode::Off && r.loop_end + 1 - r.loop_start < 2 {
-        r.loop_mode = LoopMode::Off;
-    }
     r.effects.push(step);
     Some(r.clamped(original_frames))
 }
