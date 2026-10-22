@@ -8,6 +8,7 @@ use super::model::{Instrument, Keycenter, LoopDir, SfzLoopMode};
 use super::paths::{find_sample, same_file_key, sample_path};
 use super::write::format_number;
 use crate::edit::{EditState, LoopMode};
+use crate::notes::{note_name, parse_note};
 
 /// One WAV and the regions that play it.
 #[derive(Clone, PartialEq, Debug)]
@@ -66,7 +67,8 @@ pub fn bind(inst: &Instrument, sfz_dir: &Path) -> Binding {
 }
 
 /// The sample state a region asks for (spec 4.2): root key, fine tune, loop
-/// points, direction and on/off come from the region's opcodes over `wav`'s;
+/// points, direction and on/off come from the region's opcodes over `wav`'s
+/// (the direction is forward unless `loop_type` says otherwise, spec 3.4);
 /// everything else is `wav`'s.
 pub fn region_edit(inst: &Instrument, region: usize, wav: &EditState) -> EditState {
     let info = inst.region_info(region);
@@ -90,16 +92,11 @@ pub fn region_edit(inst: &Instrument, region: usize, wav: &EditState) -> EditSta
         Some(SfzLoopMode::Continuous | SfzLoopMode::Sustain) => true,
         None => wav_loops || info.loop_start.is_some() || info.loop_end.is_some(),
     };
-    let dir = if inst.get(region, "loop_type").is_some() {
-        match info.loop_dir {
-            LoopDir::Forward => LoopMode::Forward,
-            LoopDir::Backward => LoopMode::Backward,
-            LoopDir::Alternate => LoopMode::PingPong,
-        }
-    } else if wav_loops {
-        wav.loop_mode
-    } else {
-        LoopMode::Forward
+    // Without `loop_type` a sampler loops forward, whatever the WAV says.
+    let dir = match info.loop_dir {
+        LoopDir::Forward => LoopMode::Forward,
+        LoopDir::Backward => LoopMode::Backward,
+        LoopDir::Alternate => LoopMode::PingPong,
     };
     let ls = info.loop_start.unwrap_or(wav.loop_start).min(wav.end);
     let le = info.loop_end.unwrap_or(wav.loop_end).min(wav.end);
@@ -159,8 +156,25 @@ fn shift_for_trim(inst: &mut Instrument, region: usize, shift: i64, max: i64) {
     }
 }
 
-/// Writes root key, fine tune and loop onto a region that follows its sample.
-/// A value is written only when it differs from what the region has now.
+/// `key` as key opcode text spelt like `existing`, the text the opcode has now: a number when
+/// that is one, a note name when that is one, else a note name when `name_when_new` and a
+/// number otherwise.
+pub fn key_text(existing: Option<&str>, key: u8, name_when_new: bool) -> String {
+    let name = match existing.map(str::trim) {
+        Some(t) if t.starts_with(|c: char| c.is_ascii_digit()) => false,
+        Some(t) if parse_note(t).is_some() => true,
+        _ => name_when_new,
+    };
+    if name {
+        note_name(key)
+    } else {
+        key.to_string()
+    }
+}
+
+/// Writes root key, fine tune and loop onto a region that follows its sample:
+/// the tuning opcodes only when the tuning changed, the loop opcodes only when
+/// the loop did, and each only when it differs from what the region has now.
 fn write_tuning_and_loop(
     inst: &mut Instrument,
     region: usize,
@@ -168,20 +182,30 @@ fn write_tuning_and_loop(
     after: &EditState,
 ) {
     let info = inst.region_info(region);
-    let current_root = match info.keycenter {
-        Keycenter::Note(n) => n,
-        // `sample` resolved to the WAV's own root when the edit began.
-        Keycenter::Sample => before.root,
-    };
-    if after.root != current_root {
-        put(inst, region, "pitch_keycenter", after.root);
-    }
-    let tune = format_number(-f64::from(after.cents));
-    if format_number(f64::from(info.tune)) != tune {
-        put(inst, region, "tune", tune);
+    if (before.root, before.cents) != (after.root, after.cents) {
+        let current_root = match info.keycenter {
+            Keycenter::Note(n) => n,
+            // `sample` resolved to the WAV's own root when the edit began.
+            Keycenter::Sample => before.root,
+        };
+        if after.root != current_root {
+            let existing = inst.get(region, "pitch_keycenter").map(|(text, _)| text);
+            let text = key_text(existing.as_deref(), after.root, false);
+            put(inst, region, "pitch_keycenter", text);
+        }
+        let tune = format_number(-f64::from(after.cents));
+        if format_number(f64::from(info.tune)) != tune {
+            put(inst, region, "tune", tune);
+        }
     }
 
+    let loop_changed = (before.loop_mode, before.loop_start, before.loop_end)
+        != (after.loop_mode, after.loop_start, after.loop_end);
+    if !loop_changed {
+        return;
+    }
     if after.loop_mode == LoopMode::Off {
+        // The loop is gone, so a region looping on it stops; `one_shot` stays.
         let stop = match info.loop_mode {
             Some(SfzLoopMode::NoLoop | SfzLoopMode::OneShot) => false,
             Some(SfzLoopMode::Continuous | SfzLoopMode::Sustain) => true,
@@ -193,10 +217,9 @@ fn write_tuning_and_loop(
         }
         return;
     }
-    if !matches!(
-        info.loop_mode,
-        Some(SfzLoopMode::Continuous | SfzLoopMode::Sustain)
-    ) {
+    // A region that played without a loop now loops; `one_shot` and the looping
+    // modes are the region's own choice and stay.
+    if matches!(info.loop_mode, None | Some(SfzLoopMode::NoLoop)) {
         put(inst, region, "loop_mode", "loop_continuous");
     }
     let start = after.loop_start.saturating_sub(after.start);
@@ -212,8 +235,7 @@ fn write_tuning_and_loop(
         LoopMode::PingPong => (LoopDir::Alternate, "alternate"),
         _ => (LoopDir::Forward, "forward"),
     };
-    // Against `before` too: a WAV looping backward and switched to forward
-    // must say so, as the WAV's own `smpl` may not be rewritten.
+    // Against `before` too: a direction read on opening and changed must say so.
     let before_dir = match before.loop_mode {
         LoopMode::Backward => LoopDir::Backward,
         LoopMode::PingPong => LoopDir::Alternate,
@@ -413,15 +435,15 @@ mod tests {
             (e.loop_mode, e.loop_start, e.loop_end),
             (LoopMode::PingPong, 100, 200)
         );
-        // No opcode sets the direction: the WAV's holds.
+        // No opcode sets the direction: forward, the SFZ default, whatever the WAV says.
         let w = looped(LoopMode::PingPong, 100, 200);
         let e = region_edit(&inst("<region> loop_mode=loop_sustain"), 0, &w);
-        assert_eq!(e.loop_mode, LoopMode::PingPong);
-        // Nothing says anything about looping: the WAV's loop is used.
+        assert_eq!(e.loop_mode, LoopMode::Forward);
+        // Nothing says anything about looping: the WAV's loop points are used.
         let e = region_edit(&inst("<region> sample=a.wav"), 0, &w);
         assert_eq!(
             (e.loop_mode, e.loop_start, e.loop_end),
-            (LoopMode::PingPong, 100, 200)
+            (LoopMode::Forward, 100, 200)
         );
         // A WAV without a loop, but loop points in the instrument: loops forward.
         let e = region_edit(&inst("<region> loop_start=10 loop_end=20"), 0, &wav());
@@ -701,18 +723,34 @@ mod tests {
     }
 
     #[test]
-    fn switching_a_wavs_backward_loop_to_forward_writes_loop_type() {
+    fn a_wavs_backward_loop_opens_forward_and_a_change_writes_loop_type() {
         let w = looped(LoopMode::Backward, 100, 200);
         let mut i = inst("<region> sample=a.wav");
         let before = region_edit(&i, 0, &w);
-        assert_eq!(before.loop_mode, LoopMode::Backward);
+        assert_eq!(before.loop_mode, LoopMode::Forward);
+        // Moving the points keeps forward, which needs no `loop_type`.
+        let moved = EditState {
+            loop_start: 110,
+            ..before.clone()
+        };
+        write_back(&mut i, &all_follow(1), &before, &moved);
+        assert_eq!(value(&i, 0, "loop_type"), None);
+        let after = EditState {
+            loop_mode: LoopMode::Backward,
+            ..moved.clone()
+        };
+        write_back(&mut i, &all_follow(1), &moved, &after);
+        assert_eq!(value(&i, 0, "loop_type").as_deref(), Some("backward"));
+        assert_eq!(region_edit(&i, 0, &w).loop_mode, LoopMode::Backward);
+        // And back to forward is written, as the direction read on opening was backward.
+        let mut j = inst("<region> sample=a.wav loop_type=backward");
+        let before = region_edit(&j, 0, &w);
         let after = EditState {
             loop_mode: LoopMode::Forward,
             ..before.clone()
         };
-        write_back(&mut i, &all_follow(1), &before, &after);
-        assert_eq!(value(&i, 0, "loop_type").as_deref(), Some("forward"));
-        assert_eq!(region_edit(&i, 0, &w).loop_mode, LoopMode::Forward);
+        write_back(&mut j, &all_follow(1), &before, &after);
+        assert_eq!(value(&j, 0, "loop_type").as_deref(), Some("forward"));
     }
 
     #[test]
@@ -726,6 +764,87 @@ mod tests {
         write_back(&mut i, &all_follow(1), &before, &after);
         assert_eq!(value(&i, 0, "loop_end").as_deref(), Some("499"));
         assert_eq!(value(&i, 0, "offset").as_deref(), Some("10"));
+    }
+
+    #[test]
+    fn sample_edits_never_rewrite_one_shot() {
+        let mut i = inst(
+            "<region> sample=a.wav pitch_keycenter=60 loop_mode=one_shot\n\
+             <region> sample=a.wav pitch_keycenter=60 loop_mode=no_loop\n\
+             <region> sample=a.wav pitch_keycenter=60 loop_mode=loop_sustain",
+        );
+        let w = wav();
+        let before = region_edit(&i, 0, &w);
+        let after = EditState {
+            root: 62,
+            loop_mode: LoopMode::Forward,
+            loop_start: 100,
+            loop_end: 300,
+            ..before.clone()
+        };
+        write_back(&mut i, &all_follow(3), &before, &after);
+        assert_eq!(value(&i, 0, "loop_mode").as_deref(), Some("one_shot"));
+        assert_eq!(value(&i, 0, "pitch_keycenter").as_deref(), Some("62"));
+        assert_eq!(value(&i, 0, "loop_start").as_deref(), Some("100"));
+        // A region that did not loop now plays the sample's loop.
+        assert_eq!(
+            value(&i, 1, "loop_mode").as_deref(),
+            Some("loop_continuous")
+        );
+        assert_eq!(value(&i, 2, "loop_mode").as_deref(), Some("loop_sustain"));
+    }
+
+    #[test]
+    fn a_loop_only_edit_leaves_folded_tuning_alone() {
+        let mut i = inst("<region> sample=a.wav pitch_keycenter=60 tune=80");
+        let before = region_edit(&i, 0, &wav());
+        assert_eq!((before.root, before.cents), (59, 20.0));
+        let after = EditState {
+            loop_mode: LoopMode::Forward,
+            loop_start: 100,
+            loop_end: 300,
+            ..before.clone()
+        };
+        write_back(&mut i, &all_follow(1), &before, &after);
+        assert_eq!(value(&i, 0, "pitch_keycenter").as_deref(), Some("60"));
+        assert_eq!(value(&i, 0, "tune").as_deref(), Some("80"));
+        assert_eq!(value(&i, 0, "loop_start").as_deref(), Some("100"));
+        // A tuning-only edit leaves the loop opcodes alone.
+        let mut j = inst("<region> sample=a.wav");
+        let before = region_edit(&j, 0, &looped(LoopMode::Forward, 10, 90));
+        let after = EditState {
+            cents: 5.0,
+            ..before.clone()
+        };
+        write_back(&mut j, &all_follow(1), &before, &after);
+        assert_eq!(value(&j, 0, "tune").as_deref(), Some("-5"));
+        assert_eq!(value(&j, 0, "loop_mode"), None);
+        assert_eq!(value(&j, 0, "loop_start"), None);
+    }
+
+    #[test]
+    fn pitch_keycenter_keeps_the_files_spelling() {
+        for (text, want) in [
+            ("<region> pitch_keycenter=c4", "D4"),
+            ("<region> key=c4", "D4"),
+            ("<group> pitch_keycenter=c4 <region> sample=a.wav", "D4"),
+            ("<region> pitch_keycenter=60", "62"),
+            ("<region> pitch_keycenter=sample", "62"),
+            ("<region> sample=a.wav", "62"),
+        ] {
+            let mut i = inst(text);
+            let before = region_edit(&i, 0, &wav());
+            let after = EditState {
+                root: 62,
+                ..before.clone()
+            };
+            write_back(&mut i, &all_follow(1), &before, &after);
+            assert_eq!(
+                value(&i, 0, "pitch_keycenter").as_deref(),
+                Some(want),
+                "{text}"
+            );
+        }
     }
 
     #[test]

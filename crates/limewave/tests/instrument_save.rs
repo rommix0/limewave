@@ -8,10 +8,12 @@ use eframe::egui::vec2;
 use egui_kittest::Harness;
 use egui_kittest::kittest::{NodeT, Queryable};
 use limewave::app::{FileEntry, LimewaveApp, PendingAction, Session};
+use limewave::audio::voice::Playback;
 use limewave::instrument::InstrumentState;
+use limewave::ui::region_inspector::RegionEdit;
 use limewave::ui::save_dialog::{InstrumentSaveRequest, SaveFormat};
 use limewave_core::document::{load_wav, new_document};
-use limewave_core::edit::EditState;
+use limewave_core::edit::{EditState, LoopMode};
 use limewave_core::riff::Chunk;
 use limewave_core::save::Destination;
 use limewave_core::smpl::Smpl;
@@ -782,4 +784,30 @@ fn a_failed_save_keeps_the_instrument_and_its_edits() {
     assert!(session.history.is_dirty());
     assert_eq!(session.edit().start, 100);
     assert_eq!(session.doc.path, kit_dir.join("Samples").join("a.wav"));
+}
+
+#[test]
+fn a_one_shot_region_stays_one_shot_through_sample_edits_and_a_save() {
+    let (_dir, path) = kit();
+    let out = path.parent().unwrap().join("limewave");
+    let mut h = open(&path);
+    h.state_mut().select_region(0);
+    h.state_mut()
+        .region_edit(RegionEdit::Playback(Playback::OneShot));
+    edit_sample(&mut h, 0, |e| {
+        e.root = 62;
+        (e.loop_mode, e.loop_start, e.loop_end) = (LoopMode::Forward, 100, 900);
+    });
+    h.state_mut()
+        .save_instrument_now(InstrumentSaveRequest {
+            destination: Destination::Folder(out.clone()),
+            write_smpl: false,
+        })
+        .unwrap();
+    let text = std::fs::read_to_string(out.join("kit.sfz")).unwrap();
+    let first = text.split("<region>").nth(1).unwrap();
+    assert!(first.contains("loop_mode=one_shot"), "{text}");
+    assert!(!first.contains("loop_continuous"), "{text}");
+    assert!(first.contains("pitch_keycenter=62"), "{text}");
+    assert!(first.contains("loop_start=100"), "{text}");
 }

@@ -7,7 +7,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use limewave_core::edit::{EditState, History, LoopMode};
-use limewave_core::notes::note_name;
 use limewave_core::save::Destination;
 use limewave_core::sfz::bind::{self, Binding};
 use limewave_core::sfz::format_number;
@@ -356,14 +355,8 @@ pub fn set_keys(inst: &mut Instrument, region: usize, lo: u8, hi: u8) {
         if now == key {
             continue;
         }
-        let numeric = inst
-            .get(region, name)
-            .is_some_and(|(text, _)| text.trim().starts_with(|c: char| c.is_ascii_digit()));
-        let text = if numeric {
-            key.to_string()
-        } else {
-            note_name(key)
-        };
+        let existing = inst.get(region, name).map(|(text, _)| text);
+        let text = bind::key_text(existing.as_deref(), key, true);
         inst.set(region, name, &text);
     }
 }
