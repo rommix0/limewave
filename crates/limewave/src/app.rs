@@ -94,8 +94,13 @@ pub struct Session {
     pub peaks: Vec<PeakPyramid>,
     /// Channel average of `processed`, for analysis and drawing.
     pub mono: Vec<f32>,
-    /// `processed` with the current crossfade applied.
-    pub rendered: Vec<Vec<f32>>,
+    /// `processed` with the crossfade of the edit last published (`published`) applied. Shared
+    /// with the engine's buffer and with the regions of an open instrument, never copied.
+    pub rendered: Arc<Vec<Vec<f32>>>,
+    /// The edit `rendered` was made for: the current edit, or a drag preview.
+    pub published: EditState,
+    /// Counts publishes, so an instrument's regions follow each new `rendered`.
+    pub publishes: u64,
     /// The peak of `processed` over the current edit's Start...End.
     trim_peak: f32,
     /// The last [`Session::predicted_peak`] question (effect and selection) and its answer.
@@ -148,16 +153,18 @@ impl Session {
         let processed = process(&doc.audio, &initial.effects);
         let peaks = processed.iter().map(|c| PeakPyramid::build(c)).collect();
         let mono = mono_sum(&processed);
-        let rendered = render(&processed, &initial);
+        let rendered = Arc::new(render(&processed, &initial));
         let trim_peak = trim_peak(&processed, &initial);
         Session {
             doc,
             processed_for: initial.effects.clone(),
             processed,
+            published: initial.clone(),
             history: History::new(initial),
             peaks,
             mono,
             rendered,
+            publishes: 0,
             trim_peak,
             predicted: None,
             destination: None,
@@ -460,14 +467,29 @@ impl Session {
 
     /// Renders `e` into `rendered` and, with an engine, publishes the matching play buffer.
     fn publish(&mut self, e: &EditState, engine: Option<&AudioEngine>) {
-        match engine {
-            Some(engine) => {
-                let buffer =
-                    play_buffer(&self.processed, self.doc.format.sample_rate, e, self.source);
-                self.rendered.clone_from(&buffer.audio);
-                engine.set_buffer(buffer);
-            }
-            None => self.rendered = render(&self.processed, e),
+        self.rendered = Arc::new(render(&self.processed, e));
+        self.published = e.clone();
+        self.publishes += 1;
+        if let Some(engine) = engine {
+            engine.set_buffer(self.published_buffer());
+        }
+    }
+
+    /// The buffer last published: `rendered` (shared, not copied) with `published`'s markers,
+    /// loop and tuning.
+    pub fn published_buffer(&self) -> PlayBuffer {
+        let e = &self.published;
+        PlayBuffer {
+            audio: Arc::clone(&self.rendered),
+            rate: self.doc.format.sample_rate,
+            start: e.start,
+            end: e.end,
+            loop_mode: e.loop_mode,
+            loop_start: e.loop_start,
+            loop_end: e.loop_end,
+            root: e.root,
+            cents: e.cents,
+            source: self.source,
         }
     }
 }
@@ -2889,7 +2911,7 @@ mod tests {
 
         s.undo(None);
         assert!(!s.history.is_dirty());
-        assert_eq!(s.rendered, s.doc.audio);
+        assert_eq!(*s.rendered, s.doc.audio);
         s.redo(None);
         assert!(
             region
@@ -2926,7 +2948,7 @@ mod tests {
         s.commit_preview(None);
         assert!(s.preview.is_none());
         assert_eq!(s.edit(), &plain);
-        assert_eq!(s.rendered, s.doc.audio, "release renders the final edit");
+        assert_eq!(*s.rendered, s.doc.audio, "release renders the final edit");
         s.undo(None);
         assert!(!s.history.is_dirty(), "one drag, one undo step");
 
@@ -3006,16 +3028,16 @@ mod tests {
         s.set_preview(faded, None);
         assert_eq!(s.flush_preview(None), None, "published at once");
         s.set_preview(plain, None);
-        assert_ne!(s.rendered, s.doc.audio, "throttled");
+        assert_ne!(*s.rendered, s.doc.audio, "throttled");
 
         // No further drag events: the app asks to be woken when the wait is over.
         let wait = s.flush_preview(None).expect("a repaint is needed");
         assert!(wait > Duration::ZERO && wait <= PREVIEW_PUSH_INTERVAL);
-        assert_ne!(s.rendered, s.doc.audio, "still waiting");
+        assert_ne!(*s.rendered, s.doc.audio, "still waiting");
 
         s.last_preview_push = Instant::now().checked_sub(PREVIEW_PUSH_INTERVAL);
         assert_eq!(s.flush_preview(None), None);
-        assert_eq!(s.rendered, s.doc.audio, "the held preview is published");
+        assert_eq!(*s.rendered, s.doc.audio, "the held preview is published");
         assert_eq!(s.flush_preview(None), None, "nothing left to publish");
     }
 
@@ -3046,7 +3068,7 @@ mod tests {
         let (lo0, hi0) = PeakPyramid::build(&s.doc.audio[0]).min_max(&s.doc.audio[0], 0, 8000);
         assert!((hi - 2.0 * hi0).abs() < 1e-3 && (lo - 2.0 * lo0).abs() < 1e-3);
         assert_eq!(s.mono, mono_sum(&s.processed));
-        assert_eq!(s.rendered, s.processed, "no crossfade: rendered follows");
+        assert_eq!(*s.rendered, s.processed, "no crossfade: rendered follows");
 
         s.undo(None);
         assert_eq!(s.processed, s.doc.audio);
@@ -3984,8 +4006,15 @@ mod tests {
         }
     }
 
-    #[test]
-    fn notes_play_the_instrument_map_which_follows_edits() {
+    /// An app with a headless engine and the instrument `text` open, its regions playing
+    /// `short.wav` (1000 frames, no loop, root 60), already loaded as file 0.
+    fn instrument_app(
+        text: &str,
+    ) -> (
+        tempfile::TempDir,
+        LimewaveApp,
+        crate::audio::engine::HeadlessOutput,
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let wav = dir.path().join("short.wav");
         let bytes = wav_bytes(
@@ -3995,8 +4024,7 @@ mod tests {
             Vec::new(),
         );
         std::fs::write(&wav, bytes).unwrap();
-        let text = "<region> sample=short.wav hikey=59\n<region> sample=short.wav lokey=60\n";
-        let (engine, mut out) = crate::audio::engine::headless(48_000);
+        let (engine, out) = crate::audio::engine::headless(48_000);
         let mut app = LimewaveApp::build(egui::Context::default(), Some(engine), None);
         app.files = vec![FileEntry::Loaded(Box::new(Session::new(
             load_wav(&wav).unwrap(),
@@ -4004,6 +4032,46 @@ mod tests {
         let inst = Instrument::new(parse(text).unwrap());
         app.instrument = Some(InstrumentState::new(dir.path().join("i.sfz"), inst, None));
         app.instrument.as_mut().unwrap().rebind(&app.files);
+        (dir, app, out)
+    }
+
+    #[test]
+    fn a_sample_drag_preview_is_heard_on_a_held_instrument_note() {
+        let (_dir, mut app, mut out) = instrument_app("<region> sample=short.wav\n");
+        app.select_region(0);
+        app.sync_instrument();
+        app.note_on(60);
+        out.render(64);
+        assert_eq!(out.voice_sources().len(), 1);
+
+        // Dragging a loop onto the sample: previewed, not committed.
+        let mut e = app.selected_session().unwrap().edit().clone();
+        (e.loop_mode, e.loop_start, e.loop_end) = (LoopMode::Forward, 100, 700);
+        let engine = app.engine.as_ref();
+        let FileEntry::Loaded(s) = &mut app.files[0] else {
+            unreachable!()
+        };
+        s.set_preview(e, engine);
+        assert_eq!(s.history.cursor(), 0, "nothing committed");
+        app.sync_instrument();
+        out.render(64);
+        let region = &out.instrument().expect("an instrument is set").regions[0];
+        assert_eq!(
+            (region.buffer.loop_mode, region.buffer.loop_end),
+            (LoopMode::Forward, 700)
+        );
+        // The held note loops on the previewed loop instead of ending at frame 999.
+        out.render(48_000);
+        assert_eq!(out.voice_sources().len(), 1, "still sounding");
+        let at = app.cursors()[0].frame;
+        assert!((100.0..=700.0).contains(&at), "inside the loop: {at}");
+    }
+
+    #[test]
+    fn notes_play_the_instrument_map_which_follows_edits() {
+        let (_dir, mut app, mut out) = instrument_app(
+            "<region> sample=short.wav hikey=59\n<region> sample=short.wav lokey=60\n",
+        );
         app.select_region(1);
         app.sync_instrument();
 

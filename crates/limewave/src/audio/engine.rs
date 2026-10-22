@@ -84,8 +84,9 @@ pub struct Cursor {
 /// with plain atomic stores (no allocation, no locks). The frame and source are stored
 /// `Relaxed` and the level with `Release`; an empty slot stores only its level, keeping its
 /// last frame and source. [`Cursors::read`] loads the level with `Acquire` before the frame
-/// and source, so a cursor never pairs a new level with an older frame or source. Slots are independent: a read may mix slots from two
-/// consecutive callbacks, which at most moves one cursor by a few milliseconds.
+/// and source, so a cursor never pairs a new level with an older frame or source. Slots are
+/// independent: a read may mix slots from two consecutive callbacks, which at most moves one
+/// cursor by a few milliseconds.
 pub struct Cursors {
     frames: [AtomicU64; MAX_VOICES],
     sources: [AtomicU64; MAX_VOICES],
@@ -373,8 +374,8 @@ impl<'a> Sources<'a> {
 /// instrument, else the current buffer), then fills interleaved `out` (cleared first) with the
 /// mixed voices, stolen ones still fading included, clamped to [-1, 1]. Each voice plays
 /// the buffer (or, for an instrument voice, the region) in `sources` with its source; a voice
-/// whose source is in none is dropped. Afterwards the voices' positions are published to `cursors`. Does not
-/// allocate.
+/// whose source is in none is dropped. Afterwards the voices' positions are published to
+/// `cursors`. Does not allocate.
 pub fn process(
     state: &mut MixerState,
     sources: &Sources,
@@ -682,6 +683,11 @@ impl HeadlessOutput {
     /// The sources of the buffers the callback holds: the current one and the previous one.
     pub(crate) fn sources(&self) -> (u64, u64) {
         (self.0.current.source, self.0.previous.source)
+    }
+
+    /// The instrument the callback plays new notes on, as of the last render.
+    pub(crate) fn instrument(&self) -> Option<&InstrumentPlay> {
+        self.0.current_instrument.as_deref()
     }
 
     /// The source each sounding voice plays.

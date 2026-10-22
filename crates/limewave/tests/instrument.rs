@@ -8,7 +8,7 @@ use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
 use limewave::app::{FileEntry, LimewaveApp, PendingAction};
 use limewave::audio::voice::Playback;
-use limewave::instrument::{InstrumentState, play_map};
+use limewave::instrument::{InstrumentState, play_map, set_keys};
 use limewave::ui::keyboard::key_rect_in;
 use limewave::ui::keymap::box_rect;
 use limewave::ui::regions::{RegionListAction, unassigned_wavs, unsaved_regions};
@@ -998,6 +998,50 @@ fn own_region_uses_its_own_values() {
         std::sync::Arc::ptr_eq(&follows.buffer.audio, &own.buffer.audio),
         "regions of one sample share its audio"
     );
+    // The key map's keyboard shows each region's own root.
+    assert_eq!(st(&h).region_root(&app.files, 0), 55);
+    assert_eq!(st(&h).region_root(&app.files, 1), 72);
+}
+
+#[test]
+fn region_only_edits_reuse_the_samples_audio() {
+    let (_dir, mut h) = open_text("<region> sample=a.wav\n<region> sample=b.wav lokey=61\n");
+    let before = play_map(st(&h), &h.state().files);
+    h.state_mut()
+        .instrument
+        .as_mut()
+        .unwrap()
+        .edit(|i| i.set(0, "volume", "-6"));
+    let app = h.state();
+    let after = play_map(st(&h), &app.files);
+    assert_ne!(before.regions[0].gain, after.regions[0].gain);
+    for (b, a) in before.regions.iter().zip(&after.regions) {
+        assert!(
+            std::sync::Arc::ptr_eq(&b.buffer.audio, &a.buffer.audio),
+            "nothing is rendered again"
+        );
+    }
+    let FileEntry::Loaded(s) = &app.files[st(&h).region_file(0).unwrap()] else {
+        panic!("not loaded");
+    };
+    assert!(
+        std::sync::Arc::ptr_eq(&s.rendered, &after.regions[0].buffer.audio),
+        "the map shares the session's audio"
+    );
+}
+
+#[test]
+fn an_edit_during_a_drag_preview_is_kept() {
+    let (_dir, mut h) = open_text("<region> sample=a.wav lokey=0 hikey=60\n");
+    let st_mut = h.state_mut().instrument.as_mut().unwrap();
+    st_mut.set_preview(|i| set_keys(i, 0, 0, 72));
+    st_mut.edit(|i| i.set(0, "volume", "-3"));
+    assert!(st_mut.preview.is_none(), "the edit drops the stale preview");
+    st_mut.commit_preview();
+    let s = st(&h);
+    assert_eq!(s.inst().region_info(0).volume, -3.0, "the edit is kept");
+    assert_eq!(keys(s, 0), (0, 60));
+    assert_eq!(s.history.cursor(), 1);
 }
 
 #[test]

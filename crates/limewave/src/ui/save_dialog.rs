@@ -648,7 +648,7 @@ mod tests {
         s.apply(e, None);
         assert_eq!(s.edit().crossfade, 50);
         let rendered = s.rendered.clone();
-        assert_ne!(rendered, s.doc.audio, "the crossfade changes the audio");
+        assert_ne!(*rendered, s.doc.audio, "the crossfade changes the audio");
         let view = ViewTransform {
             first: 900.0,
             frames_per_px: 2.0,
@@ -671,13 +671,13 @@ mod tests {
         assert!(s.just_saved, "the saved edit had a crossfade");
         assert_eq!(s.destination, Some(Destination::Folder(out.clone())));
         assert_eq!(s.doc.audio.len(), rendered.len());
-        for (saved, before) in s.doc.audio.iter().zip(&rendered) {
+        for (saved, before) in s.doc.audio.iter().zip(rendered.iter()) {
             assert_eq!(saved.len(), before.len());
             for (i, (a, b)) in saved.iter().zip(before).enumerate() {
                 assert!((a - b).abs() <= LSB, "frame {i}: {a} vs {b}");
             }
         }
-        assert_eq!(s.rendered, s.doc.audio, "no crossfade left to render");
+        assert_eq!(*s.rendered, s.doc.audio, "no crossfade left to render");
         assert_eq!(s.view, Some(view), "same length: the view stays");
         assert!(source.exists(), "the source is untouched");
     }

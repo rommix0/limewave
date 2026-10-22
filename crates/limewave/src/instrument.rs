@@ -118,8 +118,8 @@ impl InstrumentState {
         (n < self.binding.region_sample.len()).then_some(n)
     }
 
-    /// Changes whenever [`play_map`] would: with the instrument, its preview, or the edit,
-    /// source or loading of one of its samples.
+    /// Changes whenever [`play_map`] would: with the instrument, its preview, or the published
+    /// audio and edit (drag previews included), source or loading of one of its samples.
     pub fn play_key(&self, files: &[FileEntry]) -> u64 {
         let mut h = DefaultHasher::new();
         (
@@ -131,7 +131,7 @@ impl InstrumentState {
         self.binding.region_sample.len().hash(&mut h);
         for &file in &self.sample_file {
             match file.and_then(|i| files.get(i)) {
-                Some(FileEntry::Loaded(s)) => (s.source, s.history.stamp()).hash(&mut h),
+                Some(FileEntry::Loaded(s)) => (s.source, s.publishes).hash(&mut h),
                 _ => 0u64.hash(&mut h),
             }
         }
@@ -139,14 +139,14 @@ impl InstrumentState {
     }
 
     /// The loaded session of `region`'s sample, and the edit `region` plays it with: the
-    /// sample's current edit when the region follows it, else the region's own tuning and loop
-    /// over the WAV's (spec 4.3).
+    /// edit the sample last published (a drag preview included, so edits are heard live) when
+    /// the region follows it, else the region's own tuning and loop over the WAV's (spec 4.3).
     fn region_sound<'a>(
         &self,
         inst: &Instrument,
         files: &'a [FileEntry],
         region: usize,
-    ) -> Option<(usize, &'a Session, EditState)> {
+    ) -> Option<(&'a Session, EditState)> {
         let sample = (*self.binding.region_sample.get(region)?)?;
         let Some(FileEntry::Loaded(session)) = files.get((*self.sample_file.get(sample)?)?) else {
             return None;
@@ -158,18 +158,18 @@ impl InstrumentState {
             .position(|&r| r == region)
             .is_none_or(|i| b.follows[i]);
         let edit = if follows {
-            session.edit().clone()
+            session.published.clone()
         } else {
             bind::region_edit(inst, region, &session.doc.initial_edit())
         };
-        Some((sample, session, edit))
+        Some((session, edit))
     }
 
     /// `region`'s root key: its sample's (or its own, spec 4.3), else its `pitch_keycenter`
     /// while the sample is not loaded, else 60.
     pub fn region_root(&self, files: &[FileEntry], region: usize) -> u8 {
         match self.region_sound(self.inst(), files, region) {
-            Some((_, _, edit)) => edit.root,
+            Some((_, edit)) => edit.root,
             None => match self.inst().region_info(region).keycenter {
                 Keycenter::Note(n) => n,
                 Keycenter::Sample => 60,
@@ -180,6 +180,8 @@ impl InstrumentState {
     /// Records `f` applied to the current instrument as one undo step, then binds the result
     /// again. Samples already open keep their file; one not open maps to `None`.
     pub fn edit(&mut self, f: impl FnOnce(&mut Instrument)) {
+        // A drag preview was made from the state being changed.
+        self.preview = None;
         let mut next = self.inst().clone();
         f(&mut next);
         self.history.push(next);
@@ -249,26 +251,24 @@ impl InstrumentState {
 }
 
 /// The regions of the shown instrument as the engine plays them (spec 6): each with its
-/// effective ranges, level, envelope and playback mode, its sample's audio (shared by every
-/// region of that sample) from `offset` to `end`, and the tuning and loop of the sample, or its
+/// effective ranges, level, envelope and playback mode, the audio its sample last published
+/// (shared, never rendered or copied here) from `offset` to `end`, and the tuning and loop of
+/// the sample as last published, or its
 /// own (spec 4.3), with `transpose` folded into the root. Regions whose sample is missing or
 /// not loaded, or whose `trigger` isn't `attack`, are left out (spec 6.1).
 pub fn play_map(st: &InstrumentState, files: &[FileEntry]) -> InstrumentPlay {
     let inst = st.shown();
-    let mut buffers = vec![None; st.binding.samples.len()];
     let mut regions = Vec::new();
     for region in 0..inst.regions().len() {
-        let Some((sample, session, edit)) = st.region_sound(inst, files, region) else {
+        let Some((session, edit)) = st.region_sound(inst, files, region) else {
             continue;
         };
         let info = inst.region_info(region);
         if !info.attack_trigger {
             continue;
         }
-        let mut buffer = buffers[sample]
-            .get_or_insert_with(|| session.play_buffer())
-            .clone();
-        let current = session.edit();
+        let mut buffer = session.published_buffer();
+        let current = &session.published;
         let last = buffer.audio.first().map_or(0, Vec::len).saturating_sub(1);
         buffer.end = info.end.unwrap_or(current.end).min(current.end);
         buffer.start = info.offset.max(current.start).min(buffer.end);

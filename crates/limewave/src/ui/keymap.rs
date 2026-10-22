@@ -230,14 +230,8 @@ pub fn key_map(
         paint(ui, area, st, &ranges, &boxes, sounding);
     }
 
-    let root = st
-        .selected_region
-        .and_then(|r| st.region_file(r))
-        .and_then(|i| match files.get(i) {
-            Some(FileEntry::Loaded(s)) => Some(s.shown_edit().root),
-            _ => None,
-        })
-        .unwrap_or(60);
+    // The selected region's root: its sample's, or its own when it keeps its own tuning.
+    let root = st.selected_region.map_or(60, |r| st.region_root(files, r));
     ui.scope(|ui| {
         // Not disabled when silent: right-clicking a key still sets the root.
         if !can_play {
