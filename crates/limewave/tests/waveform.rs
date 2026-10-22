@@ -68,7 +68,7 @@ fn looped_harness_with_dt(step_dt: f32) -> Harness<'static, LimewaveApp> {
     let mut app = LimewaveApp::for_test();
     app.open_file(path);
     let mut harness = Harness::builder()
-        .with_size(eframe::egui::vec2(1100.0, 700.0))
+        .with_size(eframe::egui::vec2(1400.0, 700.0))
         .with_step_dt(step_dt)
         // The seam readout uses an arrow that the test font set lacks.
         .allow_missing_glyphs()
@@ -582,7 +582,7 @@ fn opening_a_long_stereo_file_renders_quickly() {
     app.files = vec![FileEntry::Loaded(Box::new(session))];
     app.select(0);
     let mut h = Harness::builder()
-        .with_size(eframe::egui::vec2(1100.0, 700.0))
+        .with_size(eframe::egui::vec2(1400.0, 700.0))
         // The seam readout uses an arrow that the test font set lacks.
         .allow_missing_glyphs()
         .build_ui_state(|ui, app: &mut LimewaveApp| app.show(ui), app);
@@ -653,7 +653,7 @@ fn tail_harness() -> Harness<'static, LimewaveApp> {
     app.files = vec![FileEntry::Loaded(Box::new(s))];
     app.select(0);
     let mut h = Harness::builder()
-        .with_size(eframe::egui::vec2(1100.0, 700.0))
+        .with_size(eframe::egui::vec2(1400.0, 700.0))
         .with_step_dt(0.25)
         // The seam readout uses an arrow that the test font set lacks.
         .allow_missing_glyphs()
@@ -700,4 +700,129 @@ fn end_marker_can_be_dragged_into_the_tail() {
         h.get_by_label("1500 frames").rect().width() > 0.0,
         "the label counts the tail"
     );
+}
+
+/// Turns Draw mode on.
+fn draw_on(h: &mut Harness<'static, LimewaveApp>) {
+    h.state_mut().ui.draw = true;
+    h.run();
+}
+
+/// The sample value (held to full scale) a drawing pointer at height `y` of the mono lane means.
+fn value_at(h: &Harness<'static, LimewaveApp>, y: f32) -> f32 {
+    let s = session(h);
+    let (rect, view) = (waveform_rect(h), s.view.unwrap());
+    let centre = sample_point(rect, &view, &[vec![0.0]], 0, 0).y;
+    let top = sample_point(rect, &view, &[vec![1.0]], 0, 0).y;
+    ((centre - y) / (centre - top)).clamp(-1.0, 1.0)
+}
+
+/// The height of the mono lane's zero line.
+fn lane_centre(h: &Harness<'static, LimewaveApp>) -> f32 {
+    let s = session(h);
+    sample_point(waveform_rect(h), &s.view.unwrap(), &[vec![0.0]], 0, 0).y
+}
+
+#[test]
+fn draw_mode_fills_every_frame_under_a_zoomed_out_stroke() {
+    let mut h = looped_harness();
+    draw_on(&mut h);
+    let view = session(&h).view.unwrap();
+    assert!(view.frames_per_px > 1.0, "zoomed out");
+    let left = waveform_rect(&h).left();
+    let centre = lane_centre(&h);
+    let from = pos2(frame_pos(&h, 1500).x, centre - 20.0);
+    let to = pos2(frame_pos(&h, 3500).x, centre + 20.0);
+    drag(&mut h, from, to);
+
+    let first = view.x_to_frame(from.x, left).round() as usize;
+    let last = view.x_to_frame(to.x, left).round() as usize;
+    assert_eq!(changed_frames(&h), (first..=last).collect::<Vec<_>>());
+    let values: Vec<f32> = (first..=last)
+        .map(|f| session(&h).processed[0][f])
+        .collect();
+    assert!(
+        values.windows(2).all(|w| w[1] <= w[0] + 1e-6),
+        "a falling line"
+    );
+    assert!((values[0] - value_at(&h, from.y)).abs() < 0.02);
+    assert!((values[values.len() - 1] - value_at(&h, to.y)).abs() < 0.02);
+    assert!(h.state().ui.selection.is_none(), "drawing does not select");
+
+    h.state_mut().undo();
+    h.run();
+    assert!(changed_frames(&h).is_empty(), "one undo puts it back");
+}
+
+#[test]
+fn draw_mode_starts_at_the_pointer_not_the_sample() {
+    let mut h = looped_harness();
+    zoom_in_on(&mut h, 2000);
+    draw_on(&mut h);
+    let from = dot(&h, 2000) + eframe::egui::vec2(0.0, -40.0);
+    let to = pos2(dot(&h, 2001).x, from.y);
+    drag(&mut h, from, to);
+    let at = dot(&h, 2000);
+    assert!(
+        (at.y - from.y).abs() < 0.5,
+        "the sample jumps to the press height: {at:?} vs {from:?}"
+    );
+}
+
+#[test]
+fn a_click_in_draw_mode_changes_no_audio() {
+    let mut h = looped_harness();
+    draw_on(&mut h);
+    let at = frame_pos(&h, 3000);
+    h.hover_at(at);
+    h.step();
+    for pressed in [true, false] {
+        h.event(Event::PointerButton {
+            pos: at,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        });
+        h.step();
+    }
+    assert!(changed_frames(&h).is_empty());
+    assert_eq!(h.state().ui.play_from, Some(3000));
+}
+
+#[test]
+fn markers_still_drag_in_draw_mode() {
+    let mut h = looped_harness();
+    draw_on(&mut h);
+    let from = flag_pos(&h, Marker::LoopEnd);
+    drag(&mut h, from, from + eframe::egui::vec2(-60.0, 0.0));
+    assert!(session(&h).edit().loop_end < LOOP_END as usize - 100);
+    assert!(changed_frames(&h).is_empty());
+}
+
+#[test]
+fn a_draw_stroke_stops_at_full_scale_and_the_file_end() {
+    let mut h = looped_harness();
+    draw_on(&mut h);
+    let rect = waveform_rect(&h);
+    // Well clear of the end marker, which a press on its line would grab.
+    let from = frame_pos(&h, 7000);
+    drag(&mut h, from, pos2(rect.right() + 300.0, rect.top() - 300.0));
+    let s = session(&h);
+    assert_eq!(s.processed[0][7999], 1.0);
+    assert_eq!(s.doc.frames, 8000);
+    assert_eq!(s.processed[0].len(), 8000);
+}
+
+#[test]
+fn escape_turns_draw_off_first() {
+    let mut h = looped_harness();
+    draw_on(&mut h);
+    h.state_mut().ui.selection = Some((2000, 3000));
+    h.key_press(Key::Escape);
+    h.run();
+    assert!(!h.state().ui.draw, "Draw is off");
+    assert_eq!(h.state().ui.selection, Some((2000, 3000)));
+    h.key_press(Key::Escape);
+    h.run();
+    assert_eq!(h.state().ui.selection, None);
 }

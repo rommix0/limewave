@@ -489,6 +489,8 @@ const RENDER_DEBOUNCE: Duration = Duration::from_millis(200);
 pub struct UiState {
     pub snap: bool,
     pub lock_length: bool,
+    /// Dragging on a channel draws its waveform at any zoom.
+    pub draw: bool,
     pub audition: bool,
     pub octave_base: u8,
     pub held: BTreeSet<u8>,
@@ -531,6 +533,7 @@ impl Default for UiState {
         UiState {
             snap: true,
             lock_length: false,
+            draw: false,
             audition: true,
             octave_base: 48,
             held: BTreeSet::new(),
@@ -1558,9 +1561,14 @@ impl LimewaveApp {
         if select_all {
             self.select_all();
         } else if clear {
-            // Escape cancels "Set from MIDI" first and leaves the selection alone.
+            // Escape cancels "Set from MIDI" first, then turns Draw off, and only then clears the
+            // selection.
             if self.ui.midi_learn.take().is_none() {
-                self.clear_selection();
+                if self.ui.draw {
+                    self.ui.draw = false;
+                } else {
+                    self.clear_selection();
+                }
             }
         }
     }
@@ -1771,6 +1779,9 @@ impl LimewaveApp {
                 );
                 ui.toggle_value(&mut self.ui.lock_length, "Lock length")
                     .on_hover_text("Moving either loop marker moves both");
+                ui.toggle_value(&mut self.ui.draw, "✏ Draw").on_hover_text(
+                    "Draw the waveform with the mouse (each stroke is one undo step)",
+                );
                 ui.separator();
                 let can_play = self.engine.is_some() && self.selected_session().is_some();
                 ui.add_enabled_ui(can_play, |ui| {

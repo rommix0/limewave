@@ -129,6 +129,11 @@ fn lane_rect(rect: Rect, channels: usize, i: usize) -> Rect {
     )
 }
 
+/// The channel whose lane contains height `y` in the waveform `rect`.
+fn lane_at(rect: Rect, channels: usize, y: f32) -> Option<usize> {
+    (0..channels).find(|&i| lane_rect(rect, channels, i).y_range().contains(y))
+}
+
 /// The height of the sample value `v` in `lane`; values past full scale sit at the edge.
 fn sample_y(lane: Rect, v: f32) -> f32 {
     lane.center().y - v.clamp(-1.0, 1.0) * lane.height() * 0.45
@@ -151,8 +156,7 @@ fn sample_at(
     if view.frames_per_px >= 1.0 || total == 0 {
         return None;
     }
-    let channel =
-        (0..audio.len()).find(|&i| lane_rect(rect, audio.len(), i).y_range().contains(pos.y))?;
+    let channel = lane_at(rect, audio.len(), pos.y)?;
     let frame = frame_at(view, pos.x, rect.left(), total);
     let dot = sample_point(rect, view, audio, channel, frame);
     ((dot.x - pos.x).abs() <= SAMPLE_GRAB_PX && (dot.y - pos.y).abs() <= SAMPLE_GRAB_PX)
@@ -332,15 +336,27 @@ pub fn waveform_view(
     {
         ui_state.message = None;
         let e = s.shown_edit();
+        let channels = s.processed.len();
         let gesture = match marker_at(e, &view, left, &flags, press) {
-            Some(marker) => Gesture::Marker(Drag {
+            Some(marker) => Some(Gesture::Marker(Drag {
                 marker,
                 grab_offset: marker_frame(e, marker) as f64 - view.x_to_frame(press.x, left),
+            })),
+            // Draw mode: the pencil starts at the pointer, in the lane it is in, and nothing
+            // else starts a drag.
+            None if ui_state.draw => lane_at(rect, channels, press.y).map(|channel| {
+                let lane = lane_rect(rect, channels, channel);
+                let value = sample_value(lane, press.y);
+                let frame = frame_at(&view, press.x, left, total);
+                let stroke =
+                    PencilStroke::new(channel, frame, value, sample_y(lane, value), press.y);
+                ui.data_mut(|d| d.insert_temp(pencil_id, stroke));
+                Gesture::Pencil
             }),
-            None => match sample_at(rect, &view, &s.processed, press) {
+            None => Some(match sample_at(rect, &view, &s.processed, press) {
                 Some((channel, frame)) => {
                     let value = s.processed[channel][frame];
-                    let lane = lane_rect(rect, s.processed.len(), channel);
+                    let lane = lane_rect(rect, channels, channel);
                     let stroke =
                         PencilStroke::new(channel, frame, value, sample_y(lane, value), press.y);
                     ui.data_mut(|d| d.insert_temp(pencil_id, stroke));
@@ -349,9 +365,9 @@ pub fn waveform_view(
                 None => Gesture::Select {
                     anchor: view.x_to_frame(press.x, left),
                 },
-            },
+            }),
         };
-        ui.data_mut(|d| d.insert_temp(drag_id, Some(gesture)));
+        ui.data_mut(|d| d.insert_temp(drag_id, gesture));
     }
     let gesture: Option<Gesture> = ui
         .data(|d| d.get_temp::<Option<Gesture>>(drag_id))
@@ -376,10 +392,15 @@ pub fn waveform_view(
             (Gesture::Pencil, Some(pos)) => {
                 if let Some(mut stroke) = ui.data(|d| d.get_temp::<PencilStroke>(pencil_id)) {
                     let lane = lane_rect(rect, s.processed.len(), stroke.channel);
-                    let dy = pos.y - stroke.pointer_y;
+                    let value = if ui_state.draw {
+                        // The pencil is where the pointer is.
+                        sample_value(lane, pos.y)
+                    } else {
+                        let dy = pos.y - stroke.pointer_y;
+                        let step = if shift { dy * FINE_DRAW } else { dy };
+                        sample_value(lane, stroke.y + step)
+                    };
                     stroke.pointer_y = pos.y;
-                    let step = if shift { dy * FINE_DRAW } else { dy };
-                    let value = sample_value(lane, stroke.y + step);
                     stroke.y = sample_y(lane, value);
                     let frame = frame_at(&view, pos.x, left, total);
                     stroke.draw_to(frame, value, &s.processed[stroke.channel]);
@@ -441,6 +462,7 @@ pub fn waveform_view(
     // The sample the pencil is on, or the one a press would grab.
     let stroke = ui.data(|d| d.get_temp::<PencilStroke>(pencil_id));
     let dot = match gesture {
+        _ if ui_state.draw => None,
         Some(Gesture::Pencil) => stroke.as_ref().map(|st| (st.channel, st.at)),
         Some(_) => None,
         None if hovered.is_some() => None,
@@ -448,8 +470,14 @@ pub fn waveform_view(
             .hover_pos()
             .and_then(|p| sample_at(rect, &view, &s.processed, p)),
     };
+    let over_lane = matches!(gesture, Some(Gesture::Pencil))
+        || response
+            .hover_pos()
+            .is_some_and(|p| lane_at(rect, s.processed.len(), p.y).is_some());
     if hovered.is_some() {
         ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
+    } else if ui_state.draw && over_lane {
+        ui.ctx().set_cursor_icon(CursorIcon::Crosshair);
     } else if dot.is_some() {
         ui.ctx().set_cursor_icon(CursorIcon::ResizeVertical);
     }
@@ -828,7 +856,7 @@ fn draw_lane(
         }
         let from = f0.max(0.0).floor() as usize;
         let to = (f1.ceil() as usize).max(from + 1);
-        let (lo, hi) = peaks.min_max(channel, from, to);
+        let (lo, hi) = column_range(channel, peaks, from, to, pencil);
         let top = y_of(hi);
         let bottom = y_of(lo).max(top + 1.0);
         bars.push(Shape::line_segment(
@@ -837,6 +865,33 @@ fn draw_lane(
         ));
     }
     painter.extend(bars);
+}
+
+/// The `(min, max)` of the frames `from..to` of `channel`, with `pencil` (a first frame and the
+/// values drawn from it) in place of the samples it covers.
+fn column_range(
+    channel: &[f32],
+    peaks: &PeakPyramid,
+    from: usize,
+    to: usize,
+    pencil: Option<(usize, &[f32])>,
+) -> (f32, f32) {
+    let Some((first, values)) = pencil else {
+        return peaks.min_max(channel, from, to);
+    };
+    let to = to.min(channel.len());
+    let drawn = first.max(from)..(first + values.len()).min(to);
+    if drawn.is_empty() {
+        return peaks.min_max(channel, from, to);
+    }
+    (from..to)
+        .map(|f| match f.checked_sub(first).and_then(|i| values.get(i)) {
+            Some(&v) => v,
+            None => channel[f],
+        })
+        .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), v| {
+            (lo.min(v), hi.max(v))
+        })
 }
 
 /// Tick positions as `(x offset from the left edge, label)` for the time ruler.
@@ -932,6 +987,24 @@ mod tests {
         let mut stroke = PencilStroke::new(0, 2, 0.2, 0.0, 0.0);
         stroke.draw_to(5, 0.2, &original);
         assert_eq!(stroke.values, vec![0.2; 4]);
+    }
+
+    #[test]
+    fn bar_columns_show_the_stroke_over_the_samples_it_covers() {
+        let channel = vec![0.0; 32];
+        let peaks = PeakPyramid::build(&channel);
+        let stroke = [1.0; 3];
+        let columns: Vec<(f32, f32)> = (0..8)
+            .map(|c| column_range(&channel, &peaks, c * 4, c * 4 + 4, Some((10, &stroke))))
+            .collect();
+        for (c, range) in columns.iter().enumerate() {
+            let want = if c == 2 || c == 3 {
+                (0.0, 1.0)
+            } else {
+                (0.0, 0.0)
+            };
+            assert_eq!(*range, want, "column {c}");
+        }
     }
 
     #[test]
