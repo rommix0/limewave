@@ -13,7 +13,8 @@ use limewave::instrument::InstrumentState;
 use limewave::ui::region_inspector::RegionEdit;
 use limewave::ui::save_dialog::{InstrumentSaveRequest, SaveFormat};
 use limewave_core::document::{load_wav, new_document};
-use limewave_core::edit::{EditState, LoopMode};
+use limewave_core::edit::{EditState, LoopMode, resample_edit};
+use limewave_core::effects::{resample_map, resample_map_end};
 use limewave_core::riff::Chunk;
 use limewave_core::save::Destination;
 use limewave_core::smpl::Smpl;
@@ -867,4 +868,97 @@ fn region_cents(h: &Harness<'static, LimewaveApp>) -> f32 {
             _ => None,
         })
         .expect("a loaded file")
+}
+
+/// Converts the first RSB 501-01 instrument's first sample to 44,100 Hz the way the rate dialog
+/// does, saves the instrument to a new folder and reopens it. The WAV reports the new rate and
+/// every region using the sample has its frame opcodes scaled (R3). Skips itself when the
+/// library is absent.
+#[test]
+fn rsb_sample_converts_and_its_regions_scale() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../samples/RSB 501-01");
+    if !dir.is_dir() {
+        return;
+    }
+    let mut h = open(&dir.join("E.Piano 1 mp.sfz"));
+    h.state_mut().select_region(0);
+    let file = st(&h).region_file(0).expect("region 0 has a sample");
+    let sample = st(&h).binding.region_sample[0].expect("region 0 has a sample");
+    let regions = st(&h).binding.samples[sample].regions.clone();
+    let before: Vec<[Option<usize>; 2]> = regions
+        .iter()
+        .map(|&r| {
+            ["loop_start", "loop_end"].map(|n| st(&h).inst().get(r, n)?.0.trim().parse().ok())
+        })
+        .collect();
+
+    let (e, steps, wav_loop) = {
+        let FileEntry::Loaded(s) = &h.state().files[file] else {
+            panic!("the sample is not loaded");
+        };
+        assert_ne!(s.rate(), 44_100, "the library sample is not at 44,100 Hz");
+        let e = resample_edit(
+            s.edit(),
+            &s.processed,
+            44_100,
+            s.doc.format.sample_rate,
+            s.doc.frames,
+        )
+        .expect("the sample converts");
+        let steps = e.effects[s.edit().effects.len()..].to_vec();
+        let wav_loop = (s.edit().loop_mode, s.edit().loop_start, s.edit().loop_end);
+        (e, steps, wav_loop)
+    };
+    h.state_mut().apply_rate_edit(e);
+
+    let out = tempfile::tempdir().unwrap();
+    h.state_mut().save_as();
+    settle(&mut h);
+    h.state_mut().ui.save_dialog.folder = out.path().to_path_buf();
+    h.get_by_label("Save instrument").click();
+    h.run();
+    wait_loaded(&mut h);
+
+    let results = h.state().save_results.as_ref().expect("a save result");
+    assert!(results.iter().all(|(_, r)| r.is_ok()), "{results:?}");
+    let reopened = open(&out.path().join("E.Piano 1 mp.sfz"));
+    let sample = st(&reopened).binding.region_sample[0].expect("region 0 has a sample");
+    assert_eq!(st(&reopened).binding.samples[sample].regions, regions);
+    let i = st(&reopened).region_file(0).unwrap();
+    let FileEntry::Loaded(s) = &reopened.state().files[i] else {
+        panic!("the saved sample did not load");
+    };
+    assert_eq!(s.doc.format.sample_rate, 44_100);
+    // These instruments set no loop of their own, so the sample's `smpl` loop is what plays.
+    let (mode, start, end) = wav_loop;
+    eprintln!(
+        "DBG {wav_loop:?} {:?}",
+        steps
+            .iter()
+            .map(|a| format!("{:?}", a.op))
+            .collect::<Vec<_>>()
+    );
+    assert_ne!(mode, LoopMode::Off, "the library sample has a loop");
+    assert_eq!(
+        (s.edit().loop_mode, s.edit().loop_start, s.edit().loop_end),
+        (
+            mode,
+            resample_map(&steps, start),
+            resample_map_end(&steps, end)
+        )
+    );
+    for (&r, was) in regions.iter().zip(&before) {
+        let get =
+            |n: &str| -> Option<usize> { st(&reopened).inst().get(r, n)?.0.trim().parse().ok() };
+        assert_eq!(
+            get("loop_start"),
+            was[0].map(|v| resample_map(&steps, v)),
+            "region {r}"
+        );
+        assert_eq!(
+            get("loop_end"),
+            was[1].map(|v| resample_map_end(&steps, v)),
+            "region {r}"
+        );
+    }
 }

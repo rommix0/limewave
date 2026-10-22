@@ -8,7 +8,8 @@ use super::model::Instrument;
 use super::paths::{is_absolute_text, normalize, same_file_key, sample_path, stays_inside};
 use super::write::write;
 use crate::document::WavDocument;
-use crate::edit::EditState;
+use crate::edit::{EditState, LoopMode, resample_markers};
+use crate::effects::Op;
 use crate::error::SaveError;
 use crate::save::{
     Destination, SaveOutcome, backup_existing, build_wav_bytes_with_smpl, make_backup, smpl_state,
@@ -40,8 +41,8 @@ pub fn needs_rewrite(doc: &WavDocument, e: &EditState, smpl: &EditState) -> bool
 }
 
 /// The root key, fine tune and loop the sample's WAV is to say in `smpl`: the sample's edit
-/// with `write_smpl` on, else those the WAV came with (they now live in the instrument). The
-/// audio, trim and crossfade are always the edit's (spec 7.3).
+/// with `write_smpl` on, else those the WAV came with (they now live in the instrument), its loop
+/// moved through any conversion. The audio, trim and crossfade are always the edit's (spec 7.3).
 pub fn smpl_edit_for_save<'a>(
     doc: &WavDocument,
     edit: &'a EditState,
@@ -49,6 +50,13 @@ pub fn smpl_edit_for_save<'a>(
 ) -> std::borrow::Cow<'a, EditState> {
     if write_smpl {
         std::borrow::Cow::Borrowed(edit)
+    } else if edit.effects.iter().any(|a| matches!(a.op, Op::Resample(_))) {
+        // A converted sample's own loop moves with its audio, since the instrument may not set one.
+        let mut e = resample_markers(&doc.initial_edit(), &edit.effects);
+        if e.loop_mode != LoopMode::Off && e.loop_end + 1 - e.loop_start < 2 {
+            e.loop_mode = LoopMode::Off;
+        }
+        std::borrow::Cow::Owned(e)
     } else {
         std::borrow::Cow::Owned(doc.initial_edit())
     }
@@ -427,7 +435,6 @@ pub fn save_instrument(
 mod tests {
     use super::*;
     use crate::document::load_wav;
-    use crate::edit::LoopMode;
     use crate::riff::{Chunk, parse_riff};
     use crate::save::build_wav_bytes;
     use crate::sfz::bind::{bind, region_edit};
@@ -951,6 +958,40 @@ mod tests {
             assert!(saved.contains("loop_end=800"), "{saved}");
             assert!(saved.contains("pitch_keycenter=49"), "{saved}");
         }
+    }
+
+    /// With `smpl` off, a converted sample's WAV still says its own loop, moved to the new
+    /// rate, since the instrument sets none of its own.
+    #[test]
+    fn smpl_off_scales_the_wavs_loop_with_a_conversion() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut chunk = smpl_chunk(60);
+        let mut s = Smpl::parse(&chunk.data).unwrap();
+        s.loops.push(crate::smpl::SmplLoop {
+            cue_id: 0,
+            loop_type: 0,
+            start: 1000,
+            end: 1999,
+            fraction: 0,
+            play_count: 0,
+        });
+        chunk.data = s.to_bytes();
+        put(root, "inst/x.wav", &wav_with(220.0, vec![chunk]));
+        let sfz = put(
+            root,
+            "inst/a.sfz",
+            b"<region> sample=x.wav
+",
+        );
+        let mut o = open(&sfz);
+        let audio = vec![vec![0.0; FRAMES]];
+        o.edits[0] =
+            crate::edit::resample_edit(&o.initial[0], &audio, 22_050, RATE, FRAMES).unwrap();
+        let out = root.join("o");
+        o.save(&Destination::Folder(out.clone()), false).unwrap();
+        let l = smpl_of(&out.join("x.wav")).unwrap().loops[0];
+        assert_eq!((l.start, l.end), (500, 999));
     }
 
     fn data_of(bytes: &[u8]) -> Vec<u8> {

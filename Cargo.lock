@@ -1967,7 +1967,7 @@ dependencies = [
 
 [[package]]
 name = "limewave"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "arc-swap",
  "cpal",
@@ -1982,7 +1982,7 @@ dependencies = [
 
 [[package]]
 name = "limewave-core"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "realfft",
  "tempfile",
