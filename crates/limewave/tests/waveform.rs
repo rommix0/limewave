@@ -378,6 +378,88 @@ fn dragging_the_overview_box_scrolls_the_view() {
     assert!(!session(&h).history.is_dirty(), "scrolling is not an edit");
 }
 
+/// Sets the view to show `visible` frames from `first`, measured against the overview strip.
+fn set_view(h: &mut Harness<'static, LimewaveApp>, first: f64, visible: f64) {
+    let width = h.get_by_label("Overview").rect().width();
+    let FileEntry::Loaded(s) = &mut h.state_mut().files[0] else {
+        unreachable!()
+    };
+    let mut view = s.view.unwrap();
+    view.first = first;
+    view.frames_per_px = visible / f64::from(width);
+    s.view = Some(view);
+    h.run();
+}
+
+/// The overview strip's x for `frame` of the 8000-frame test file.
+fn overview_x(h: &Harness<'static, LimewaveApp>, frame: f64) -> f32 {
+    let overview = h.get_by_label("Overview").rect();
+    overview.left() + (frame / 8000.0 * f64::from(overview.width())) as f32
+}
+
+/// Frames the view shows across the overview strip.
+fn visible_frames(h: &Harness<'static, LimewaveApp>) -> f64 {
+    let width = h.get_by_label("Overview").rect().width();
+    session(h).view.unwrap().frames_per_px * f64::from(width)
+}
+
+#[test]
+fn dragging_the_overview_box_right_edge_zooms_with_the_left_end_fixed() {
+    let mut h = looped_harness();
+    set_view(&mut h, 0.0, 2000.0);
+    let y = h.get_by_label("Overview").rect().center().y;
+    let from = pos2(overview_x(&h, 2000.0) - 1.0, y);
+    let to = pos2(overview_x(&h, 4000.0) - 1.0, y);
+    drag(&mut h, from, to);
+    let view = session(&h).view.unwrap();
+    assert_eq!(view.first, 0.0, "the left end stays put");
+    let visible = visible_frames(&h);
+    assert!(
+        (visible - 4000.0).abs() < 8000.0 * 0.02,
+        "visible = {visible}, expected about 4000"
+    );
+    assert!(!session(&h).history.is_dirty(), "zooming is not an edit");
+}
+
+#[test]
+fn dragging_the_overview_box_left_edge_zooms_with_the_right_end_fixed() {
+    let mut h = looped_harness();
+    set_view(&mut h, 2000.0, 2000.0);
+    let y = h.get_by_label("Overview").rect().center().y;
+    let from = pos2(overview_x(&h, 2000.0) + 1.0, y);
+    let to = pos2(overview_x(&h, 1000.0) + 1.0, y);
+    drag(&mut h, from, to);
+    let view = session(&h).view.unwrap();
+    let right = view.first + visible_frames(&h);
+    assert!(
+        (view.first - 1000.0).abs() < 8000.0 * 0.02,
+        "first = {}, expected about 1000",
+        view.first
+    );
+    assert!(
+        (right - 4000.0).abs() < 8000.0 * 0.02,
+        "right end = {right}, expected about 4000"
+    );
+}
+
+#[test]
+fn an_edge_dragged_past_the_other_stops_at_the_closest_zoom() {
+    let mut h = looped_harness();
+    set_view(&mut h, 2000.0, 2000.0);
+    let y = h.get_by_label("Overview").rect().center().y;
+    let from = pos2(overview_x(&h, 4000.0) - 1.0, y);
+    let to = pos2(overview_x(&h, 500.0), y);
+    drag(&mut h, from, to);
+    let view = session(&h).view.unwrap();
+    assert!(
+        (view.first - 2000.0).abs() < 1.0,
+        "the left end stays put, first = {}",
+        view.first
+    );
+    assert!(view.frames_per_px >= limewave::ui::coords::MIN_FRAMES_PER_PX);
+    assert!(visible_frames(&h) < 200.0, "zoomed right in");
+}
+
 #[test]
 fn opening_a_long_stereo_file_renders_quickly() {
     let t = Instant::now();

@@ -67,6 +67,8 @@ Notes play when the **Audition** toggle is on and no text field has focus.
 | Hold Shift while dragging a marker | Turn zero-crossing snap off for that drag |
 | Shift-click on the waveform | Extend an existing selection, or make one from the play-from point |
 | Mouse wheel over the waveform | Zoom around the cursor |
+| Drag the overview box | Scroll |
+| Drag either edge of the overview box | Zoom, keeping the other edge in place |
 
 Note names follow the convention that MIDI note 60 is C4.
 
