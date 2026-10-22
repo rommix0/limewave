@@ -290,11 +290,31 @@ fn smpl_unchanged(doc: &WavDocument, init: &EditState, e: &EditState) -> bool {
 /// The complete WAV file for `doc` edited by `e` (spec §6.5–6.6). `e` is clamped to the
 /// document first, so any edit state is accepted.
 pub fn build_wav_bytes(doc: &WavDocument, e: &EditState) -> Vec<u8> {
+    build_wav_bytes_with_smpl(doc, e, e)
+}
+
+/// `e` with the root key, fine tune and loop of `smpl`: what the `smpl`, `inst` and `acid`
+/// chunks say when the audio is `e`'s.
+pub fn smpl_state(e: &EditState, smpl: &EditState) -> EditState {
+    EditState {
+        root: smpl.root,
+        cents: smpl.cents,
+        loop_mode: smpl.loop_mode,
+        loop_start: smpl.loop_start,
+        loop_end: smpl.loop_end,
+        ..e.clone()
+    }
+}
+
+/// [`build_wav_bytes`] with the audio (effects, crossfade at `e`'s loop, trim) from `e` and the
+/// root key, fine tune and loop the `smpl`, `inst` and `acid` chunks say from `smpl`.
+pub fn build_wav_bytes_with_smpl(doc: &WavDocument, e: &EditState, smpl: &EditState) -> Vec<u8> {
+    let tuning = smpl_state(e, smpl).clamped(doc.frames);
     let e = e.clone().clamped(doc.frames);
     let init = doc.initial_edit();
-    let mut smpl = (!smpl_unchanged(doc, &init, &e)
-        && (doc.smpl.is_some() || tuning_or_loop_changed(&init, &e)))
-    .then(|| edited_smpl(doc, &init, &e).to_bytes());
+    let mut smpl = (!smpl_unchanged(doc, &init, &tuning)
+        && (doc.smpl.is_some() || tuning_or_loop_changed(&init, &tuning)))
+    .then(|| edited_smpl(doc, &init, &tuning).to_bytes());
     let audio = process(&doc.audio, &e.effects);
     // `fmt ` is rewritten only when the effects changed the channel count.
     let mut new_fmt = u16::try_from(audio.len())
@@ -321,7 +341,7 @@ pub fn build_wav_bytes(doc: &WavDocument, e: &EditState) -> Vec<u8> {
                     }
                 )
             }));
-    let tuning_changed = (e.root, e.cents) != (init.root, init.cents);
+    let tuning_changed = (tuning.root, tuning.cents) != (init.root, init.cents);
     let fact_frames = u32::try_from(e.end - e.start + 1)
         .unwrap_or(u32::MAX)
         .to_le_bytes();
@@ -357,8 +377,8 @@ pub fn build_wav_bytes(doc: &WavDocument, e: &EditState) -> Vec<u8> {
                 }
             }
             // `inst` and `acid` follow a tuning change; otherwise they stay as they are.
-            b"inst" if tuning_changed => sync_inst(&mut c.data, e.root, e.cents),
-            b"acid" if tuning_changed => sync_acid(&mut c.data, e.root),
+            b"inst" if tuning_changed => sync_inst(&mut c.data, tuning.root, tuning.cents),
+            b"acid" if tuning_changed => sync_acid(&mut c.data, tuning.root),
             _ => {}
         }
         chunks.push(c);

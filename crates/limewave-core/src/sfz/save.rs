@@ -11,7 +11,8 @@ use crate::document::WavDocument;
 use crate::edit::EditState;
 use crate::error::SaveError;
 use crate::save::{
-    Destination, SaveOutcome, backup_existing, build_wav_bytes, make_backup, write_atomic,
+    Destination, SaveOutcome, backup_existing, build_wav_bytes_with_smpl, make_backup, smpl_state,
+    write_atomic,
 };
 
 /// One loaded sample being saved.
@@ -32,26 +33,24 @@ pub struct InstrumentSaved {
     pub written: Vec<SaveOutcome>,
 }
 
-/// Whether the WAV must be re-encoded to hold `e`: it differs from what the file said on load.
-pub fn needs_rewrite(doc: &WavDocument, e: &EditState) -> bool {
-    *e != doc.initial_edit()
+/// Whether the WAV must be re-encoded to hold the audio of `e` with the root key, fine tune and
+/// loop of `smpl` in its chunks: they differ from what the file said on load.
+pub fn needs_rewrite(doc: &WavDocument, e: &EditState, smpl: &EditState) -> bool {
+    smpl_state(e, smpl) != doc.initial_edit()
 }
 
-/// The edit to write into the sample's WAV. With `write_smpl` off the WAV keeps the root key,
-/// fine tune and loop it came with (those now live in the instrument); everything else (audio,
-/// trim, crossfade) is the sample's current edit.
-pub fn wav_edit_for_save(doc: &WavDocument, edit: &EditState, write_smpl: bool) -> EditState {
+/// The root key, fine tune and loop the sample's WAV is to say in `smpl`: the sample's edit
+/// with `write_smpl` on, else those the WAV came with (they now live in the instrument). The
+/// audio, trim and crossfade are always the edit's (spec 7.3).
+pub fn smpl_edit_for_save<'a>(
+    doc: &WavDocument,
+    edit: &'a EditState,
+    write_smpl: bool,
+) -> std::borrow::Cow<'a, EditState> {
     if write_smpl {
-        return edit.clone();
-    }
-    let own = doc.initial_edit();
-    EditState {
-        root: own.root,
-        cents: own.cents,
-        loop_mode: own.loop_mode,
-        loop_start: own.loop_start,
-        loop_end: own.loop_end,
-        ..edit.clone()
+        std::borrow::Cow::Borrowed(edit)
+    } else {
+        std::borrow::Cow::Owned(doc.initial_edit())
     }
 }
 
@@ -339,7 +338,13 @@ pub fn save_instrument(
         let rewrite = samples
             .get(plan.index)
             .and_then(Option::as_ref)
-            .is_some_and(|s| needs_rewrite(s.doc, &wav_edit_for_save(s.doc, s.edit, write_smpl)));
+            .is_some_and(|s| {
+                needs_rewrite(
+                    s.doc,
+                    s.edit,
+                    &smpl_edit_for_save(s.doc, s.edit, write_smpl),
+                )
+            });
         let in_place = file_id(&plan.target) == file_id(&plan.source);
         if in_place && !rewrite {
             continue;
@@ -391,7 +396,11 @@ pub fn save_instrument(
             let s = samples[job.index]
                 .as_ref()
                 .expect("a rebuilt sample is loaded");
-            build_wav_bytes(s.doc, &wav_edit_for_save(s.doc, s.edit, write_smpl))
+            build_wav_bytes_with_smpl(
+                s.doc,
+                s.edit,
+                &smpl_edit_for_save(s.doc, s.edit, write_smpl),
+            )
         };
         write_atomic(&job.target, &job.source, &bytes)?;
     }
@@ -420,6 +429,7 @@ mod tests {
     use crate::document::load_wav;
     use crate::edit::LoopMode;
     use crate::riff::{Chunk, parse_riff};
+    use crate::save::build_wav_bytes;
     use crate::sfz::bind::{bind, region_edit};
     use crate::sfz::model::Instrument;
     use crate::sfz::parse::{decode_text, parse};
@@ -941,6 +951,82 @@ mod tests {
             assert!(saved.contains("loop_end=800"), "{saved}");
             assert!(saved.contains("pitch_keycenter=49"), "{saved}");
         }
+    }
+
+    fn data_of(bytes: &[u8]) -> Vec<u8> {
+        let chunks = parse_riff(bytes).unwrap().chunks;
+        chunks
+            .iter()
+            .find(|c| &c.id == b"data")
+            .map(|c| c.data.clone())
+            .unwrap()
+    }
+
+    fn smpl_of(p: &Path) -> Option<Smpl> {
+        let chunks = parse_riff(&std::fs::read(p).unwrap()).unwrap().chunks;
+        chunks
+            .iter()
+            .find(|c| &c.id == b"smpl")
+            .map(|c| Smpl::parse(&c.data).unwrap())
+    }
+
+    /// With `smpl` off, the crossfade is still written, at the loop as edited, while the
+    /// `smpl` chunk keeps the WAV's own values (spec 7.3).
+    #[test]
+    fn smpl_off_writes_the_crossfade_at_the_edited_loop() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // (a) A WAV without `smpl`, given a loop in the editor.
+        put(root, "a/x.wav", &wav_with(220.0, vec![]));
+        let sfz = put(root, "a/a.sfz", b"<region> sample=x.wav\n");
+        let mut o = open(&sfz);
+        o.edits[0] = EditState {
+            crossfade: 100,
+            ..looped(&o.initial[0])
+        };
+        let out = root.join("a/out");
+        o.save(&Destination::Folder(out.clone()), false).unwrap();
+        let saved = std::fs::read(out.join("x.wav")).unwrap();
+        let want = data_of(&build_wav_bytes(&o.docs[0], &o.edits[0]));
+        assert_ne!(
+            want,
+            o.docs[0].data_chunk(),
+            "the crossfade changes the audio"
+        );
+        assert_eq!(data_of(&saved), want);
+        assert_eq!(smpl_of(&out.join("x.wav")), None, "no smpl added");
+
+        // (b) A WAV whose own loop differs from the instrument's.
+        let mut s = Smpl::parse(&smpl_chunk(60).data).unwrap();
+        s.loops = vec![crate::smpl::SmplLoop {
+            cue_id: 0,
+            loop_type: 0,
+            start: 100,
+            end: 900,
+            fraction: 0,
+            play_count: 0,
+        }];
+        let chunk = Chunk {
+            id: *b"smpl",
+            data: s.to_bytes(),
+        };
+        put(root, "b/x.wav", &wav_with(220.0, vec![chunk]));
+        let sfz = put(
+            root,
+            "b/a.sfz",
+            b"<region> sample=x.wav loop_mode=loop_continuous loop_start=200 loop_end=800\n",
+        );
+        let mut o = open(&sfz);
+        assert_eq!((o.initial[0].loop_start, o.initial[0].loop_end), (200, 800));
+        o.edits[0].crossfade = 100;
+        let out = root.join("b/out");
+        o.save(&Destination::Folder(out.clone()), false).unwrap();
+        let saved = std::fs::read(out.join("x.wav")).unwrap();
+        let want = data_of(&build_wav_bytes(&o.docs[0], &o.edits[0]));
+        assert_ne!(want, o.docs[0].data_chunk());
+        assert_eq!(data_of(&saved), want);
+        let l = smpl_of(&out.join("x.wav")).unwrap().loops[0];
+        assert_eq!((l.start, l.end), (100, 900), "the WAV's own loop");
     }
 
     #[test]
