@@ -16,7 +16,7 @@ const RING_SECONDS: usize = 2;
 /// The ring never holds fewer frames than this, so a device block fits even at a low rate.
 const MIN_RING_FRAMES: usize = 1024;
 /// The longest take, in seconds (10 minutes).
-const CAP_SECONDS: usize = 600;
+pub const CAP_SECONDS: usize = 600;
 /// How often the capture thread drains the ring.
 const DRAIN_EVERY: Duration = Duration::from_millis(5);
 /// The clip light's level: -0.1 dBFS, `10^(-0.1/20)`.

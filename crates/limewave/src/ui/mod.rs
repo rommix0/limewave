@@ -8,6 +8,7 @@ pub mod inspector;
 pub mod keyboard;
 pub mod new_dialog;
 pub mod overview;
+pub mod record_panel;
 pub mod save_dialog;
 pub mod seam;
 pub mod spectrum_dialog;

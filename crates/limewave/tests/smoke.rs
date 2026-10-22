@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use egui_kittest::Harness;
-use egui_kittest::kittest::Queryable;
+use egui_kittest::kittest::{NodeT, Queryable};
 use limewave::app::{FileEntry, LimewaveApp, PendingAction};
 use limewave_core::edit::EditState;
 use limewave_core::testwav::{sine, wav_bytes};
@@ -94,4 +94,13 @@ fn unsaved_prompt_offers_discard_and_cancel() {
     assert!(harness.state().pending.is_none());
     assert_eq!(harness.state().dirty_count(), 1);
     assert_eq!(harness.query_all_by_label("Unsaved changes").count(), 0);
+}
+
+#[test]
+fn the_record_button_is_disabled_without_input_devices() {
+    let app = LimewaveApp::for_test();
+    assert_eq!(app.input_device_count, 0);
+    let mut h = harness(app);
+    h.run();
+    assert!(h.get_by_label("Record").accesskit_node().is_disabled());
 }
