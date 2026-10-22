@@ -9,8 +9,7 @@ use eframe::egui::{
 };
 use limewave_core::edit::LoopMode;
 use limewave_core::notes::note_name;
-use limewave_core::sfz::model::{Instrument, Keycenter, RegionInfo, SfzLoopMode};
-use limewave_core::sfz::parse::Token;
+use limewave_core::sfz::model::{Keycenter, RegionInfo, SfzLoopMode};
 use limewave_core::sfz::paths::same_file_key;
 
 use crate::app::FileEntry;
@@ -89,46 +88,13 @@ pub fn unassigned_wavs(st: &InstrumentState, files: &[FileEntry]) -> Vec<PathBuf
     found
 }
 
-/// What identifies a region across edits: its group and its own tokens, header included.
-fn region_keys(inst: &Instrument) -> Vec<String> {
-    let tokens = &inst.file.tokens;
-    inst.regions()
-        .into_iter()
-        .enumerate()
-        .map(|(n, h)| {
-            let end = tokens[h + 1..]
-                .iter()
-                .position(|t| matches!(t, Token::Header(_)))
-                .map_or(tokens.len(), |p| h + 1 + p);
-            format!("{:?}{:?}", inst.group_of(n), &tokens[h..end])
-        })
-        .collect()
-}
-
 /// Per region, whether a save would write something for it: its sample is unsaved, or the
-/// region is not as it was in the saved instrument. Regions are compared by content, as their
-/// numbers shift when others are added or removed. Everything counts while the instrument has
-/// never been saved.
+/// region is not as it was in the saved instrument ([`InstrumentState::changed_regions`]).
 pub fn unsaved_regions(st: &InstrumentState, files: &[FileEntry]) -> Vec<bool> {
-    let count = st.inst().regions().len();
-    let changed: Vec<bool> = match st.history.saved() {
-        Some(saved) if !st.untitled => {
-            if st.history.is_dirty() {
-                let old: HashSet<String> = region_keys(saved).into_iter().collect();
-                region_keys(st.inst())
-                    .iter()
-                    .map(|k| !old.contains(k))
-                    .collect()
-            } else {
-                vec![false; count]
-            }
-        }
-        _ => vec![true; count],
-    };
-    changed
-        .into_iter()
+    st.changed_regions()
+        .iter()
         .enumerate()
-        .map(|(n, c)| {
+        .map(|(n, &c)| {
             c || st
                 .region_file(n)
                 .and_then(|i| files.get(i))
@@ -290,16 +256,15 @@ pub fn region_list(
     });
     ui.separator();
 
-    // Each region's row is worked out once, here.
-    let group_of: Vec<Option<usize>> = (0..regions).map(|r| inst.group_of(r)).collect();
+    // Each region's row is worked out once, here, from settings read once per change.
+    let view = st.view();
     let unsaved = unsaved_regions(st, files);
-    let rows: Vec<(Option<usize>, Row)> = (0..regions)
-        .map(|r| {
-            (
-                group_of[r],
-                row_data(st, files, r, &inst.region_info(r), unsaved[r]),
-            )
-        })
+    let rows: Vec<(Option<usize>, Row)> = view
+        .infos
+        .iter()
+        .zip(&view.groups)
+        .enumerate()
+        .map(|(r, (info, &group))| (group, row_data(st, files, r, info, unsaved[r])))
         .collect();
 
     ScrollArea::vertical()

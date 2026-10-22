@@ -276,74 +276,171 @@ impl Instrument {
             .next()
     }
 
-    /// The nearest level whose value parses.
-    fn pick<T>(&self, region: usize, name: &str, parse: impl Fn(&str) -> Option<T>) -> Option<T> {
-        self.level_values(region, name)
-            .iter()
-            .find_map(|(v, _)| parse(v))
+    /// The value `canon` has at each of `levels` that sets it, nearest first, expanded.
+    fn values_in<'a>(
+        &'a self,
+        levels: &'a [(Level, Range<usize>)],
+        defines: &'a [(String, String)],
+        canon: &'a str,
+    ) -> impl Iterator<Item = String> + 'a {
+        levels.iter().filter_map(move |(_, range)| {
+            self.file.tokens[range.clone()]
+                .iter()
+                .rev()
+                .find_map(|t| match t {
+                    Token::Opcode { name, value } if supplies(canon, name) => {
+                        Some(expand(value, defines))
+                    }
+                    _ => None,
+                })
+        })
     }
 
     /// A region's effective settings with SFZ defaults filled in.
     pub fn region_info(&self, region: usize) -> RegionInfo {
-        let float = |name: &str, default: f32, parse: fn(&str) -> Option<f32>| {
-            self.pick(region, name, parse).unwrap_or(default)
+        self.info_in(&self.levels(region), &self.defines())
+    }
+
+    /// Every region's effective settings, as [`Instrument::region_info`] gives them, read in
+    /// one pass over the file.
+    pub fn region_infos(&self) -> Vec<RegionInfo> {
+        let defines = self.defines();
+        let mut out = Vec::new();
+        self.each_region(|levels, _| out.push(self.info_in(levels, &defines)));
+        out
+    }
+
+    /// Every region's group number, as [`Instrument::group_of`] gives it, in one pass.
+    pub fn region_groups(&self) -> Vec<Option<usize>> {
+        let mut out = Vec::new();
+        self.each_region(|_, group| out.push(group));
+        out
+    }
+
+    /// Calls `f` for each region in order with its levels (nearest first, as
+    /// [`Instrument::levels`] gives them) and its group number, in one pass over the tokens.
+    fn each_region(&self, mut f: impl FnMut(&[(Level, Range<usize>)], Option<usize>)) {
+        let tokens = &self.file.tokens;
+        let headers: Vec<usize> = tokens
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| matches!(t, Token::Header(_)))
+            .map(|(i, _)| i)
+            .collect();
+        let (mut group, mut master, mut global): (Option<(usize, Range<usize>)>, _, _) =
+            (None, None, None);
+        let mut groups_seen = 0;
+        let mut levels = Vec::with_capacity(4);
+        for (k, &h) in headers.iter().enumerate() {
+            let span = h + 1..headers.get(k + 1).copied().unwrap_or(tokens.len());
+            match &tokens[h] {
+                // A later master or global ends the group (and a global the master).
+                Token::Header(HeaderKind::Global) => {
+                    (global, master, group) = (Some(span), None, None);
+                }
+                Token::Header(HeaderKind::Master) => (master, group) = (Some(span), None),
+                Token::Header(HeaderKind::Group) => {
+                    group = Some((groups_seen, span));
+                    groups_seen += 1;
+                }
+                Token::Header(HeaderKind::Region) => {
+                    levels.clear();
+                    levels.push((Level::Region, span));
+                    if let Some((_, g)) = &group {
+                        levels.push((Level::Group, g.clone()));
+                    }
+                    if let Some(m) = &master {
+                        levels.push((Level::Master, m.clone()));
+                    }
+                    if let Some(g) = &global {
+                        levels.push((Level::Global, g.clone()));
+                    }
+                    f(&levels, group.as_ref().map(|(n, _)| *n));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// The effective settings of a region whose settings lie in `levels`.
+    fn info_in(
+        &self,
+        levels: &[(Level, Range<usize>)],
+        defines: &[(String, String)],
+    ) -> RegionInfo {
+        // The nearest level whose value parses.
+        fn pick<T>(
+            inst: &Instrument,
+            levels: &[(Level, Range<usize>)],
+            defines: &[(String, String)],
+            name: &str,
+            parse: impl Fn(&str) -> Option<T>,
+        ) -> Option<T> {
+            inst.values_in(levels, defines, name)
+                .find_map(|v| parse(&v))
+        }
+        let pick_f = |name: &str, default: f32, parse: fn(&str) -> Option<f32>| {
+            pick(self, levels, defines, name, parse).unwrap_or(default)
         };
+        let pick_note = |name: &str| pick(self, levels, defines, name, parse_note);
+        let pick_vel = |name: &str| pick(self, levels, defines, name, parse_vel);
+        let pick_frame = |name: &str| pick(self, levels, defines, name, parse_frame);
         RegionInfo {
-            sample: self.pick(region, "sample", |s| {
+            sample: pick(self, levels, defines, "sample", |s| {
                 let s = s.trim();
                 (!s.is_empty()).then(|| s.to_owned())
             }),
-            lokey: self.pick(region, "lokey", parse_note).unwrap_or(0),
-            hikey: self.pick(region, "hikey", parse_note).unwrap_or(127),
-            lovel: self.pick(region, "lovel", parse_vel).unwrap_or(1),
-            hivel: self.pick(region, "hivel", parse_vel).unwrap_or(127),
-            keycenter: self
-                .pick(region, "pitch_keycenter", |s| {
-                    if s.trim().eq_ignore_ascii_case("sample") {
-                        Some(Keycenter::Sample)
-                    } else {
-                        parse_note(s).map(Keycenter::Note)
-                    }
-                })
-                .unwrap_or(Keycenter::Note(60)),
-            tune: float("tune", 0.0, parse_f32),
-            transpose: self
-                .pick(region, "transpose", |s| s.trim().parse::<i32>().ok())
-                .unwrap_or(0),
-            volume: float("volume", 0.0, parse_f32),
-            amp_veltrack: float("amp_veltrack", 100.0, parse_f32),
-            offset: self.pick(region, "offset", parse_frame).unwrap_or(0),
-            end: self.pick(region, "end", parse_frame),
-            loop_mode: self.pick(region, "loop_mode", |s| match s.trim() {
+            lokey: pick_note("lokey").unwrap_or(0),
+            hikey: pick_note("hikey").unwrap_or(127),
+            lovel: pick_vel("lovel").unwrap_or(1),
+            hivel: pick_vel("hivel").unwrap_or(127),
+            keycenter: pick(self, levels, defines, "pitch_keycenter", |s| {
+                if s.trim().eq_ignore_ascii_case("sample") {
+                    Some(Keycenter::Sample)
+                } else {
+                    parse_note(s).map(Keycenter::Note)
+                }
+            })
+            .unwrap_or(Keycenter::Note(60)),
+            tune: pick_f("tune", 0.0, parse_f32),
+            transpose: pick(self, levels, defines, "transpose", |s| {
+                s.trim().parse::<i32>().ok()
+            })
+            .unwrap_or(0),
+            volume: pick_f("volume", 0.0, parse_f32),
+            amp_veltrack: pick_f("amp_veltrack", 100.0, parse_f32),
+            offset: pick_frame("offset").unwrap_or(0),
+            end: pick_frame("end"),
+            loop_mode: pick(self, levels, defines, "loop_mode", |s| match s.trim() {
                 "no_loop" => Some(SfzLoopMode::NoLoop),
                 "one_shot" => Some(SfzLoopMode::OneShot),
                 "loop_continuous" => Some(SfzLoopMode::Continuous),
                 "loop_sustain" => Some(SfzLoopMode::Sustain),
                 _ => None,
             }),
-            loop_dir: self
-                .pick(region, "loop_type", |s| match s.trim() {
-                    "forward" => Some(LoopDir::Forward),
-                    "backward" => Some(LoopDir::Backward),
-                    "alternate" => Some(LoopDir::Alternate),
-                    _ => None,
-                })
-                .unwrap_or(LoopDir::Forward),
-            loop_start: self.pick(region, "loop_start", parse_frame),
-            loop_end: self.pick(region, "loop_end", parse_frame),
+            loop_dir: pick(self, levels, defines, "loop_type", |s| match s.trim() {
+                "forward" => Some(LoopDir::Forward),
+                "backward" => Some(LoopDir::Backward),
+                "alternate" => Some(LoopDir::Alternate),
+                _ => None,
+            })
+            .unwrap_or(LoopDir::Forward),
+            loop_start: pick_frame("loop_start"),
+            loop_end: pick_frame("loop_end"),
             ampeg: Ampeg {
-                attack: float("ampeg_attack", 0.0, parse_time),
-                decay: float("ampeg_decay", 0.0, parse_time),
-                sustain: self
-                    .pick(region, "ampeg_sustain", |s| {
-                        parse_f32(s).filter(|v| (0.0..=100.0).contains(v))
-                    })
-                    .unwrap_or(100.0),
-                release: float("ampeg_release", 0.0, parse_time),
+                attack: pick_f("ampeg_attack", 0.0, parse_time),
+                decay: pick_f("ampeg_decay", 0.0, parse_time),
+                sustain: pick(self, levels, defines, "ampeg_sustain", |s| {
+                    parse_f32(s).filter(|v| (0.0..=100.0).contains(v))
+                })
+                .unwrap_or(100.0),
+                release: pick_f("ampeg_release", 0.0, parse_time),
             },
+            // The nearest `trigger`, parsed or not.
             attack_trigger: self
-                .get(region, "trigger")
-                .is_none_or(|(v, _)| v.trim() == "attack"),
+                .values_in(levels, defines, "trigger")
+                .next()
+                .is_none_or(|v| v.trim() == "attack"),
         }
     }
 
@@ -802,6 +899,63 @@ mod tests {
         assert_eq!(inst("<region> sample=a.wav").default_path(), "");
         // A region does not inherit control opcodes.
         assert!(i.get(0, "default_path").is_none());
+    }
+
+    /// Regions under every kind of scope: global, master, groups ended by a master or global,
+    /// defines, `key`, aliases, `<control>` and an unknown header.
+    fn many_scopes() -> Instrument {
+        inst(
+            "#define $V -4
+             <control> default_path=x/ <region> sample=loose.wav key=c3 loopmode=one_shot
+             <global> volume=$V tune=3 <region> sample=g.wav
+             <master> transpose=-1 loop_type=alternate
+             <group> lokey=40 hikey=50 loopstart=10 loopend=99 trigger=release <region> sample=a.wav
+             <region> sample=b.wav key=45 volume=bad
+             <curve> v000=0
+             <region> sample=c.wav ampeg_release=0.5 pitch_keycenter=sample
+             <master> lovel=20 <region> sample=d.wav hivel=90
+             <group> loop_mode=loop_sustain <region> sample=e.wav
+             #define $K 70
+             <global> <region> sample=f.wav key=$K amp_veltrack=50
+             <group> <region>",
+        )
+    }
+
+    #[test]
+    fn region_infos_is_region_info_for_every_region() {
+        let i = many_scopes();
+        let n = i.regions().len();
+        assert_eq!(n, 9);
+        let want: Vec<RegionInfo> = (0..n).map(|r| i.region_info(r)).collect();
+        assert_eq!(i.region_infos(), want);
+        let groups: Vec<Option<usize>> = (0..n).map(|r| i.group_of(r)).collect();
+        assert_eq!(i.region_groups(), groups);
+        assert_eq!(inst("").region_infos(), []);
+    }
+
+    #[test]
+    fn region_infos_reads_the_tokens_once_not_per_region() {
+        // Thousands of regions under one group: one pass is quick even in a debug build,
+        // while a scan of the whole file per region and opcode would take seconds.
+        let mut text = String::from(
+            "<group> volume=-1 ampeg_release=0.2
+",
+        );
+        for k in 0..6000 {
+            text.push_str(&format!(
+                "<region> sample=s{k}.wav lokey={lo} hikey={lo} pitch_keycenter={lo}
+",
+                lo = k % 128
+            ));
+        }
+        let i = inst(&text);
+        let started = std::time::Instant::now();
+        let infos = i.region_infos();
+        let groups = i.region_groups();
+        let took = started.elapsed();
+        assert_eq!((infos.len(), groups.len()), (6000, 6000));
+        assert_eq!(infos[5999].volume, -1.0);
+        assert!(took.as_millis() < 1000, "{took:?}");
     }
 
     #[test]

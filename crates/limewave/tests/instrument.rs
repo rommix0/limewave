@@ -1766,3 +1766,34 @@ fn a_no_loop_region_following_a_looped_sample_plays_without_the_loop() {
     assert_eq!(map.regions[0].buffer.loop_mode, LoopMode::Forward);
     assert_eq!(map.regions[1].buffer.loop_mode, LoopMode::Off);
 }
+
+#[test]
+fn region_settings_are_read_once_per_change() {
+    let (_dir, mut h) =
+        open_text("<region> sample=a.wav lokey=0 hikey=59\n<region> sample=b.wav\n");
+    let first = st(&h).view();
+    assert!(
+        std::sync::Arc::ptr_eq(&first, &st(&h).view()),
+        "kept while nothing changes"
+    );
+    assert_eq!(first.infos.len(), 2);
+    h.run();
+    assert!(
+        std::sync::Arc::ptr_eq(&first, &st(&h).view()),
+        "kept across frames"
+    );
+    // A drag preview, and dropping it, are seen at once.
+    st_mut(&mut h).set_preview(|i| set_keys(i, 0, 0, 40));
+    assert_eq!(st(&h).view().infos[0].hikey, 40);
+    st_mut(&mut h).drop_preview();
+    assert_eq!(st(&h).view().infos[0].hikey, 59);
+    st_mut(&mut h).edit(|i| set_keys(i, 0, 0, 50));
+    assert_eq!(st(&h).view().infos[0].hikey, 50);
+    h.state_mut().undo();
+    assert_eq!(st(&h).view().infos[0].hikey, 59);
+    assert_eq!(st(&h).view().groups, [None, None]);
+    // The unsaved rows follow the history the same way.
+    assert_eq!(unsaved_regions(st(&h), &h.state().files), [false, false]);
+    h.state_mut().redo();
+    assert_eq!(unsaved_regions(st(&h), &h.state().files), [true, false]);
+}

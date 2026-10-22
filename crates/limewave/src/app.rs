@@ -1213,7 +1213,7 @@ impl LimewaveApp {
             return;
         };
         // A drag preview was made from the state being left.
-        st.preview = None;
+        st.drop_preview();
         if redo {
             st.history.redo();
         } else {

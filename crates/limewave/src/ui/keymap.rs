@@ -194,10 +194,8 @@ pub fn key_map(
         }
     });
 
-    let inst = st.shown();
-    let infos: Vec<_> = (0..inst.regions().len())
-        .map(|r| inst.region_info(r))
-        .collect();
+    let view = st.view();
+    let infos = &view.infos;
     let ranges: Vec<(u8, u8)> = infos.iter().map(|i| (i.lokey, i.hikey)).collect();
     let (lane, lane_count) = lanes(&ranges);
 
@@ -222,9 +220,7 @@ pub fn key_map(
         .collect();
     boxes.sort_by_key(|&(r, _)| Some(r) == st.selected_region);
 
-    actions.extend(interact(
-        ui, &response, area, st, &infos, &boxes, *keys_only,
-    ));
+    actions.extend(interact(ui, &response, area, st, infos, &boxes, *keys_only));
 
     if ui.is_rect_visible(area) {
         paint(ui, area, st, &ranges, &boxes, sounding);
@@ -378,9 +374,14 @@ fn paint(
         }
     }
 
-    let inst = st.shown();
+    let view = st.view();
     for &(region, rect) in boxes {
-        let group = inst.group_of(region).map_or(0, |g| g + 1);
+        let group = view
+            .groups
+            .get(region)
+            .copied()
+            .flatten()
+            .map_or(0, |g| g + 1);
         let tint = GROUP_TINTS[group % GROUP_TINTS.len()];
         let missing = st
             .binding

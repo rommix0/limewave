@@ -1,9 +1,11 @@
 //! The open SFZ instrument: its edit history, which WAV each region plays and where those WAVs
 //! sit in the app's file list.
 
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use limewave_core::edit::{EditState, History, LoopMode};
@@ -11,7 +13,7 @@ use limewave_core::save::Destination;
 use limewave_core::sfz::bind::{self, Binding, SampleBinding, SampleStates};
 use limewave_core::sfz::format_number;
 use limewave_core::sfz::map::auto_map;
-use limewave_core::sfz::model::{Instrument, Keycenter, SfzLoopMode};
+use limewave_core::sfz::model::{Instrument, Keycenter, RegionInfo, SfzLoopMode};
 use limewave_core::sfz::parse::{HeaderKind, SfzFile, Token};
 use limewave_core::sfz::paths::same_file_key;
 
@@ -67,6 +69,23 @@ pub struct InstrumentState {
     /// Region `n` plays under source `region_sources + n`, the same while the instrument is
     /// edited; also the source of its [`InstrumentPlay`].
     region_sources: u64,
+    /// [`InstrumentState::view`] with the history stamp and preview count it was worked out for.
+    view: Cached<(u64, u64), RegionView>,
+    /// [`InstrumentState::changed_regions`] with the history stamp, dirtiness and untitledness it
+    /// was worked out for.
+    changed: Cached<(u64, bool, bool), Vec<bool>>,
+}
+
+/// A value worked out from the instrument, with the key of the state it was worked out for.
+type Cached<K, T> = RefCell<Option<(K, Arc<T>)>>;
+
+/// Each region's effective settings and group number in the shown instrument, read in one pass
+/// and kept until the instrument or its preview changes, so drawing a frame never reads the
+/// file once per region.
+#[derive(Debug, PartialEq)]
+pub struct RegionView {
+    pub infos: Vec<RegionInfo>,
+    pub groups: Vec<Option<usize>>,
 }
 
 impl InstrumentState {
@@ -91,6 +110,8 @@ impl InstrumentState {
             preview: None,
             preview_changes: 0,
             region_sources: NEXT_REGION_SOURCES.fetch_add(REGION_SOURCE_BLOCK, Ordering::Relaxed),
+            view: RefCell::new(None),
+            changed: RefCell::new(None),
         }
     }
 
@@ -102,6 +123,61 @@ impl InstrumentState {
     /// current instrument.
     pub fn shown(&self) -> &Instrument {
         self.preview.as_ref().unwrap_or_else(|| self.inst())
+    }
+
+    /// Every region's settings and group in the shown instrument (see [`RegionView`]).
+    pub fn view(&self) -> Arc<RegionView> {
+        let key = (self.history.stamp(), self.preview_changes);
+        let mut cache = self.view.borrow_mut();
+        if let Some((k, view)) = &*cache
+            && *k == key
+        {
+            return Arc::clone(view);
+        }
+        let shown = self.shown();
+        let view = Arc::new(RegionView {
+            infos: shown.region_infos(),
+            groups: shown.region_groups(),
+        });
+        *cache = Some((key, Arc::clone(&view)));
+        view
+    }
+
+    /// Per region of the current instrument, whether it is not as it was in the saved
+    /// instrument. Regions are compared by content, as their numbers shift when others are
+    /// added or removed. Every region counts while the instrument has never been saved.
+    pub fn changed_regions(&self) -> Arc<Vec<bool>> {
+        let key = (self.history.stamp(), self.history.is_dirty(), self.untitled);
+        let mut cache = self.changed.borrow_mut();
+        if let Some((k, changed)) = &*cache
+            && *k == key
+        {
+            return Arc::clone(changed);
+        }
+        let count = self.inst().regions().len();
+        let changed = Arc::new(match self.history.saved() {
+            Some(saved) if !self.untitled => {
+                if self.history.is_dirty() {
+                    let old: HashSet<String> = region_keys(saved).into_iter().collect();
+                    region_keys(self.inst())
+                        .iter()
+                        .map(|k| !old.contains(k))
+                        .collect()
+                } else {
+                    vec![false; count]
+                }
+            }
+            _ => vec![true; count],
+        });
+        *cache = Some((key, Arc::clone(&changed)));
+        changed
+    }
+
+    /// Drops the drag preview, if there is one.
+    pub fn drop_preview(&mut self) {
+        if self.preview.take().is_some() {
+            self.preview_changes += 1;
+        }
     }
 
     /// Applies `f` to the shown instrument as the drag preview, outside the history.
@@ -204,7 +280,7 @@ impl InstrumentState {
     /// again. Samples already open keep their file; one not open maps to `None`.
     pub fn edit(&mut self, f: impl FnOnce(&mut Instrument)) {
         // A drag preview was made from the state being changed.
-        self.preview = None;
+        self.drop_preview();
         let mut next = self.inst().clone();
         f(&mut next);
         self.history.push(next);
@@ -283,12 +359,12 @@ impl InstrumentState {
 /// not loaded, or whose `trigger` isn't `attack`, are left out (spec 6.1).
 pub fn play_map(st: &InstrumentState, files: &[FileEntry]) -> InstrumentPlay {
     let inst = st.shown();
+    let view = st.view();
     let mut regions = Vec::new();
-    for region in 0..inst.regions().len() {
+    for (region, info) in view.infos.iter().enumerate() {
         let Some((session, edit)) = st.region_sound(inst, files, region) else {
             continue;
         };
-        let info = inst.region_info(region);
         if !info.attack_trigger {
             continue;
         }
@@ -394,6 +470,22 @@ pub fn set_velocities(inst: &mut Instrument, region: usize, lo: u8, hi: u8) {
     if info.hivel != hi {
         inst.set(region, "hivel", &hi.to_string());
     }
+}
+
+/// What identifies a region across edits: its group and its own tokens, header included.
+fn region_keys(inst: &Instrument) -> Vec<String> {
+    let tokens = &inst.file.tokens;
+    inst.regions()
+        .into_iter()
+        .zip(inst.region_groups())
+        .map(|(h, group)| {
+            let end = tokens[h + 1..]
+                .iter()
+                .position(|t| matches!(t, Token::Header(_)))
+                .map_or(tokens.len(), |p| h + 1 + p);
+            format!("{group:?}{:?}", &tokens[h..end])
+        })
+        .collect()
 }
 
 /// The folder sample paths are relative to.

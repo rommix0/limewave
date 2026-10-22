@@ -127,7 +127,12 @@ fn note_field(ui: &mut Ui, name: &Response, value: u8) -> Option<u8> {
 /// included). Returns what the user changed this frame, in order.
 pub fn region_section(ui: &mut Ui, st: &InstrumentState, region: usize) -> Vec<RegionEdit> {
     let inst = st.shown();
-    let info = inst.region_info(region);
+    let info = st
+        .view()
+        .infos
+        .get(region)
+        .cloned()
+        .unwrap_or_else(|| inst.region_info(region));
     let mut out = Vec::new();
     ui.heading("Region");
 
