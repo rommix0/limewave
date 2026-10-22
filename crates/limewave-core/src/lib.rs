@@ -23,7 +23,7 @@ pub use error::{LoadError, SaveError, WavError};
 /// The longest new or recorded sample, in seconds.
 pub const MAX_NEW_SECONDS: u32 = 600;
 
-/// The software tag written into exported WAV files, e.g. `Limewave 0.3.0`.
+/// The software tag written into exported WAV files, e.g. `Limewave 0.4.0`.
 pub fn software_tag() -> String {
     format!("Limewave {}", env!("CARGO_PKG_VERSION"))
 }
@@ -34,7 +34,7 @@ mod tests {
 
     #[test]
     fn software_tag_has_name_and_version() {
-        assert_eq!(software_tag(), "Limewave 0.3.0");
+        assert_eq!(software_tag(), "Limewave 0.4.0");
         assert_eq!(
             software_tag(),
             format!("Limewave {}", env!("CARGO_PKG_VERSION"))

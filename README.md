@@ -2,7 +2,7 @@
 
 Limewave is an open-source loop and one-shot WAV sample editor, written in Rust. Open a WAV file or a folder of them, set the loop points, root key and fine tune by hand, listen to the result while you edit, and save files that samplers read correctly. It runs on Windows, macOS and Linux.
 
-What it does in version 0.3:
+What it does in version 0.4:
 
 - Reads and writes PCM (8/16/24/32-bit) and 32/64-bit float WAV files, mono or stereo, at any sample rate.
 - **New…** (toolbar): creates a blank, silent sample to draw on. Choose the length (in milliseconds or frames, up to 600 seconds), the sample rate, mono or stereo, the bit depth (16-bit, 24-bit or 32-bit float) and the root key, and whether to loop the whole file. **One cycle of** a note (such as A4) sets the length to one cycle of that note, the root key to the note and the loop to the whole file, and shows how many cents off the whole-frame cycle is. Creating a sample turns **Draw** on. The new file is called Untitled 1, 2 and so on, and counts as unsaved until you save it.
@@ -34,6 +34,8 @@ cargo run --release -p limewave
 ```
 
 To run the tests: `cargo test --workspace`.
+
+On macOS, a bundled build must set `NSMicrophoneUsageDescription` to: Limewave records audio from your input device when you press Record.
 
 To try the tail generator on a real sample from the command line, without the app, use the `tail_lab` bench. It cuts a file, renders a tail with each method you ask for, and writes the results (with the loop in the `smpl` chunk for sustain tails) into `target/tail-lab/<name>/` for listening:
 
