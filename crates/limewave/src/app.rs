@@ -24,10 +24,10 @@ use limewave_core::save::{Destination, default_folder};
 use limewave_core::wav::SampleFormat;
 
 use crate::audio::engine::{AudioEngine, Command, Cursor};
-use crate::audio::input::input_devices;
+use crate::audio::input::input_device_count;
 use crate::audio::keys::{octave_shift, qwerty_note};
 use crate::audio::midi::{MidiConnection, connect_midi, decode_last_note, list_midi_ports};
-use crate::audio::record::{StopReason, Take};
+use crate::audio::record::{Recorder, StopReason, Take};
 use crate::audio::voice::{Adsr, PlayBuffer, play_buffer};
 use crate::folder;
 use crate::render_worker::{RenderKey, RenderSlot};
@@ -643,9 +643,16 @@ pub struct LimewaveApp {
     pub save_results: Option<Vec<SaveResult>>,
     /// Asks where an untitled file goes. Tests replace it.
     pub save_picker: SavePicker,
-    /// How many input devices were listed at startup or when the Record panel last opened;
-    /// Record is disabled while it is 0.
+    /// How many input devices were counted last: at startup, when the Record panel opened,
+    /// when the pointer moved onto Record, or when the window regained the focus. Record is
+    /// disabled while it is 0.
     pub input_device_count: usize,
+    /// Counts the input devices. Tests replace it; it counts none unless replaced, so no test
+    /// depends on this machine's devices.
+    pub count_inputs: fn() -> usize,
+    /// Whether the pointer was on the Record button, and the window had the focus, last frame.
+    record_hovered: bool,
+    window_focused: bool,
     /// The next numbers for [`NewName::Untitled`] and [`NewName::Recording`]. They never reset.
     next_untitled: u32,
     next_recording: u32,
@@ -690,7 +697,8 @@ impl LimewaveApp {
             Err(e) => (None, Some(e)),
         };
         let mut app = Self::build(cc.egui_ctx.clone(), engine, audio_error);
-        app.input_device_count = input_devices().len();
+        app.count_inputs = input_device_count;
+        app.input_device_count = input_device_count();
         if let Some(storage) = cc.storage {
             app.load_settings(storage);
         }
@@ -733,6 +741,9 @@ impl LimewaveApp {
             save_results: None,
             save_picker: Box::new(system_save_picker),
             input_device_count: 0,
+            count_inputs: || 0,
+            record_hovered: false,
+            window_focused: true,
             next_untitled: 1,
             next_recording: 1,
             sent_title: None,
@@ -822,6 +833,21 @@ impl LimewaveApp {
         self.ui.record_panel = Some(panel);
     }
 
+    /// Counts the input devices again when Record may have become usable: as the pointer
+    /// moves onto the Record button, or as the window regains the focus (say, after an
+    /// interface was switched on). Never every frame. Returns whether the count changed.
+    fn refresh_inputs(&mut self, record_hovered: bool, focused: bool) -> bool {
+        let arrived = record_hovered && !self.record_hovered;
+        let regained = focused && !self.window_focused;
+        self.record_hovered = record_hovered;
+        self.window_focused = focused;
+        let before = self.input_device_count;
+        if arrived || regained {
+            self.input_device_count = (self.count_inputs)();
+        }
+        self.input_device_count != before
+    }
+
     /// Adds `take` as a new untitled "Recording N.wav" at the device's rate and selects it.
     /// Why the take stopped, if not by Stop, becomes the Record panel's notice (or the
     /// toolbar message once the panel is closed). A device failure also closes the panel's
@@ -838,11 +864,21 @@ impl LimewaveApp {
             let doc = new_document(name, take.audio, take.rate, bits.format(), 60, false);
             self.add_untitled(doc);
         }
-        match (&mut self.ui.record_panel, notice) {
+        let left = match (&mut self.ui.record_panel, notice) {
             (Some(panel), Some(text)) if failed => panel.device_failed(text),
-            (Some(panel), notice) => panel.notice = notice,
-            (None, Some(text)) => self.ui.message = Some(text),
-            (None, None) => {}
+            (Some(panel), notice) => {
+                panel.notice = notice;
+                None
+            }
+            (None, Some(text)) => {
+                self.ui.message = Some(text);
+                None
+            }
+            (None, None) => None,
+        };
+        // Closing the failed input may still hand back a take; it is kept too.
+        if let Some(take) = left {
+            self.add_recording(take, bits);
         }
     }
 
@@ -852,13 +888,11 @@ impl LimewaveApp {
     fn hold_close(&mut self) -> bool {
         if let Some(mut panel) = self.ui.record_panel.take() {
             let bits = panel.bits;
-            let takes: Vec<Take> = match &mut panel.recorder {
-                Some(recorder) => recorder.poll().into_iter().chain(recorder.stop()).collect(),
-                None => Vec::new(),
-            };
-            // Closes the input before the takes become files.
+            // The take in progress, or one the capture thread already stopped by itself.
+            let take = panel.recorder.as_mut().and_then(Recorder::stop);
+            // Closes the input before the take becomes a file.
             drop(panel);
-            for take in takes {
+            if let Some(take) = take {
                 self.add_recording(take, bits);
             }
         }
@@ -878,9 +912,13 @@ impl LimewaveApp {
             .get(i)
             .map(FileEntry::file_name)
             .unwrap_or_default();
-        let Some(path) = (self.save_picker)(&name) else {
+        let Some(mut path) = (self.save_picker)(&name) else {
             return false;
         };
+        // Some pickers return the typed name without the filter's extension.
+        if path.extension().is_none() {
+            path.set_extension("wav");
+        }
         let req = SaveRequest {
             indices: vec![i],
             destination: Destination::File(path.clone()),
@@ -1826,6 +1864,7 @@ impl LimewaveApp {
         let mut midi_choice = None;
         let mut save = None;
         let mut record = false;
+        let mut record_hovered = false;
         egui::Panel::top("toolbar").show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 // A widget that does not fit moves whole to the next row; its text is never
@@ -1878,11 +1917,12 @@ impl LimewaveApp {
                 ui.toggle_value(&mut self.ui.draw, "✏ Draw").on_hover_text(
                     "Draw the waveform with the mouse (each stroke is one undo step)",
                 );
-                record = ui
+                let response = ui
                     .add_enabled(self.input_device_count > 0, egui::Button::new("Record"))
                     .on_hover_text("Record a new sample from an input device")
-                    .on_disabled_hover_text(NO_INPUT)
-                    .clicked();
+                    .on_disabled_hover_text(NO_INPUT);
+                record = response.clicked();
+                record_hovered = response.contains_pointer();
                 ui.separator();
                 // Each button is added on its own, not in an enabled group: a group is laid
                 // out in whatever width is left on the row, and would wrap inside itself.
@@ -1937,6 +1977,11 @@ impl LimewaveApp {
         }
         if let Some(c) = save {
             self.run_save_command(c);
+        }
+        let focused = ui.ctx().input(|i| i.focused);
+        if self.refresh_inputs(record_hovered, focused) {
+            // Shows Record enabled or disabled at once.
+            ui.ctx().request_repaint();
         }
         if record {
             self.open_record_panel();
@@ -2038,7 +2083,7 @@ impl LimewaveApp {
         egui::Modal::new(egui::Id::unique("unsaved_changes")).show(ctx, |ui| {
             ui.heading("Unsaved changes");
             ui.label(format!(
-                "{count} file(s) have edits that have not been saved. Discarding them cannot be undone."
+                "{count} file(s) are not saved. Discarding them cannot be undone."
             ));
             ui.add_space(8.0);
             ui.horizontal(|ui| {
@@ -2080,7 +2125,7 @@ mod tests {
     use crate::audio::record::Feed;
     use crate::audio::record::InputChoice::Pair;
     use crate::render_worker::spawn_render;
-    use egui_kittest::kittest::Queryable;
+    use egui_kittest::kittest::{NodeT, Queryable};
     use limewave_core::document::load_wav_bytes;
     use limewave_core::edit::LoopMode;
     use limewave_core::effects::{FadeCurve, MonoSource, Splice, SpliceKind};
@@ -2995,6 +3040,100 @@ mod tests {
             Some(PendingAction::Close),
             "the unsaved prompt asks"
         );
+    }
+
+    /// An app that counted no input device at startup, though one is there now.
+    fn an_input_device_appears() -> egui_kittest::Harness<'static, LimewaveApp> {
+        let mut app = LimewaveApp::for_test();
+        app.count_inputs = || 1;
+        let mut h = harness_for(app);
+        h.run();
+        assert_eq!(h.state().input_device_count, 0);
+        assert!(h.get_by_label("Record").accesskit_node().is_disabled());
+        h
+    }
+
+    #[test]
+    fn pointing_at_record_counts_the_input_devices_again() {
+        let mut h = an_input_device_appears();
+        h.get_by_label("Record").hover();
+        h.run();
+        assert_eq!(h.state().input_device_count, 1);
+        assert!(!h.get_by_label("Record").accesskit_node().is_disabled());
+    }
+
+    #[test]
+    fn regaining_the_focus_counts_the_input_devices_again() {
+        let mut h = an_input_device_appears();
+        h.input_mut().focused = false;
+        h.run();
+        assert_eq!(h.state().input_device_count, 0, "not while unfocused");
+        h.input_mut().focused = true;
+        h.run();
+        assert_eq!(h.state().input_device_count, 1);
+        assert!(!h.get_by_label("Record").accesskit_node().is_disabled());
+    }
+
+    /// A Record panel whose capture thread has stopped a 1000-frame take by itself (a device
+    /// error), which no frame has polled yet.
+    fn panel_with_a_finished_take() -> (RecordPanelState, Feed) {
+        let (mut panel, mut feed) = RecordPanelState::with_recorder(48_000, 2, Pair(0));
+        let recorder = panel.recorder.as_mut().unwrap();
+        recorder.start();
+        feed.push(&stereo(1000));
+        feed.errors().report("Input device error: gone".into());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while recorder.recording() {
+            assert!(
+                Instant::now() < deadline,
+                "the thread did not stop the take"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        (panel, feed)
+    }
+
+    #[test]
+    fn closing_the_window_keeps_a_take_the_thread_finished() {
+        let (panel, _feed) = panel_with_a_finished_take();
+        let mut app = LimewaveApp::for_test();
+        app.ui.record_panel = Some(panel);
+        assert!(request_window_close(&mut app), "the window stays open");
+        assert!(app.ui.record_panel.is_none(), "the panel closes");
+        assert_eq!(app.files.len(), 1, "the take is kept");
+        let FileEntry::Loaded(s) = &app.files[0] else {
+            panic!("the take is not loaded");
+        };
+        assert_eq!(s.frames(), 1000);
+        assert_eq!(app.ui.message.as_deref(), Some("Input device error: gone"));
+    }
+
+    #[test]
+    fn escape_keeps_a_take_the_thread_finished() {
+        let (panel, _feed) = panel_with_a_finished_take();
+        let mut app = LimewaveApp::for_test();
+        app.ui.record_panel = Some(panel);
+        let mut h = harness_for(app);
+        h.key_press(Key::Escape);
+        h.run();
+        assert!(h.state().ui.record_panel.is_none(), "closed");
+        assert_eq!(h.state().files.len(), 1, "the take is kept");
+    }
+
+    #[test]
+    fn escape_while_recording_does_nothing() {
+        let (mut panel, mut feed) = RecordPanelState::with_recorder(48_000, 2, Pair(0));
+        panel.recorder.as_mut().unwrap().start();
+        feed.push(&stereo(1000));
+        let mut app = LimewaveApp::for_test();
+        app.ui.record_panel = Some(panel);
+        let mut h = harness_for(app);
+        h.run();
+        h.key_press(Key::Escape);
+        h.run();
+        let panel = h.state().ui.record_panel.as_ref().expect("still open");
+        assert!(panel.recorder.as_ref().unwrap().recording());
+        assert!(h.state().files.is_empty());
     }
 
     #[test]

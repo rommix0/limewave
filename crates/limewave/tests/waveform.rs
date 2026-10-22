@@ -796,6 +796,22 @@ fn a_click_in_draw_mode_changes_no_audio() {
 }
 
 #[test]
+fn a_draw_press_outside_every_lane_starts_nothing() {
+    let mut h = looped_harness();
+    draw_on(&mut h);
+    let before = session(&h).edit().clone();
+    // On the time ruler, above the lanes and the marker flags, away from every marker line.
+    let y = waveform_rect(&h).top() + 8.0;
+    let from = pos2(frame_pos(&h, 3000).x, y);
+    let to = pos2(frame_pos(&h, 3600).x, y + 60.0);
+    drag(&mut h, from, to);
+    assert!(changed_frames(&h).is_empty(), "no audio changes");
+    assert_eq!(h.state().ui.selection, None, "no selection");
+    assert_eq!(session(&h).edit(), &before, "no marker moves");
+    assert!(!session(&h).history.is_dirty(), "no history entry");
+}
+
+#[test]
 fn markers_still_drag_in_draw_mode() {
     let mut h = looped_harness();
     draw_on(&mut h);

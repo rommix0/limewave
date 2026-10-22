@@ -217,7 +217,7 @@ struct Capture {
     cap: usize,
     /// Whether a take is in progress.
     active: bool,
-    /// A take the thread stopped by itself, until `poll` takes it.
+    /// A take the thread stopped by itself, until `poll` or `stop` takes it.
     finished: Option<Take>,
     #[cfg(test)]
     paused: bool,
@@ -351,9 +351,14 @@ impl Recorder {
     }
 
     /// Starts a new take: clears the take and the clip lights, then records. Audio fed before
-    /// this is dropped.
+    /// this is dropped. A take the thread finished must be collected (`poll` or `stop`)
+    /// first, or the new take's end would overwrite it.
     pub fn start(&mut self) {
         let mut capture = lock(&self.capture);
+        debug_assert!(
+            capture.finished.is_none(),
+            "start with a finished take not collected"
+        );
         let stale = capture.ring.slots();
         if let Ok(chunk) = capture.ring.read_chunk(stale) {
             chunk.commit_all();
@@ -368,8 +373,9 @@ impl Recorder {
         self.shared.recording.store(true, Ordering::Release);
     }
 
-    /// Stops the take in progress and returns it, or `None` when none is in progress. A take
-    /// the thread already stopped by itself waits for [`Recorder::poll`].
+    /// Stops the take in progress and returns it. With none in progress, returns a take the
+    /// thread stopped by itself and no `poll` has collected yet, so stopping (or closing)
+    /// never loses one; otherwise `None`.
     ///
     /// A pending cap, overflow or device error the thread has not acted on yet is the take's
     /// reason, as in `poll`; such a take is returned even with no frames, so the reason is
@@ -378,7 +384,7 @@ impl Recorder {
         self.shared.recording.store(false, Ordering::Release);
         let mut capture = lock(&self.capture);
         if !capture.active {
-            return None;
+            return capture.finished.take();
         }
         let stopped = capture
             .drain_and_check(&self.shared)
@@ -605,6 +611,28 @@ mod tests {
         assert_eq!(take.stopped.message(), None);
         assert_eq!(take.audio[0], index(0..100));
         assert!(!rec.recording());
+    }
+
+    #[test]
+    fn stop_returns_a_take_the_thread_finished_by_itself() {
+        let (mut rec, mut feed) = Recorder::new(48_000, 2, Pair(0));
+        rec.start();
+        push_blocks(&mut feed, &ramp(0..100), 2);
+        feed.errors().report("gone".into());
+        // No poll: the thread stops the take, then the UI presses Stop or closes.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while rec.recording() {
+            assert!(
+                Instant::now() < deadline,
+                "the thread did not stop the take"
+            );
+            sleep(Duration::from_millis(2));
+        }
+        let take = rec.stop().expect("the finished take");
+        assert_eq!(take.stopped, StopReason::Device("gone".into()));
+        assert_eq!(take.audio[0], index(0..100));
+        assert!(rec.stop().is_none(), "returned once");
+        assert!(rec.poll().is_none(), "returned once");
     }
 
     #[test]

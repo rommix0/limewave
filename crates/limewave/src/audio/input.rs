@@ -1,7 +1,7 @@
 //! Input devices and the stream that feeds a [`Feed`] (the device side of recording).
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{FromSample, I24, SampleFormat, SizedSample, StreamConfig, U24};
+use cpal::{FromSample, I24, SampleFormat, SizedSample, StreamConfig, SupportedStreamConfig, U24};
 
 use super::record::{Feed, InputErrors};
 
@@ -52,47 +52,89 @@ pub fn input_devices() -> Vec<InputDevice> {
     list
 }
 
-/// Opens the named input device at its default config and starts the stream, feeding `feed`.
-/// Any sample format is converted to `f32` in a buffer allocated before the stream starts.
-/// The `Stream` must be kept alive; dropping it stops the capture.
-pub fn open_input(name: &str, feed: Feed) -> Result<cpal::Stream, String> {
+/// How many input devices the host lists, without reading their configs: cheap enough to
+/// ask again whenever Record might become usable.
+pub fn input_device_count() -> usize {
+    cpal::default_host()
+        .input_devices()
+        .map_or(0, Iterator::count)
+}
+
+/// An input device found by name, with the config it opens at: its default input config as
+/// it is now, which may differ from when the devices were listed.
+pub struct PreparedInput {
+    name: String,
+    device: cpal::Device,
+    config: SupportedStreamConfig,
+}
+
+/// Finds the named input device and reads its current default input config.
+pub fn prepare_input(name: &str) -> Result<PreparedInput, String> {
     let host = cpal::default_host();
     let device = host
         .input_devices()
         .map_err(|e| format!("Could not list input devices: {e}"))?
         .find(|d| device_name(d) == name)
         .ok_or_else(|| format!("Input device {name} was not found"))?;
-    let supported = device
+    let config = device
         .default_input_config()
         .map_err(|e| format!("Could not open {name}: {e}"))?;
-    let format = supported.sample_format();
-    let config = supported.config();
-    let errors = feed.errors();
-    let stream = match format {
-        SampleFormat::F32 => build_f32(&device, config, feed, errors),
-        SampleFormat::F64 => build_converted::<f64>(&device, config, feed, errors),
-        SampleFormat::I8 => build_converted::<i8>(&device, config, feed, errors),
-        SampleFormat::I16 => build_converted::<i16>(&device, config, feed, errors),
-        SampleFormat::I24 => build_converted::<I24>(&device, config, feed, errors),
-        SampleFormat::I32 => build_converted::<i32>(&device, config, feed, errors),
-        SampleFormat::I64 => build_converted::<i64>(&device, config, feed, errors),
-        SampleFormat::U8 => build_converted::<u8>(&device, config, feed, errors),
-        SampleFormat::U16 => build_converted::<u16>(&device, config, feed, errors),
-        SampleFormat::U24 => build_converted::<U24>(&device, config, feed, errors),
-        SampleFormat::U32 => build_converted::<u32>(&device, config, feed, errors),
-        SampleFormat::U64 => build_converted::<u64>(&device, config, feed, errors),
-        // DSD and any format added later.
-        other => {
-            return Err(format!(
-                "Could not open {name}: unsupported sample format {other}"
-            ));
-        }
+    if config.channels() == 0 {
+        return Err(format!("Could not open {name}: it has no input channels"));
     }
-    .map_err(|e| format!("Could not open {name}: {e}"))?;
-    stream
-        .play()
-        .map_err(|e| format!("Could not start {name}: {e}"))?;
-    Ok(stream)
+    Ok(PreparedInput {
+        name: name.to_string(),
+        device,
+        config,
+    })
+}
+
+impl PreparedInput {
+    /// The rate the stream opens at, which is the take's.
+    pub fn rate(&self) -> u32 {
+        self.config.sample_rate()
+    }
+
+    /// The device channels the stream delivers.
+    pub fn channels(&self) -> usize {
+        usize::from(self.config.channels())
+    }
+
+    /// Opens the stream at exactly this config and starts it, feeding `feed`, which must be
+    /// built for [`PreparedInput::rate`] and [`PreparedInput::channels`]. Any sample format is
+    /// converted to `f32` in a buffer allocated before the stream starts. The `Stream` must be
+    /// kept alive; dropping it stops the capture.
+    pub fn open(self, feed: Feed) -> Result<cpal::Stream, String> {
+        let (name, device) = (&self.name, &self.device);
+        let format = self.config.sample_format();
+        let config = self.config.config();
+        let errors = feed.errors();
+        let stream = match format {
+            SampleFormat::F32 => build_f32(device, config, feed, errors),
+            SampleFormat::F64 => build_converted::<f64>(device, config, feed, errors),
+            SampleFormat::I8 => build_converted::<i8>(device, config, feed, errors),
+            SampleFormat::I16 => build_converted::<i16>(device, config, feed, errors),
+            SampleFormat::I24 => build_converted::<I24>(device, config, feed, errors),
+            SampleFormat::I32 => build_converted::<i32>(device, config, feed, errors),
+            SampleFormat::I64 => build_converted::<i64>(device, config, feed, errors),
+            SampleFormat::U8 => build_converted::<u8>(device, config, feed, errors),
+            SampleFormat::U16 => build_converted::<u16>(device, config, feed, errors),
+            SampleFormat::U24 => build_converted::<U24>(device, config, feed, errors),
+            SampleFormat::U32 => build_converted::<u32>(device, config, feed, errors),
+            SampleFormat::U64 => build_converted::<u64>(device, config, feed, errors),
+            // DSD and any format added later.
+            other => {
+                return Err(format!(
+                    "Could not open {name}: unsupported sample format {other}"
+                ));
+            }
+        }
+        .map_err(|e| format!("Could not open {name}: {e}"))?;
+        stream
+            .play()
+            .map_err(|e| format!("Could not start {name}: {e}"))?;
+        Ok(stream)
+    }
 }
 
 fn error_callback(errors: InputErrors) -> impl FnMut(cpal::Error) + Send + 'static {

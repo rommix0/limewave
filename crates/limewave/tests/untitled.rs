@@ -141,6 +141,21 @@ fn saving_an_untitled_file_makes_it_an_ordinary_file() {
 }
 
 #[test]
+fn a_picked_name_without_an_extension_gets_wav() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = LimewaveApp::for_test();
+    add(&mut app);
+    let picked = dir.path().join("mine");
+    app.save_picker = Box::new(move |_| Some(picked.clone()));
+    app.save();
+    let s = session(&mut app, 0);
+    assert!(!s.untitled);
+    assert!(s.doc.path.ends_with("mine.wav"));
+    assert!(dir.path().join("mine.wav").exists());
+    assert!(!dir.path().join("mine").exists());
+}
+
+#[test]
 fn a_cancelled_picker_leaves_the_file_untitled() {
     let mut app = LimewaveApp::for_test();
     add(&mut app);

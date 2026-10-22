@@ -8,10 +8,12 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Button, Color32, ComboBox, Role, Sense, Ui, WidgetInfo, vec2};
 
 use crate::app::LimewaveApp;
-use crate::audio::input::{InputDevice, input_devices, open_input};
+use crate::audio::input::{InputDevice, input_devices, prepare_input};
 #[cfg(test)]
 use crate::audio::record::Feed;
-use crate::audio::record::{CAP_SECONDS, InputChoice, Recorder, default_choice, input_choices};
+use crate::audio::record::{
+    CAP_SECONDS, InputChoice, Recorder, Take, default_choice, input_choices,
+};
 use crate::theme::colors;
 use crate::ui::dialog_kit::PLOT_BACKGROUND;
 use crate::ui::new_dialog::BitDepth;
@@ -56,7 +58,8 @@ impl RecordPanelState {
         let devices = input_devices();
         let choice = default_choice(devices.first().map_or(1, |d| d.channels));
         let mut panel = RecordPanelState::closed(devices, choice);
-        panel.reopen();
+        // A new panel has no input yet, so no take.
+        let _ = panel.reopen();
         panel
     }
 
@@ -95,17 +98,35 @@ impl RecordPanelState {
         (panel, feed)
     }
 
-    /// Closes the input, then opens the chosen inputs of the chosen device at its own rate.
-    fn reopen(&mut self) {
+    /// Closes the input, collecting any take it still holds; returns that take.
+    fn close_input(&mut self) -> Option<Take> {
+        let take = self.recorder.as_mut().and_then(Recorder::stop);
         self.stream = None;
         self.recorder = None;
         self.holds.clear();
+        take
+    }
+
+    /// Closes the input, then opens the chosen inputs of the chosen device at the rate and
+    /// channel count it opens at now, which may have changed since the devices were listed.
+    /// Returns any take the old input still held, for the caller to keep.
+    #[must_use]
+    fn reopen(&mut self) -> Option<Take> {
+        let take = self.close_input();
         let Some(device) = self.devices.get(self.device) else {
             self.error = Some(NO_INPUT.into());
-            return;
+            return take;
         };
-        let (recorder, feed) = Recorder::new(device.rate, device.channels, self.choice);
-        match open_input(&device.name, feed) {
+        let input = match prepare_input(&device.name) {
+            Ok(input) => input,
+            Err(e) => {
+                self.error = Some(e);
+                return take;
+            }
+        };
+        self.adopt_format(input.rate(), input.channels());
+        let (recorder, feed) = Recorder::new(input.rate(), input.channels(), self.choice);
+        match input.open(feed) {
             Ok(stream) => {
                 self.stream = Some(stream);
                 self.recorder = Some(recorder);
@@ -113,16 +134,30 @@ impl RecordPanelState {
             }
             Err(e) => self.error = Some(e),
         }
+        take
+    }
+
+    /// The chosen device opens at `rate` with `channels` inputs: shows them, and falls back to
+    /// the device's default inputs when the chosen ones no longer exist.
+    fn adopt_format(&mut self, rate: u32, channels: usize) {
+        if let Some(device) = self.devices.get_mut(self.device) {
+            device.rate = rate;
+            device.channels = channels;
+        }
+        if !input_choices(channels).contains(&self.choice) {
+            self.choice = default_choice(channels);
+        }
     }
 
     /// The device failed during a take: closes the input and shows `text` as the error, so
-    /// Record stays disabled until a device opens again.
-    pub(crate) fn device_failed(&mut self, text: String) {
-        self.stream = None;
-        self.recorder = None;
-        self.holds.clear();
+    /// Record stays disabled until a device opens again. Returns any take the input still
+    /// held, for the caller to keep.
+    #[must_use]
+    pub(crate) fn device_failed(&mut self, text: String) -> Option<Take> {
+        let take = self.close_input();
         self.error = Some(text);
         self.notice = None;
+        take
     }
 
     fn recording(&self) -> bool {
@@ -179,18 +214,20 @@ pub fn record_panel(ctx: &egui::Context, app: &mut LimewaveApp) {
         return;
     };
     let mut takes = Vec::new();
-    // Before anything below can start a take: a new one would overwrite a finished one.
-    takes.extend(p.recorder.as_mut().and_then(Recorder::poll));
+    // Read before the poll: once a take is seen stopped, the poll collects it, so Record (shown
+    // only then) never starts a new take over a finished one.
     let recording = p.recording();
+    takes.extend(p.recorder.as_mut().and_then(Recorder::poll));
     if !recording {
         p.confirm_close = false;
     }
     let mut close = false;
+    let mut discard = false;
     let modal = egui::Modal::new(egui::Id::unique("record_panel")).show(ctx, |ui| {
         ui.set_width(380.0);
         ui.heading("Record");
         ui.add_space(4.0);
-        ui.add_enabled_ui(!recording, |ui| choosers(ui, &mut p));
+        ui.add_enabled_ui(!recording, |ui| takes.extend(choosers(ui, &mut p)));
         ui.horizontal(|ui| {
             let label = ui.label("Bit depth");
             ComboBox::from_id_salt("record_bits")
@@ -225,12 +262,12 @@ pub fn record_panel(ctx: &egui::Context, app: &mut LimewaveApp) {
         if p.confirm_close {
             ui.label("Stop and keep the take?");
             ui.horizontal(|ui| {
-                if ui.button("Keep").clicked() {
-                    takes.extend(p.recorder.as_mut().and_then(Recorder::stop));
+                // Closing keeps the take (below).
+                close |= ui.button("Keep").clicked();
+                if ui.button("Discard").clicked() {
+                    discard = true;
                     close = true;
                 }
-                // Closing drops the recorder and the take in progress with it.
-                close |= ui.button("Discard").clicked();
                 if ui.button("Cancel").clicked() {
                     p.confirm_close = false;
                 }
@@ -259,23 +296,30 @@ pub fn record_panel(ctx: &egui::Context, app: &mut LimewaveApp) {
             });
         }
     });
-    if modal.should_close() && !p.recording() {
+    // Escape or a click outside does nothing while a take was recording at the frame's start.
+    if modal.should_close() && !recording && !p.recording() {
         close = true;
     }
     ctx.request_repaint_after(METER_REPAINT);
     let bits = p.bits;
-    if !close {
+    if close {
+        // Every way of closing but Discard keeps the take in progress, or one the capture
+        // thread stopped by itself since the poll above. Closing the input drops the rest.
+        let take = p.close_input();
+        if !discard {
+            takes.extend(take);
+        }
+    } else {
         app.ui.record_panel = Some(p);
     }
-    // Otherwise `p` drops here, closing the input.
     for take in takes {
         app.add_recording(take, bits);
     }
 }
 
 /// The Device and Input choosers. Changing either reopens the input; while an error shows,
-/// choosing the current one again retries it.
-fn choosers(ui: &mut Ui, p: &mut RecordPanelState) {
+/// choosing the current one again retries it. Returns any take the old input still held.
+fn choosers(ui: &mut Ui, p: &mut RecordPanelState) -> Option<Take> {
     let mut device = None;
     ui.horizontal(|ui| {
         let label = ui.label("Device");
@@ -315,10 +359,12 @@ fn choosers(ui: &mut Ui, p: &mut RecordPanelState) {
     if let Some(i) = device.filter(|&i| i != p.device || retry) {
         p.device = i;
         p.choice = default_choice(p.devices[i].channels);
-        p.reopen();
+        p.reopen()
     } else if let Some(c) = choice.filter(|&c| c != p.choice || retry) {
         p.choice = c;
-        p.reopen();
+        p.reopen()
+    } else {
+        None
     }
 }
 
@@ -369,7 +415,7 @@ fn meters(ui: &mut Ui, p: &mut RecordPanelState) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audio::record::InputChoice::Pair;
+    use crate::audio::record::InputChoice::{Mono, Pair};
 
     #[test]
     fn times_show_as_minutes_and_seconds() {
@@ -408,9 +454,62 @@ mod tests {
         let (mut p, _feed) = RecordPanelState::with_recorder(48_000, 2, Pair(0));
         assert!(p.can_record());
         p.devices.clear();
-        p.reopen();
+        assert!(p.reopen().is_none());
         assert_eq!(p.error.as_deref(), Some(NO_INPUT));
         assert!(p.recorder.is_none());
         assert!(!p.can_record());
+    }
+
+    /// A panel whose capture thread stopped a 100-frame take by itself, not yet polled.
+    fn panel_with_a_finished_take() -> RecordPanelState {
+        let (mut p, mut feed) = RecordPanelState::with_recorder(48_000, 2, Pair(0));
+        let recorder = p.recorder.as_mut().unwrap();
+        recorder.start();
+        feed.push(&[0.25; 200]);
+        feed.errors().report("gone".into());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while recorder.recording() {
+            assert!(
+                Instant::now() < deadline,
+                "the thread did not stop the take"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        p
+    }
+
+    #[test]
+    fn reopening_hands_back_a_take_the_thread_finished() {
+        let mut p = panel_with_a_finished_take();
+        // No device, so nothing opens again: only the old input's take matters.
+        p.devices.clear();
+        let take = p.reopen().expect("the finished take");
+        assert_eq!(take.frames(), 100);
+        assert!(p.recorder.is_none());
+    }
+
+    #[test]
+    fn a_failed_device_hands_back_a_take_the_thread_finished() {
+        let mut p = panel_with_a_finished_take();
+        let take = p.device_failed("gone".into()).expect("the finished take");
+        assert_eq!(take.frames(), 100);
+        assert_eq!(p.error.as_deref(), Some("gone"));
+        assert!(p.recorder.is_none() && p.stream.is_none());
+    }
+
+    #[test]
+    fn reopening_adopts_the_format_the_device_opens_at() {
+        let (mut p, _feed) = RecordPanelState::with_recorder(48_000, 2, Pair(0));
+        p.adopt_format(44_100, 1);
+        assert_eq!((p.devices[0].rate, p.devices[0].channels), (44_100, 1));
+        assert_eq!(p.rate(), Some(44_100), "the shown rate is the take's");
+        assert_eq!(p.choice, Mono(0), "the pair no longer exists");
+
+        p.choice = Mono(0);
+        p.adopt_format(96_000, 4);
+        assert_eq!(p.choice, Mono(0), "a choice that still fits is kept");
+        p.choice = Pair(2);
+        p.adopt_format(96_000, 2);
+        assert_eq!(p.choice, Pair(0), "falls back to the default inputs");
     }
 }
