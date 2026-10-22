@@ -2,15 +2,31 @@
 //! sit in the app's file list.
 
 use std::collections::HashMap;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use limewave_core::edit::{EditState, History};
 use limewave_core::save::Destination;
 use limewave_core::sfz::bind::{self, Binding};
-use limewave_core::sfz::model::Instrument;
+use limewave_core::sfz::model::{Instrument, Keycenter, SfzLoopMode};
 use limewave_core::sfz::paths::same_file_key;
 
-use crate::app::{FileEntry, PendingAction};
+use crate::app::{FileEntry, PendingAction, Session};
+use crate::audio::voice::{InstrumentPlay, Playback, RegionPlay, ampeg_to_adsr};
+
+/// The first source given to instrument regions. Session sources count up from 1 and never
+/// get this far, so a region's voice is never taken for a session's.
+const REGION_SOURCES: u64 = 1 << 40;
+/// Sources each opened instrument sets aside for its regions.
+const REGION_SOURCE_BLOCK: u64 = 1 << 20;
+/// The next block of region sources.
+static NEXT_REGION_SOURCES: AtomicU64 = AtomicU64::new(REGION_SOURCES);
+
+/// Whether `source` belongs to an instrument region rather than a session.
+pub fn is_region_source(source: u64) -> bool {
+    source >= REGION_SOURCES
+}
 
 /// One open instrument (spec 4.5). Its samples are the app's open files.
 pub struct InstrumentState {
@@ -37,6 +53,13 @@ pub struct InstrumentState {
     /// Parallel to `binding.samples`: each loaded WAV's own `initial_edit`, `None` while it
     /// loads or if it failed. Lets [`InstrumentState::edit`] rebind without the file list.
     wavs: Vec<Option<EditState>>,
+    /// The instrument as a key map drag shows it, not yet in the history.
+    pub preview: Option<Instrument>,
+    /// Counts preview changes, so the audio follows a drag.
+    preview_changes: u64,
+    /// Region `n` plays under source `region_sources + n`, the same while the instrument is
+    /// edited; also the source of its [`InstrumentPlay`].
+    region_sources: u64,
 }
 
 impl InstrumentState {
@@ -57,11 +80,101 @@ impl InstrumentState {
             keys_only: false,
             unassigned: None,
             wavs: vec![None; n],
+            preview: None,
+            preview_changes: 0,
+            region_sources: NEXT_REGION_SOURCES.fetch_add(REGION_SOURCE_BLOCK, Ordering::Relaxed),
         }
     }
 
     pub fn inst(&self) -> &Instrument {
         self.history.current()
+    }
+
+    /// What the key map shows and the engine plays: the drag preview if there is one, else the
+    /// current instrument.
+    pub fn shown(&self) -> &Instrument {
+        self.preview.as_ref().unwrap_or_else(|| self.inst())
+    }
+
+    /// Applies `f` to the shown instrument as the drag preview, outside the history.
+    pub fn set_preview(&mut self, f: impl FnOnce(&mut Instrument)) {
+        let mut next = self.shown().clone();
+        f(&mut next);
+        self.preview = Some(next);
+        self.preview_changes += 1;
+    }
+
+    /// Records the drag preview as one undo step, if there is one.
+    pub fn commit_preview(&mut self) {
+        if let Some(preview) = self.preview.take() {
+            self.preview_changes += 1;
+            self.edit(|i| *i = preview);
+        }
+    }
+
+    /// The region whose voices play under `source`.
+    pub fn region_of_source(&self, source: u64) -> Option<usize> {
+        let n = usize::try_from(source.checked_sub(self.region_sources)?).ok()?;
+        (n < self.binding.region_sample.len()).then_some(n)
+    }
+
+    /// Changes whenever [`play_map`] would: with the instrument, its preview, or the edit,
+    /// source or loading of one of its samples.
+    pub fn play_key(&self, files: &[FileEntry]) -> u64 {
+        let mut h = DefaultHasher::new();
+        (
+            self.history.stamp(),
+            self.preview_changes,
+            self.region_sources,
+        )
+            .hash(&mut h);
+        self.binding.region_sample.len().hash(&mut h);
+        for &file in &self.sample_file {
+            match file.and_then(|i| files.get(i)) {
+                Some(FileEntry::Loaded(s)) => (s.source, s.history.stamp()).hash(&mut h),
+                _ => 0u64.hash(&mut h),
+            }
+        }
+        h.finish()
+    }
+
+    /// The loaded session of `region`'s sample, and the edit `region` plays it with: the
+    /// sample's current edit when the region follows it, else the region's own tuning and loop
+    /// over the WAV's (spec 4.3).
+    fn region_sound<'a>(
+        &self,
+        inst: &Instrument,
+        files: &'a [FileEntry],
+        region: usize,
+    ) -> Option<(usize, &'a Session, EditState)> {
+        let sample = (*self.binding.region_sample.get(region)?)?;
+        let Some(FileEntry::Loaded(session)) = files.get((*self.sample_file.get(sample)?)?) else {
+            return None;
+        };
+        let b = &self.binding.samples[sample];
+        let follows = b
+            .regions
+            .iter()
+            .position(|&r| r == region)
+            .is_none_or(|i| b.follows[i]);
+        let edit = if follows {
+            session.edit().clone()
+        } else {
+            bind::region_edit(inst, region, &session.doc.initial_edit())
+        };
+        Some((sample, session, edit))
+    }
+
+    /// `region`'s root key: its sample's (or its own, spec 4.3), else its `pitch_keycenter`
+    /// while the sample is not loaded, else 60.
+    pub fn region_root(&self, files: &[FileEntry], region: usize) -> u8 {
+        match self.region_sound(self.inst(), files, region) {
+            Some((_, _, edit)) => edit.root,
+            None => match self.inst().region_info(region).keycenter {
+                Keycenter::Note(n) => n,
+                Keycenter::Sample => 60,
+            },
+        }
     }
 
     /// Records `f` applied to the current instrument as one undo step, then binds the result
@@ -132,6 +245,80 @@ impl InstrumentState {
     pub fn region_file(&self, region: usize) -> Option<usize> {
         let sample = (*self.binding.region_sample.get(region)?)?;
         *self.sample_file.get(sample)?
+    }
+}
+
+/// The regions of the shown instrument as the engine plays them (spec 6): each with its
+/// effective ranges, level, envelope and playback mode, its sample's audio (shared by every
+/// region of that sample) from `offset` to `end`, and the tuning and loop of the sample, or its
+/// own (spec 4.3), with `transpose` folded into the root. Regions whose sample is missing or
+/// not loaded, or whose `trigger` isn't `attack`, are left out (spec 6.1).
+pub fn play_map(st: &InstrumentState, files: &[FileEntry]) -> InstrumentPlay {
+    let inst = st.shown();
+    let mut buffers = vec![None; st.binding.samples.len()];
+    let mut regions = Vec::new();
+    for region in 0..inst.regions().len() {
+        let Some((sample, session, edit)) = st.region_sound(inst, files, region) else {
+            continue;
+        };
+        let info = inst.region_info(region);
+        if !info.attack_trigger {
+            continue;
+        }
+        let mut buffer = buffers[sample]
+            .get_or_insert_with(|| session.play_buffer())
+            .clone();
+        let current = session.edit();
+        let last = buffer.audio.first().map_or(0, Vec::len).saturating_sub(1);
+        buffer.end = info.end.unwrap_or(current.end).min(current.end);
+        buffer.start = info.offset.max(current.start).min(buffer.end);
+        buffer.loop_mode = edit.loop_mode;
+        buffer.loop_end = edit.loop_end.min(last);
+        buffer.loop_start = edit.loop_start.min(buffer.loop_end);
+        buffer.root = (i32::from(edit.root) - info.transpose).clamp(0, 127) as u8;
+        buffer.cents = edit.cents;
+        buffer.source = st.region_sources + region as u64;
+        regions.push(RegionPlay {
+            buffer,
+            lokey: info.lokey,
+            hikey: info.hikey,
+            lovel: info.lovel,
+            hivel: info.hivel,
+            gain: 10f32.powf(info.volume / 20.0),
+            veltrack: info.amp_veltrack / 100.0,
+            playback: match info.loop_mode {
+                Some(SfzLoopMode::OneShot) => Playback::OneShot,
+                Some(SfzLoopMode::Sustain) => Playback::Sustain,
+                _ => Playback::Normal,
+            },
+            adsr: ampeg_to_adsr(&info.ampeg),
+        });
+    }
+    InstrumentPlay {
+        regions,
+        source: st.region_sources,
+    }
+}
+
+/// Sets `region`'s key range, writing only the ends that change.
+pub fn set_keys(inst: &mut Instrument, region: usize, lo: u8, hi: u8) {
+    let info = inst.region_info(region);
+    if info.lokey != lo {
+        inst.set(region, "lokey", &lo.to_string());
+    }
+    if info.hikey != hi {
+        inst.set(region, "hikey", &hi.to_string());
+    }
+}
+
+/// Sets `region`'s velocity range, writing only the ends that change.
+pub fn set_velocities(inst: &mut Instrument, region: usize, lo: u8, hi: u8) {
+    let info = inst.region_info(region);
+    if info.lovel != lo {
+        inst.set(region, "lovel", &lo.to_string());
+    }
+    if info.hivel != hi {
+        inst.set(region, "hivel", &hi.to_string());
     }
 }
 

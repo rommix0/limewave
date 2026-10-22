@@ -6,6 +6,7 @@ pub mod effects;
 pub mod filelist;
 pub mod inspector;
 pub mod keyboard;
+pub mod keymap;
 pub mod new_dialog;
 pub mod overview;
 pub mod record_panel;

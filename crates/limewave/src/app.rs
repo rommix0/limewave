@@ -22,6 +22,7 @@ use limewave_core::notes::note_name;
 use limewave_core::render::render;
 use limewave_core::save::{Destination, default_folder};
 use limewave_core::sfz::bind;
+use limewave_core::sfz::map::{auto_map, fill_gaps};
 use limewave_core::sfz::model::Instrument;
 use limewave_core::sfz::parse::{decode_text, parse};
 use limewave_core::sfz::paths::{same_file_key, sample_path};
@@ -35,7 +36,7 @@ use crate::audio::midi::{MidiConnection, connect_midi, decode_last_note, list_mi
 use crate::audio::record::{Recorder, StopReason, Take};
 use crate::audio::voice::{Adsr, PlayBuffer, play_buffer};
 use crate::folder;
-use crate::instrument::InstrumentState;
+use crate::instrument::{InstrumentState, is_region_source, play_map, set_keys, set_velocities};
 use crate::render_worker::{RenderKey, RenderSlot};
 use crate::theme::{self, colors};
 use crate::ui::coords::ViewTransform;
@@ -43,6 +44,7 @@ use crate::ui::effects::{EffectDialog, EffectParams, edit_menu, effect_dialog, e
 use crate::ui::filelist::{self, FileListClick};
 use crate::ui::inspector::{InspectorAction, inspector};
 use crate::ui::keyboard::{KeyEvent, keyboard_strip};
+use crate::ui::keymap::{KeyMapAction, key_map};
 use crate::ui::new_dialog::{BitDepth, NewDialogState, new_dialog};
 use crate::ui::overview::overview;
 use crate::ui::record_panel::{NO_INPUT, RecordPanelState, record_panel};
@@ -67,6 +69,8 @@ pub(crate) const SELECT_ALL_SHORTCUT: KeyboardShortcut =
 
 /// Default height of the seam panel: its controls plus a plot of about 200 px.
 const SEAM_PANEL_HEIGHT: f32 = 300.0;
+/// Default height of the key map panel (spec 5.2).
+const KEYMAP_PANEL_HEIGHT: f32 = 160.0;
 
 type LoadResult = (usize, Result<WavDocument, String>);
 
@@ -752,6 +756,8 @@ pub struct LimewaveApp {
     sent_envelope: Option<Adsr>,
     /// The "Release plays after loop end" setting last sent to the engine.
     sent_release_after_loop: Option<bool>,
+    /// The [`InstrumentState::play_key`] of the regions last sent to the engine.
+    sent_instrument: Option<u64>,
     /// True while the engine has been silenced because no loaded file is selected.
     silenced: bool,
     /// Keeps the play cursors moving; see [`CursorWatch`].
@@ -838,6 +844,7 @@ impl LimewaveApp {
             midi_error: None,
             sent_envelope: None,
             sent_release_after_loop: None,
+            sent_instrument: None,
             silenced: false,
             cursor_watch: CursorWatch::default(),
             midi_seen: None,
@@ -945,6 +952,7 @@ impl LimewaveApp {
     /// Forgets the open instrument and takes it out of the audio engine.
     fn drop_instrument(&mut self) {
         self.instrument = None;
+        self.sent_instrument = None;
         if let Some(engine) = &self.engine {
             engine.set_instrument(None);
         }
@@ -1087,6 +1095,8 @@ impl LimewaveApp {
         let Some(st) = &mut self.instrument else {
             return;
         };
+        // A drag preview was made from the state being left.
+        st.preview = None;
         if redo {
             st.history.redo();
         } else {
@@ -2172,14 +2182,19 @@ impl LimewaveApp {
         }
         self.inspector_panel(ui);
         self.sync_envelope();
-        self.keyboard_panel(ui);
         let cursors = self.cursors();
+        self.keyboard_panel(ui, &cursors);
+        self.sync_instrument();
         let now = Instant::now();
         self.watch_midi(now);
         // Without an engine no cursor ever shows, so there is nothing to wait for.
         if self.engine.is_some() && self.cursor_watch.keep_repainting(!cursors.is_empty(), now) {
             ctx.request_repaint();
         }
+        let cursors: Vec<Cursor> = cursors
+            .into_iter()
+            .filter(|c| self.cursor_shows(c))
+            .collect();
         egui::CentralPanel::default().show(ui, |ui| self.central(ui, &cursors));
         self.unsaved_prompt(&ctx);
         new_dialog(&ctx, self);
@@ -2251,7 +2266,12 @@ impl LimewaveApp {
         }
     }
 
-    fn keyboard_panel(&mut self, ui: &mut egui::Ui) {
+    /// The key map while an instrument is open, else the plain keyboard strip.
+    fn keyboard_panel(&mut self, ui: &mut egui::Ui, cursors: &[Cursor]) {
+        if self.instrument.is_some() {
+            self.keymap_panel(ui, cursors);
+            return;
+        }
         let root = self.selected_session().map_or(60, |s| s.shown_edit().root);
         let live = self.engine.is_some() && self.ui.audition;
         let mut key = None;
@@ -2271,12 +2291,153 @@ impl LimewaveApp {
                     key = keyboard_strip(ui, root, &self.ui.held, live);
                 });
             });
-        match key {
-            Some(KeyEvent::Press(note)) => self.note_on(note),
-            Some(KeyEvent::Release(note)) => self.note_off(note),
-            Some(KeyEvent::SetRoot(note)) => self.set_root(note),
-            None => {}
+        if let Some(key) = key {
+            self.key_event(key);
         }
+    }
+
+    /// A keyboard strip event. A right-dragged range sets the selected region's keys, so
+    /// without an instrument it does nothing.
+    fn key_event(&mut self, key: KeyEvent) {
+        match key {
+            KeyEvent::Press(note) => self.note_on(note),
+            KeyEvent::Release(note) => self.note_off(note),
+            KeyEvent::SetRoot(note) => self.set_root(note),
+            KeyEvent::SetRange(lo, hi) => {
+                if let Some(st) = &mut self.instrument
+                    && let Some(region) = st.selected_region
+                {
+                    st.edit(|i| set_keys(i, region, lo, hi));
+                }
+            }
+        }
+    }
+
+    /// The key map (spec 5.2) in the bottom panel, with the regions sounding now lit.
+    fn keymap_panel(&mut self, ui: &mut egui::Ui, cursors: &[Cursor]) {
+        let Some(st) = &self.instrument else {
+            return;
+        };
+        let live = self.engine.is_some() && self.ui.audition;
+        let sounding: BTreeSet<usize> = cursors
+            .iter()
+            .filter_map(|c| st.region_of_source(c.source))
+            .collect();
+        let mut velocity = self.ui.velocity;
+        let mut keys_only = st.keys_only;
+        let mut actions = Vec::new();
+        egui::Panel::bottom("keymap")
+            .resizable(true)
+            .default_size(KEYMAP_PANEL_HEIGHT)
+            .size_range(110.0..=480.0)
+            .show(ui, |ui| {
+                actions = key_map(
+                    ui,
+                    st,
+                    &self.files,
+                    &sounding,
+                    &self.ui.held,
+                    live,
+                    &mut velocity,
+                    &mut keys_only,
+                );
+            });
+        self.ui.velocity = velocity;
+        if let Some(st) = &mut self.instrument {
+            st.keys_only = keys_only;
+        }
+        for action in actions {
+            self.keymap_action(action);
+        }
+    }
+
+    fn keymap_action(&mut self, action: KeyMapAction) {
+        match action {
+            KeyMapAction::Select(region) => self.select_region(region),
+            KeyMapAction::Key(key) => self.key_event(key),
+            KeyMapAction::AutoMap => self.map_keys(false),
+            KeyMapAction::FillGaps => self.map_keys(true),
+            KeyMapAction::SetKeys(region, lo, hi) => {
+                if let Some(st) = &mut self.instrument {
+                    st.set_preview(|i| set_keys(i, region, lo, hi));
+                }
+            }
+            KeyMapAction::SetVel(region, lo, hi) => {
+                if let Some(st) = &mut self.instrument {
+                    st.set_preview(|i| set_velocities(i, region, lo, hi));
+                }
+            }
+            KeyMapAction::Commit => {
+                if let Some(st) = &mut self.instrument {
+                    st.commit_preview();
+                }
+            }
+        }
+    }
+
+    /// Auto-map from root keys, or Fill gaps with `fill` (spec 5.5), over the selected
+    /// region's group (every region when the instrument has no groups) as one undo step.
+    fn map_keys(&mut self, fill: bool) {
+        let Some(st) = &self.instrument else {
+            return;
+        };
+        let inst = st.inst();
+        let group = match st.selected_region {
+            Some(region) => inst.group_of(region),
+            None if inst.groups().is_empty() => None,
+            None => return,
+        };
+        let members: Vec<usize> = (0..inst.regions().len())
+            .filter(|&r| inst.group_of(r) == group)
+            .collect();
+        let ranges = if fill {
+            let now: Vec<(u8, u8)> = members
+                .iter()
+                .map(|&r| {
+                    let info = inst.region_info(r);
+                    (info.lokey, info.hikey)
+                })
+                .collect();
+            fill_gaps(&now)
+        } else {
+            let roots: Vec<u8> = members
+                .iter()
+                .map(|&r| st.region_root(&self.files, r))
+                .collect();
+            auto_map(&roots)
+        };
+        if let Some(st) = &mut self.instrument {
+            st.edit(|i| {
+                for (&region, &(lo, hi)) in members.iter().zip(&ranges) {
+                    set_keys(i, region, lo, hi);
+                }
+            });
+        }
+    }
+
+    /// Hands the engine the instrument's regions whenever the instrument or one of its samples
+    /// changed since they were last sent.
+    fn sync_instrument(&mut self) {
+        let (Some(st), Some(engine)) = (&self.instrument, &self.engine) else {
+            return;
+        };
+        let key = st.play_key(&self.files);
+        if self.sent_instrument != Some(key) {
+            engine.set_instrument(Some(play_map(st, &self.files)));
+            self.sent_instrument = Some(key);
+        }
+    }
+
+    /// Whether the waveform draws cursor `c`. A region's voice reads its own sample, so it
+    /// shows only on that sample; every other voice shows as before.
+    fn cursor_shows(&self, c: &Cursor) -> bool {
+        if !is_region_source(c.source) {
+            return true;
+        }
+        self.instrument
+            .as_ref()
+            .and_then(|st| st.region_file(st.region_of_source(c.source)?))
+            .is_some_and(|file| Some(file) == self.selected)
     }
 
     fn toolbar(&mut self, ui: &mut egui::Ui) {
@@ -3821,6 +3982,61 @@ mod tests {
             app.release_all();
             out.render(48_000);
         }
+    }
+
+    #[test]
+    fn notes_play_the_instrument_map_which_follows_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        let wav = dir.path().join("short.wav");
+        let bytes = wav_bytes(
+            &[sine(220.0, 44100, 1000, 0.5)],
+            44100,
+            SampleFormat::Int { bits: 16 },
+            Vec::new(),
+        );
+        std::fs::write(&wav, bytes).unwrap();
+        let text = "<region> sample=short.wav hikey=59\n<region> sample=short.wav lokey=60\n";
+        let (engine, mut out) = crate::audio::engine::headless(48_000);
+        let mut app = LimewaveApp::build(egui::Context::default(), Some(engine), None);
+        app.files = vec![FileEntry::Loaded(Box::new(Session::new(
+            load_wav(&wav).unwrap(),
+        )))];
+        let inst = Instrument::new(parse(text).unwrap());
+        app.instrument = Some(InstrumentState::new(dir.path().join("i.sfz"), inst, None));
+        app.instrument.as_mut().unwrap().rebind(&app.files);
+        app.select_region(1);
+        app.sync_instrument();
+
+        app.note_on(64);
+        out.render(64);
+        let st = app.instrument.as_ref().unwrap();
+        let voices = out.voice_sources();
+        assert_eq!(voices.len(), 1);
+        assert_eq!(st.region_of_source(voices[0]), Some(1), "region 1 sounds");
+        let cursors = app.cursors();
+        assert_eq!(cursors.len(), 1);
+        assert!(app.cursor_shows(&cursors[0]), "on its own sample");
+        app.selected = None;
+        assert!(!app.cursor_shows(&cursors[0]), "not on another");
+        app.select_region(1);
+        out.render(48_000);
+
+        // Narrowing region 1 is heard at once: key 72 is now outside every region.
+        let st = app.instrument.as_mut().unwrap();
+        st.edit(|i| set_keys(i, 1, 60, 70));
+        app.sync_instrument();
+        app.note_on(72);
+        out.render(64);
+        assert!(out.voice_sources().is_empty(), "no region plays 72");
+        app.release_all();
+
+        // Closing the instrument plays the sample again.
+        app.drop_instrument();
+        app.select(0);
+        app.note_on(72);
+        out.render(64);
+        let session = app.selected_session().unwrap().source;
+        assert_eq!(out.voice_sources(), [session]);
     }
 
     #[test]

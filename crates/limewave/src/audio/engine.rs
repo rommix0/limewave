@@ -68,24 +68,27 @@ pub enum Command {
     },
 }
 
-/// Where one sounding voice is: its read position in file frames and its envelope level.
+/// Where one sounding voice is: its read position in file frames, its envelope level and the
+/// source it plays ([`PlayBuffer::source`]), which tells whose frames those are.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Cursor {
     pub frame: f64,
     pub level: f32,
+    pub source: u64,
 }
 
 /// The voices' positions, published by the audio thread for the UI to draw as cursors.
 ///
-/// One slot per voice: the `f64` bits of the frame and the `f32` bits of the level, where a
-/// level of 0 marks an empty slot. The audio thread writes every slot once per callback with
-/// plain atomic stores (no allocation, no locks). The frame is stored `Relaxed` and the level
-/// with `Release`; an empty slot stores only its level, keeping its last frame.
-/// [`Cursors::read`] loads the level with `Acquire` before the frame, so a cursor never pairs
-/// a new level with an older frame. Slots are independent: a read may mix slots from two
+/// One slot per voice: the `f64` bits of the frame, the source and the `f32` bits of the level,
+/// where a level of 0 marks an empty slot. The audio thread writes every slot once per callback
+/// with plain atomic stores (no allocation, no locks). The frame and source are stored
+/// `Relaxed` and the level with `Release`; an empty slot stores only its level, keeping its
+/// last frame and source. [`Cursors::read`] loads the level with `Acquire` before the frame
+/// and source, so a cursor never pairs a new level with an older frame or source. Slots are independent: a read may mix slots from two
 /// consecutive callbacks, which at most moves one cursor by a few milliseconds.
 pub struct Cursors {
     frames: [AtomicU64; MAX_VOICES],
+    sources: [AtomicU64; MAX_VOICES],
     levels: [AtomicU32; MAX_VOICES],
 }
 
@@ -93,6 +96,7 @@ impl Cursors {
     pub fn new() -> Cursors {
         Cursors {
             frames: [const { AtomicU64::new(0) }; MAX_VOICES],
+            sources: [const { AtomicU64::new(0) }; MAX_VOICES],
             levels: [const { AtomicU32::new(0) }; MAX_VOICES],
         }
     }
@@ -102,11 +106,13 @@ impl Cursors {
         self.levels
             .iter()
             .zip(&self.frames)
-            .filter_map(|(level, frame)| {
+            .zip(&self.sources)
+            .filter_map(|((level, frame), source)| {
                 let level = f32::from_bits(level.load(Ordering::Acquire));
                 (level > 0.0).then(|| Cursor {
                     frame: f64::from_bits(frame.load(Ordering::Relaxed)),
                     level,
+                    source: source.load(Ordering::Relaxed),
                 })
             })
             .collect()
@@ -119,6 +125,7 @@ impl Cursors {
             // not then load a frame of 0 and draw a cursor there.
             let level = voice.as_ref().map_or(0.0, |v| {
                 self.frames[i].store(v.position().to_bits(), Ordering::Relaxed);
+                self.sources[i].store(v.source(), Ordering::Relaxed);
                 v.level()
             });
             self.levels[i].store(level.to_bits(), Ordering::Release);
@@ -1330,6 +1337,7 @@ mod tests {
         assert_eq!(got.len(), 1, "{got:?}");
         assert!((got[0].frame - 480.0).abs() <= 1.0, "{}", got[0].frame);
         assert_eq!(got[0].level, 1.0);
+        assert_eq!(got[0].source, b.source);
     }
 
     #[test]

@@ -3,12 +3,16 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use eframe::egui::{Event, Modifiers, PointerButton, Pos2, Rect};
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
 use limewave::app::{FileEntry, LimewaveApp, PendingAction};
-use limewave::instrument::InstrumentState;
+use limewave::audio::voice::Playback;
+use limewave::instrument::{InstrumentState, play_map};
+use limewave::ui::keyboard::key_rect_in;
+use limewave::ui::keymap::box_rect;
 use limewave::ui::regions::{RegionListAction, unassigned_wavs, unsaved_regions};
-use limewave_core::edit::EditState;
+use limewave_core::edit::{EditState, LoopMode};
 use limewave_core::riff::Chunk;
 use limewave_core::sfz::Keycenter;
 use limewave_core::smpl::Smpl;
@@ -749,4 +753,263 @@ fn unassigned_count_follows_add_and_undo() {
     h.state_mut().undo();
     h.run();
     h.get_by_label("Unassigned WAVs (2)");
+}
+
+/// The key map's box area on screen.
+fn map_area(h: &Harness<'static, LimewaveApp>) -> Rect {
+    h.get_by_label("Key map").rect()
+}
+
+fn press(h: &mut Harness<'static, LimewaveApp>, at: Pos2, button: PointerButton, pressed: bool) {
+    h.event(Event::PointerButton {
+        pos: at,
+        button,
+        pressed,
+        modifiers: Modifiers::NONE,
+    });
+    h.step();
+}
+
+fn click_at(h: &mut Harness<'static, LimewaveApp>, at: Pos2) {
+    h.hover_at(at);
+    h.step();
+    press(h, at, PointerButton::Primary, true);
+    press(h, at, PointerButton::Primary, false);
+    h.run();
+}
+
+fn drag_with(h: &mut Harness<'static, LimewaveApp>, button: PointerButton, from: Pos2, to: Pos2) {
+    h.hover_at(from);
+    h.step();
+    press(h, from, button, true);
+    for i in 1..=4 {
+        h.hover_at(from + (to - from) * (i as f32 / 4.0));
+        h.step();
+    }
+    press(h, to, button, false);
+    h.run();
+}
+
+fn keys(st: &InstrumentState, region: usize) -> (u8, u8) {
+    let info = st.inst().region_info(region);
+    (info.lokey, info.hikey)
+}
+
+#[test]
+fn clicking_a_box_selects_its_region() {
+    let (_dir, mut h) = open_text(
+        "<group> <region> sample=a.wav pitch_keycenter=60 lokey=0 hikey=62\n\
+         <region> sample=b.wav pitch_keycenter=64 lokey=63 hikey=127\n",
+    );
+    h.run();
+    assert_eq!(st(&h).selected_region, Some(0));
+    let b = box_rect(map_area(&h), false, 0, 1, 63, 127, 1, 127);
+    click_at(&mut h, b.center());
+    assert_eq!(st(&h).selected_region, Some(1));
+    assert_eq!(shown(h.state()), "b.wav");
+    let a = box_rect(map_area(&h), false, 0, 1, 0, 62, 1, 127);
+    click_at(&mut h, a.center());
+    assert_eq!(st(&h).selected_region, Some(0));
+    assert_selection_valid(h.state());
+    assert!(!st(&h).history.is_dirty(), "selecting is not an edit");
+}
+
+#[test]
+fn clicking_again_where_boxes_overlap_cycles_through_them() {
+    let (_dir, mut h) = open_text(
+        "<group> <region> sample=a.wav lokey=40 hikey=80\n\
+         <region> sample=b.wav lokey=50 hikey=90\n",
+    );
+    h.run();
+    let at = box_rect(map_area(&h), false, 0, 1, 60, 70, 1, 127).center();
+    click_at(&mut h, at);
+    assert_eq!(
+        st(&h).selected_region,
+        Some(0),
+        "the selected one stays first"
+    );
+    click_at(&mut h, at);
+    assert_eq!(st(&h).selected_region, Some(1));
+    click_at(&mut h, at);
+    assert_eq!(st(&h).selected_region, Some(0));
+}
+
+#[test]
+fn dragging_a_right_edge_changes_hikey_in_one_undo_step() {
+    let (_dir, mut h) = open_text(
+        "<group> <region> sample=a.wav pitch_keycenter=60 lokey=0 hikey=62\n\
+         <region> sample=b.wav pitch_keycenter=64 lokey=63 hikey=127\n",
+    );
+    h.run();
+    let area = map_area(&h);
+    let a = box_rect(area, false, 0, 1, 0, 62, 1, 127);
+    let from = Pos2::new(a.right() - 1.0, a.center().y);
+    let to = box_rect(area, false, 0, 1, 72, 72, 1, 127).center();
+    drag_with(&mut h, PointerButton::Primary, from, to);
+    assert_eq!(keys(st(&h), 0), (0, 72));
+    assert_eq!(keys(st(&h), 1), (63, 127), "the other region stays");
+    assert_eq!(st(&h).history.cursor(), 1, "one undo step");
+    assert!(st(&h).preview.is_none(), "the preview was committed");
+    h.state_mut().undo();
+    assert_eq!(keys(st(&h), 0), (0, 62));
+    assert!(!st(&h).history.is_dirty());
+}
+
+#[test]
+fn auto_map_lays_out_ranges_by_root() {
+    let (_dir, mut h) = open_text(
+        "<group> <region> sample=a.wav pitch_keycenter=48\n\
+         <region> sample=b.wav pitch_keycenter=60 lokey=60 hikey=60\n\
+         <region> sample=c.wav pitch_keycenter=72 lovel=1 hivel=64\n\
+         <group> <region> sample=a.wav pitch_keycenter=48 lokey=10 hikey=20\n",
+    );
+    h.run();
+    h.get_by_label("Auto-map from root keys").click();
+    h.run();
+    let s = st(&h);
+    assert_eq!(keys(s, 0), (0, 54));
+    assert_eq!(keys(s, 1), (55, 66));
+    assert_eq!(keys(s, 2), (67, 127));
+    assert_eq!(keys(s, 3), (10, 20), "another group is left alone");
+    assert_eq!(s.inst().region_info(2).hivel, 64, "velocity is not changed");
+    assert_eq!(s.history.cursor(), 1, "one undo step");
+    h.state_mut().undo();
+    assert_eq!(keys(st(&h), 0), (0, 127));
+    assert_eq!(keys(st(&h), 1), (60, 60));
+}
+
+#[test]
+fn auto_map_uses_the_samples_current_root() {
+    let (_dir, mut h) = open_text(
+        "<region> sample=a.wav pitch_keycenter=48\n<region> sample=b.wav pitch_keycenter=60\n",
+    );
+    // Region 0's sample is tuned to 64 in the editor: it is now above region 1.
+    let i = h.state().selected.unwrap();
+    let FileEntry::Loaded(s) = &mut h.state_mut().files[i] else {
+        panic!("not loaded");
+    };
+    let e = EditState {
+        root: 64,
+        ..s.edit().clone()
+    };
+    s.apply(e, None);
+    h.run();
+    h.get_by_label("Auto-map from root keys").click();
+    h.run();
+    assert_eq!(keys(st(&h), 0), (63, 127));
+    assert_eq!(keys(st(&h), 1), (0, 62));
+}
+
+#[test]
+fn fill_gaps_closes_holes() {
+    let (_dir, mut h) = open_text(
+        "<region> sample=a.wav lokey=40 hikey=50\n<region> sample=b.wav lokey=60 hikey=70\n",
+    );
+    h.run();
+    h.get_by_label("Fill gaps").click();
+    h.run();
+    assert_eq!(keys(st(&h), 0), (0, 55));
+    assert_eq!(keys(st(&h), 1), (56, 127));
+    assert_eq!(st(&h).history.cursor(), 1, "one undo step");
+    h.state_mut().undo();
+    assert_eq!(keys(st(&h), 0), (40, 50));
+}
+
+#[test]
+fn play_map_has_one_entry_per_found_region_with_tuning() {
+    let (_dir, h) = open_text(
+        "<region> sample=a.wav pitch_keycenter=49 tune=14 lokey=0 hikey=60 lovel=10 hivel=90\n\
+         <region> sample=b.wav pitch_keycenter=49 transpose=-1 lokey=61\n\
+         <region> sample=gone.wav\n\
+         <region> sample=c.wav trigger=release\n",
+    );
+    let app = h.state();
+    let map = play_map(st(&h), &app.files);
+    assert_eq!(
+        map.regions.len(),
+        2,
+        "the missing and release regions are left out"
+    );
+    let (a, b) = (&map.regions[0], &map.regions[1]);
+    assert_eq!((a.buffer.root, a.buffer.cents), (49, -14.0));
+    assert_eq!((a.lokey, a.hikey, a.lovel, a.hivel), (0, 60, 10, 90));
+    assert_eq!(
+        (b.buffer.root, b.buffer.cents),
+        (50, 0.0),
+        "transpose -1 plays a key lower"
+    );
+    assert_eq!((b.lokey, b.hikey), (61, 127));
+    assert_ne!(a.buffer.source, b.buffer.source);
+    for r in &map.regions {
+        assert!(
+            app.files.iter().all(|f| match f {
+                FileEntry::Loaded(s) => s.source != r.buffer.source,
+                _ => true,
+            }),
+            "region sources are not session sources"
+        );
+    }
+    // Rebuilding keeps each region's source.
+    let again = play_map(st(&h), &app.files);
+    assert_eq!(again.source, map.source);
+    assert_eq!(again.regions[1].buffer.source, b.buffer.source);
+}
+
+#[test]
+fn own_region_uses_its_own_values() {
+    let (_dir, mut h) = open_text(
+        "<region> sample=a.wav pitch_keycenter=60 lokey=0 hikey=60 loop_mode=one_shot\n\
+         <region> sample=a.wav pitch_keycenter=72 tune=-30 loop_mode=loop_continuous \
+         loop_start=100 loop_end=2000 offset=50 end=3000 volume=-6 amp_veltrack=50 \
+         ampeg_attack=0.01 ampeg_release=0.5 lokey=61\n",
+    );
+    assert_eq!(st(&h).binding.samples[0].follows, [true, false]);
+    // The shared sample is retuned in the editor: only the following region hears it.
+    let i = h.state().selected.unwrap();
+    let FileEntry::Loaded(s) = &mut h.state_mut().files[i] else {
+        panic!("not loaded");
+    };
+    let e = EditState {
+        root: 55,
+        ..s.edit().clone()
+    };
+    s.apply(e, None);
+    let app = h.state();
+    let map = play_map(st(&h), &app.files);
+    let (follows, own) = (&map.regions[0], &map.regions[1]);
+    assert_eq!(follows.buffer.root, 55);
+    assert_eq!(follows.playback, Playback::OneShot);
+    assert_eq!((own.buffer.root, own.buffer.cents), (72, 30.0));
+    assert_eq!(
+        (
+            own.buffer.loop_mode,
+            own.buffer.loop_start,
+            own.buffer.loop_end
+        ),
+        (LoopMode::Forward, 100, 2000)
+    );
+    assert_eq!((own.buffer.start, own.buffer.end), (50, 3000));
+    assert!((own.gain - 10f32.powf(-6.0 / 20.0)).abs() < 1e-6);
+    assert_eq!(own.veltrack, 0.5);
+    assert_eq!(own.playback, Playback::Normal);
+    assert_eq!(own.adsr.attack_ms, 10.0);
+    assert_eq!(own.adsr.release_ms, 500.0);
+    assert!(
+        std::sync::Arc::ptr_eq(&follows.buffer.audio, &own.buffer.audio),
+        "regions of one sample share its audio"
+    );
+}
+
+#[test]
+fn right_drag_on_the_key_map_keyboard_sets_the_selected_range() {
+    let (_dir, mut h) = open_text("<region> sample=a.wav lokey=0 hikey=127\n");
+    h.run();
+    let kb = h.get_by_label("Piano keyboard").rect();
+    let at = |note: u8| {
+        let r = key_rect_in(kb, 0..=127, note);
+        Pos2::new(r.center().x, r.bottom() - 3.0)
+    };
+    drag_with(&mut h, PointerButton::Secondary, at(48), at(52));
+    assert_eq!(keys(st(&h), 0), (48, 52));
+    assert_eq!(st(&h).history.cursor(), 1, "one undo step");
 }

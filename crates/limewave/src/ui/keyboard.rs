@@ -1,9 +1,11 @@
 //! The piano strip at the bottom of the window.
 
 use std::collections::BTreeSet;
+use std::ops::RangeInclusive;
 
 use eframe::egui::{
-    Align2, Color32, FontId, Pos2, Rect, Role, Sense, Stroke, StrokeKind, Ui, WidgetInfo, vec2,
+    Align2, Color32, FontId, PointerButton, Pos2, Rect, Role, Sense, Stroke, StrokeKind, Ui,
+    WidgetInfo, vec2,
 };
 use limewave_core::notes::note_name;
 
@@ -23,22 +25,29 @@ fn white_index(note: u8) -> u32 {
     u32::from(note / 12) * 7 + BELOW[usize::from(note % 12)]
 }
 
-fn is_black(note: u8) -> bool {
+pub(crate) fn is_black(note: u8) -> bool {
     matches!(note % 12, 1 | 3 | 6 | 8 | 10)
 }
 
-fn white_count() -> f32 {
-    (white_index(LAST_NOTE) - white_index(FIRST_NOTE) + 1) as f32
+/// White keys in `keys`, which should start and end on white keys.
+fn white_count(keys: &RangeInclusive<u8>) -> f32 {
+    (white_index(*keys.end()) - white_index(*keys.start()) + 1) as f32
 }
 
 /// The rectangle of `note` inside a strip occupying `strip`. Black keys overlap the white keys
 /// beside them. Notes outside 36..=96 get an empty rectangle.
 pub fn key_rect(strip: Rect, note: u8) -> Rect {
-    if !(FIRST_NOTE..=LAST_NOTE).contains(&note) {
+    key_rect_in(strip, FIRST_NOTE..=LAST_NOTE, note)
+}
+
+/// The rectangle of `note` inside a strip of the notes `keys` occupying `strip`, as
+/// [`key_rect`]; notes outside `keys` get an empty rectangle.
+pub fn key_rect_in(strip: Rect, keys: RangeInclusive<u8>, note: u8) -> Rect {
+    if !keys.contains(&note) {
         return Rect::NOTHING;
     }
-    let w = strip.width() / white_count();
-    let x = (white_index(note) - white_index(FIRST_NOTE)) as f32 * w;
+    let w = strip.width() / white_count(&keys);
+    let x = (white_index(note) - white_index(*keys.start())) as f32 * w;
     if is_black(note) {
         let cx = strip.left() + x + w;
         Rect::from_min_size(
@@ -54,12 +63,12 @@ pub fn key_rect(strip: Rect, note: u8) -> Rect {
 }
 
 /// The note under `pos`, black keys first because they sit on top.
-fn note_at(strip: Rect, pos: Pos2) -> Option<u8> {
-    let notes = || FIRST_NOTE..=LAST_NOTE;
+fn note_at(strip: Rect, keys: &RangeInclusive<u8>, pos: Pos2) -> Option<u8> {
+    let notes = || keys.clone();
     notes()
         .filter(|n| is_black(*n))
         .chain(notes().filter(|n| !is_black(*n)))
-        .find(|n| key_rect(strip, *n).contains(pos))
+        .find(|n| key_rect_in(strip, keys.clone(), *n).contains(pos))
 }
 
 /// What the strip reports for one frame.
@@ -71,15 +80,29 @@ pub enum KeyEvent {
     Release(u8),
     /// A key was right-clicked: make it the root key.
     SetRoot(u8),
+    /// The right button was dragged across two or more keys: these, lowest first.
+    SetRange(u8, u8),
 }
 
-/// Draws the strip over the available area. The root key is `LOOP` coloured and held keys
-/// `START` green. A left press on a key is [`KeyEvent::Press`], and the key is released when
-/// the button goes up or the pointer slides off it. A right click gives [`KeyEvent::SetRoot`]
-/// and never plays; dragging with the right button does nothing. Unless `can_play`, a left
-/// press does nothing either, so no key lights up silently.
+/// [`keyboard_strip_range`] over the notes 36..=96.
 pub fn keyboard_strip(
     ui: &mut Ui,
+    root: u8,
+    held: &BTreeSet<u8>,
+    can_play: bool,
+) -> Option<KeyEvent> {
+    keyboard_strip_range(ui, FIRST_NOTE..=LAST_NOTE, root, held, can_play)
+}
+
+/// Draws a strip of the notes `keys` over the available area. The root key is `LOOP`
+/// coloured and held keys `START` green. A left press on a key is [`KeyEvent::Press`], and
+/// the key is released when the button goes up or the pointer slides off it. A right click
+/// gives [`KeyEvent::SetRoot`] and never plays; a right drag across two or more keys gives
+/// [`KeyEvent::SetRange`] when the button goes up. Unless `can_play`, a left press does
+/// nothing, so no key lights up silently.
+pub fn keyboard_strip_range(
+    ui: &mut Ui,
+    keys: RangeInclusive<u8>,
     root: u8,
     held: &BTreeSet<u8>,
     can_play: bool,
@@ -95,7 +118,7 @@ pub fn keyboard_strip(
         && ui.input(|i| i.pointer.primary_down()))
     .then(|| ui.input(|i| i.pointer.interact_pos()))
     .flatten()
-    .and_then(|p| note_at(rect, p));
+    .and_then(|p| note_at(rect, &keys, p));
     let mut event = None;
     match (active, under_pointer) {
         (None, Some(n)) => {
@@ -112,19 +135,66 @@ pub fn keyboard_strip(
         && response.secondary_clicked()
         && let Some(n) = response
             .interact_pointer_pos()
-            .and_then(|p| note_at(rect, p))
+            .and_then(|p| note_at(rect, &keys, p))
     {
         event = Some(KeyEvent::SetRoot(n));
     }
     ui.data_mut(|d| d.insert_temp(id, active));
 
+    // The keys a right drag went from and has reached. The pointer is held on the strip, so
+    // dragging past an end reaches the last key.
+    let range_id = response.id.with("right_drag");
+    let mut range: Option<(u8, u8)> = ui.data(|d| d.get_temp(range_id)).flatten();
+    let on_strip = |p: Pos2| note_at(rect, &keys, rect.shrink(0.5).clamp(p));
+    if response.drag_started_by(PointerButton::Secondary) {
+        range = ui
+            .input(|i| i.pointer.press_origin())
+            .and_then(on_strip)
+            .map(|n| (n, n));
+    }
+    if let Some((_, to)) = &mut range
+        && let Some(n) = ui.input(|i| i.pointer.latest_pos()).and_then(on_strip)
+    {
+        *to = n;
+    }
+    if response.drag_stopped_by(PointerButton::Secondary) {
+        if let Some((from, to)) = range.take()
+            && from != to
+            && event.is_none()
+        {
+            event = Some(KeyEvent::SetRange(from.min(to), from.max(to)));
+        }
+    } else if !response.dragged_by(PointerButton::Secondary) {
+        range = None;
+    }
+    ui.data_mut(|d| d.insert_temp(range_id, range));
+
     if ui.is_rect_visible(rect) {
-        paint(ui, rect, root, held, active);
+        paint(ui, rect, &keys, root, held, active);
+        if let Some((from, to)) = range {
+            let span = key_rect_in(rect, keys.clone(), from.min(to)).union(key_rect_in(
+                rect,
+                keys.clone(),
+                from.max(to),
+            ));
+            ui.painter_at(rect).rect_filled(
+                span.with_min_y(rect.top()).with_max_y(rect.bottom()),
+                0.0,
+                colors::NEON.gamma_multiply(0.35),
+            );
+        }
     }
     event
 }
 
-fn paint(ui: &Ui, rect: Rect, root: u8, held: &BTreeSet<u8>, pressed: Option<u8>) {
+fn paint(
+    ui: &Ui,
+    rect: Rect,
+    keys: &RangeInclusive<u8>,
+    root: u8,
+    held: &BTreeSet<u8>,
+    pressed: Option<u8>,
+) {
     let painter = ui.painter_at(rect);
     let lit = |n: u8| held.contains(&n) || pressed == Some(n);
     let fill = |n: u8| {
@@ -139,8 +209,9 @@ fn paint(ui: &Ui, rect: Rect, root: u8, held: &BTreeSet<u8>, pressed: Option<u8>
         }
     };
     let outline = Stroke::new(1.0, Color32::from_gray(70));
-    for n in (FIRST_NOTE..=LAST_NOTE).filter(|n| !is_black(*n)) {
-        let r = key_rect(rect, n);
+    let key = |n: u8| key_rect_in(rect, keys.clone(), n);
+    for n in keys.clone().filter(|n| !is_black(*n)) {
+        let r = key(n);
         painter.rect(r, 0.0, fill(n), outline, StrokeKind::Inside);
         if lit(n) && n != root {
             painter.rect_filled(
@@ -159,13 +230,13 @@ fn paint(ui: &Ui, rect: Rect, root: u8, held: &BTreeSet<u8>, pressed: Option<u8>
             );
         }
     }
-    for n in (FIRST_NOTE..=LAST_NOTE).filter(|n| is_black(*n)) {
-        painter.rect(key_rect(rect, n), 0.0, fill(n), outline, StrokeKind::Inside);
+    for n in keys.clone().filter(|n| is_black(*n)) {
+        painter.rect(key(n), 0.0, fill(n), outline, StrokeKind::Inside);
     }
     // A lit root key keeps its colour; show that it is also held with a green rim.
     if lit(root) {
         painter.rect_stroke(
-            key_rect(rect, root),
+            key(root),
             0.0,
             Stroke::new(2.0, colors::START),
             StrokeKind::Inside,
@@ -250,16 +321,63 @@ mod tests {
     }
 
     #[test]
+    fn right_drag_gives_set_range() {
+        let (mut harness, c4) = strip_harness(true);
+        let e4 = {
+            let r = key_rect(harness.state().1, 64);
+            Pos2::new(r.center().x, r.bottom() - 4.0)
+        };
+        harness.event(button(c4, PointerButton::Secondary, true));
+        harness.run();
+        for i in 1..=4 {
+            harness.hover_at(c4 + (e4 - c4) * (i as f32 / 4.0));
+            harness.run();
+        }
+        harness.event(button(e4, PointerButton::Secondary, false));
+        harness.run();
+        assert_eq!(harness.state().0, vec![KeyEvent::SetRange(60, 64)]);
+
+        // Leftwards gives the same range, low key first.
+        harness.state_mut().0.clear();
+        harness.hover_at(e4);
+        harness.run();
+        harness.event(button(e4, PointerButton::Secondary, true));
+        harness.run();
+        for i in 1..=4 {
+            harness.hover_at(e4 + (c4 - e4) * (i as f32 / 4.0));
+            harness.run();
+        }
+        harness.event(button(c4, PointerButton::Secondary, false));
+        harness.run();
+        assert_eq!(harness.state().0, vec![KeyEvent::SetRange(60, 64)]);
+    }
+
+    #[test]
+    fn a_ranged_strip_places_keys_within_its_range() {
+        let strip = Rect::from_min_size(Pos2::ZERO, vec2(750.0, 40.0));
+        // 0..=127 has 75 white keys: 10 px each.
+        assert_eq!(key_rect_in(strip, 0..=127, 0).left(), 0.0);
+        assert_eq!(key_rect_in(strip, 0..=127, 127).right(), 750.0);
+        assert_eq!(key_rect_in(strip, 0..=127, 60).left(), 350.0);
+        assert_eq!(key_rect_in(strip, 0..=127, 128), Rect::NOTHING);
+        assert_eq!(
+            key_rect(strip, 60),
+            key_rect_in(strip, FIRST_NOTE..=LAST_NOTE, 60)
+        );
+    }
+
+    #[test]
     fn black_keys_sit_over_white_keys() {
         let strip = Rect::from_min_size(Pos2::ZERO, vec2(720.0, 100.0));
         let black = key_rect(strip, 61);
-        assert_eq!(note_at(strip, black.center()), Some(61));
+        let keys = FIRST_NOTE..=LAST_NOTE;
+        assert_eq!(note_at(strip, &keys, black.center()), Some(61));
         let white = key_rect(strip, 60);
         assert_eq!(
-            note_at(strip, Pos2::new(white.left() + 1.0, 95.0)),
+            note_at(strip, &keys, Pos2::new(white.left() + 1.0, 95.0)),
             Some(60)
         );
-        assert_eq!(note_at(strip, Pos2::new(-5.0, 50.0)), None);
+        assert_eq!(note_at(strip, &keys, Pos2::new(-5.0, 50.0)), None);
         assert_eq!(key_rect(strip, 20), Rect::NOTHING);
     }
 }
