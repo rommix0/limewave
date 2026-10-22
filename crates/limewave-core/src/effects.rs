@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 
+use crate::dsp::resample::resampled_len;
 use crate::edit::{EditState, LoopMode};
 
 /// The shape of a fade.
@@ -58,6 +59,9 @@ pub enum Op {
     /// Replace the range with new audio, which may change the frame count. The audio is
     /// shared, so replaying the step and copying edit states stay cheap.
     Splice(Arc<Splice>),
+    /// Convert the whole input to another sample rate. `first..=last` is the whole input; the
+    /// converted audio is shared like a splice's.
+    Resample(Arc<Resample>),
 }
 
 /// Which tool made a splice.
@@ -79,6 +83,17 @@ pub struct Splice {
     pub audio: Vec<Vec<f32>>,
     /// The inclusive range inside `audio` that is synthetic, shown tinted.
     pub generated: (usize, usize),
+}
+
+/// A sample-rate conversion: the audio rendered once from the step's input.
+#[derive(Clone, PartialEq, Debug)]
+pub struct Resample {
+    /// The rate of the step's input, in hertz.
+    pub from: u32,
+    /// The rate of `audio`, in hertz.
+    pub to: u32,
+    /// The converted audio, one `Vec` per channel, all the same length.
+    pub audio: Vec<Vec<f32>>,
 }
 
 /// An operation with the inclusive frame range it works on.
@@ -219,6 +234,11 @@ pub fn apply_effect(audio: &mut Vec<Vec<f32>>, a: &AppliedEffect) {
                 ch.splice(a.first..=last, new.iter().copied());
             }
         }
+        Op::Resample(r) => {
+            if r.audio.len() == audio.len() {
+                audio.clone_from(&r.audio);
+            }
+        }
         Op::StereoToMono(pick) => {
             if audio.len() >= 2 {
                 let kept = match pick {
@@ -289,18 +309,24 @@ fn apply_in_range(op: &Op, channel: usize, s: &mut [f32]) {
             .for_each(|(i, v)| *v *= fade_gain(*c, 1.0 - t(i))),
         Op::Invert => s.iter_mut().for_each(|v| *v = -*v),
         Op::Reverse { .. } => s.reverse(),
-        Op::StereoToMono(_) | Op::SwapChannels | Op::MonoToStereo | Op::Splice(_) => {}
+        Op::StereoToMono(_)
+        | Op::SwapChannels
+        | Op::MonoToStereo
+        | Op::Splice(_)
+        | Op::Resample(_) => {}
     }
 }
 
 /// The frame count after step `a` on an input of `input` frames: unchanged, except for a
-/// splice, whose range (cut to the input as in [`apply_effect`]) becomes its audio.
+/// splice, whose range (cut to the input as in [`apply_effect`]) becomes its audio, and a
+/// conversion, whose whole input does.
 pub fn output_frames(a: &AppliedEffect, input: usize) -> usize {
     match &a.op {
         Op::Splice(s) if a.first <= a.last && a.first < input => {
             let replaced = a.last.min(input - 1) + 1 - a.first;
             (input - replaced).saturating_add(frame_count(&s.audio))
         }
+        Op::Resample(r) => frame_count(&r.audio),
         _ => input,
     }
 }
@@ -322,9 +348,49 @@ pub fn frames_after(original: usize, effects: &[AppliedEffect]) -> usize {
     effects.iter().fold(original, |f, a| output_frames(a, f))
 }
 
-/// Whether any step changes the frame count: the list holds a splice.
+/// Whether any step changes the frame count: the list holds a splice or a conversion.
 pub fn changes_length(effects: &[AppliedEffect]) -> bool {
-    effects.iter().any(|a| matches!(a.op, Op::Splice(_)))
+    effects
+        .iter()
+        .any(|a| matches!(a.op, Op::Splice(_) | Op::Resample(_)))
+}
+
+/// The sample rate after `effects`: the `to` of the last conversion, else the file's own.
+pub fn rate_after(file_rate: u32, effects: &[AppliedEffect]) -> u32 {
+    effects
+        .iter()
+        .rev()
+        .find_map(|a| match &a.op {
+            Op::Resample(r) => Some(r.to),
+            _ => None,
+        })
+        .unwrap_or(file_rate)
+}
+
+/// Where frame `f` lands through conversion step `a` (`r` is its payload). The step's input
+/// is `last + 1` frames. The end-of-file position (the input length) lands on the new length;
+/// any other frame is scaled by `round(f * to / from)` and held to the new length - 1.
+fn scale_through(a: &AppliedEffect, r: &Resample, f: usize) -> usize {
+    let input = a.last.saturating_add(1);
+    let new_len = frame_count(&r.audio);
+    if r.from == 0 {
+        return f;
+    }
+    if f == input {
+        new_len
+    } else {
+        resampled_len(f, r.from, r.to).min(new_len.saturating_sub(1))
+    }
+}
+
+/// Where frame `f` lands through only the conversion steps of `effects`, in order. Each step
+/// takes its input length from its own range; other steps are ignored. See [`map_frame`] for
+/// the mapping through every kind of step.
+pub fn resample_map(effects: &[AppliedEffect], f: usize) -> usize {
+    effects.iter().fold(f, |f, a| match &a.op {
+        Op::Resample(r) => scale_through(a, r, f),
+        _ => f,
+    })
 }
 
 /// Replays `effects` in order on a copy of the original audio.
@@ -354,6 +420,7 @@ pub fn peak(audio: &[Vec<f32>], first: usize, last: usize) -> f32 {
 /// - A splice keeps frames before its range, drops those inside it, and shifts those after it
 ///   by the change in length. The end-of-file position (the input length) counts as after,
 ///   so it lands on the new length.
+/// - A conversion scales the frame as in [`resample_map`].
 ///
 /// Never overflows, whatever the ranges.
 pub fn map_frame(effects: &[AppliedEffect], f: usize) -> Option<usize> {
@@ -379,6 +446,7 @@ fn map_step(a: &AppliedEffect, f: usize) -> Option<usize> {
                 )
             }
         }
+        Op::Resample(r) => Some(scale_through(a, r, f)),
         _ => Some(f),
     }
 }
@@ -408,8 +476,8 @@ pub fn map_range(effects: &[AppliedEffect], first: usize, last: usize) -> Option
 /// The synthetic frames of every splice in `effects`, in the coordinates after the last step,
 /// as sorted inclusive ranges with touching ones merged. Each splice's range is placed at the
 /// splice's start and follows the audio through the later steps: every reverse mirrors the
-/// part of it inside the reversed block, and later splices clip and shift it as in
-/// [`map_range`]. Parts that nothing survives of are left out.
+/// part of it inside the reversed block, later splices clip and shift it as in
+/// [`map_range`], and conversions scale it. Parts that nothing survives of are left out.
 pub fn generated_ranges(effects: &[AppliedEffect]) -> Vec<(usize, usize)> {
     let mut ranges: Vec<(usize, usize)> = effects
         .iter()
@@ -467,6 +535,11 @@ fn follow_audio(a: &AppliedEffect, parts: Vec<(usize, usize)>) -> Vec<(usize, us
         Op::Splice(_) => parts
             .into_iter()
             .filter_map(|(lo, hi)| map_range(std::slice::from_ref(a), lo, hi))
+            .collect(),
+        // Scaling keeps the order, so a range stays a range (and may shrink to one frame).
+        Op::Resample(ref r) => parts
+            .into_iter()
+            .map(|(lo, hi)| (scale_through(a, r, lo), scale_through(a, r, hi)))
             .collect(),
         _ => parts,
     }
@@ -1118,5 +1191,55 @@ mod tests {
         assert_eq!(peak(&x, 0, 1), 0.7);
         assert_eq!(peak(&x, 2, 1), 0.0);
         assert_eq!(peak(&[], 0, 5), 0.0);
+    }
+
+    #[test]
+    fn generated_audio_tint_follows_a_conversion() {
+        let tail = AppliedEffect {
+            op: Op::Splice(Arc::new(Splice {
+                kind: SpliceKind::Tail,
+                audio: vec![vec![0.0; 500]],
+                generated: (0, 499),
+            })),
+            first: 500,
+            last: 999,
+        };
+        let half = AppliedEffect {
+            op: Op::Resample(Arc::new(Resample {
+                from: 1000,
+                to: 500,
+                audio: vec![vec![0.0; 500]],
+            })),
+            first: 0,
+            last: 999,
+        };
+        assert_eq!(generated_ranges(&[tail, half]), vec![(250, 499)]);
+    }
+
+    #[test]
+    fn a_conversion_changes_the_length_and_the_step_inputs() {
+        let half = AppliedEffect {
+            op: Op::Resample(Arc::new(Resample {
+                from: 1000,
+                to: 500,
+                audio: vec![vec![0.0; 500]],
+            })),
+            first: 0,
+            last: 999,
+        };
+        let fade = AppliedEffect {
+            op: Op::Invert,
+            first: 0,
+            last: 99,
+        };
+        let effects = [half, fade];
+        assert!(changes_length(&effects));
+        assert!(!changes_length(&effects[1..]));
+        assert_eq!(output_frames(&effects[0], 1000), 500);
+        assert_eq!(step_inputs(1000, &effects), vec![1000, 500]);
+        assert_eq!(frames_after(1000, &effects), 500);
+        // Other steps are ignored by resample_map.
+        assert_eq!(resample_map(&effects, 1000), 500);
+        assert_eq!(resample_map(&effects[1..], 1000), 1000);
     }
 }

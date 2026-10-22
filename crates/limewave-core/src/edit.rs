@@ -3,7 +3,11 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::effects::{AppliedEffect, Op, Splice, SpliceKind, frames_after, output_frames};
+use crate::dsp::resample::{MAX_RATE, MIN_RATE, resample, resampled_len};
+use crate::effects::{
+    AppliedEffect, Op, Resample, Splice, SpliceKind, frames_after, output_frames, rate_after,
+    resample_map,
+};
 
 /// How the sample loops on playback.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -68,7 +72,7 @@ impl EditState {
         self.effects.retain_mut(|a| {
             let keep = match a.op {
                 Op::StereoToMono(_) | Op::SwapChannels | Op::MonoToStereo => true,
-                Op::Splice(_) => a.first <= a.last && a.last < frames,
+                Op::Splice(_) | Op::Resample(_) => a.first <= a.last && a.last < frames,
                 _ => {
                     a.last = a.last.min(frames.saturating_sub(1));
                     frames > 0 && a.first <= a.last
@@ -319,6 +323,47 @@ pub fn redraw_samples(
         last,
     });
     Some(r)
+}
+
+/// Converts the processed audio to the rate `to`, as one undoable effect step. `file_rate` is
+/// the rate of the file on disk; the rate converted from is [`rate_after`] the steps so far.
+/// The audio is rendered here, from `processed`.
+///
+/// Start, End and the loop points move with the audio, each scaled by `round(f * to / from)`
+/// (see [`resample_map`]), and the crossfade by the same ratio. A loop whose scaled length is
+/// under 2 frames is turned off. Returns `None` when `to` is the current rate or outside
+/// `MIN_RATE..=MAX_RATE`, the current rate is 0, or `processed` holds no frames.
+pub fn resample_edit(
+    e: &EditState,
+    processed: &[Vec<f32>],
+    to: u32,
+    file_rate: u32,
+    original_frames: usize,
+) -> Option<EditState> {
+    let from = rate_after(file_rate, &e.effects);
+    let frames = processed.first().map_or(0, Vec::len);
+    if to == from || !(MIN_RATE..=MAX_RATE).contains(&to) || from == 0 || frames == 0 {
+        return None;
+    }
+    let step = AppliedEffect {
+        op: Op::Resample(Arc::new(Resample {
+            from,
+            to,
+            audio: resample(processed, from, to),
+        })),
+        first: 0,
+        last: frames - 1,
+    };
+    let scale = |f| resample_map(std::slice::from_ref(&step), f);
+    let mut r = e.clone();
+    (r.start, r.end) = (scale(e.start), scale(e.end));
+    (r.loop_start, r.loop_end) = (scale(e.loop_start), scale(e.loop_end));
+    r.crossfade = resampled_len(e.crossfade, from, to);
+    if r.loop_mode != LoopMode::Off && resampled_len(e.loop_len(), from, to) < 2 {
+        r.loop_mode = LoopMode::Off;
+    }
+    r.effects.push(step);
+    Some(r.clamped(original_frames))
 }
 
 /// Source of entry stamps, shared by every history in the process so stamps from
@@ -948,5 +993,124 @@ mod tests {
         assert!(redraw_samples(&e, &audio, 1, 2, &[0.5]).is_none());
         assert!(redraw_samples(&e, &audio, 0, 9, &[0.5, 0.5]).is_none());
         assert!(redraw_samples(&e, &audio, 0, 2, &[f32::NAN]).is_none());
+    }
+
+    use crate::effects::{map_frame, map_range, process};
+
+    #[test]
+    fn rate_after_takes_the_last_conversion() {
+        assert_eq!(rate_after(44_100, &[]), 44_100);
+        let e = resample_edit(
+            &EditState::default_for(4410),
+            &[vec![0.0; 4410]],
+            31_250,
+            44_100,
+            4410,
+        )
+        .unwrap();
+        assert_eq!(rate_after(44_100, &e.effects), 31_250);
+        // A second conversion starts from the first one's rate.
+        let again = resample_edit(&e, &[vec![0.0; 3125]], 62_500, 44_100, 4410).unwrap();
+        assert_eq!(rate_after(44_100, &again.effects), 62_500);
+        let Op::Resample(ref r) = again.effects[1].op else {
+            panic!("expected a conversion");
+        };
+        assert_eq!((r.from, r.to), (31_250, 62_500));
+    }
+
+    #[test]
+    fn a_conversion_scales_markers_loop_and_crossfade() {
+        let mut e = EditState::default_for(44_100);
+        (
+            e.start,
+            e.end,
+            e.loop_mode,
+            e.loop_start,
+            e.loop_end,
+            e.crossfade,
+        ) = (100, 40_000, LoopMode::Forward, 1_000, 30_000, 441);
+        let r = resample_edit(&e, &[vec![0.0; 44_100]], 22_050, 44_100, 44_100).unwrap();
+        assert_eq!(
+            (r.start, r.end, r.loop_start, r.loop_end, r.crossfade),
+            (50, 20_000, 500, 15_000, 221)
+        );
+        assert_eq!(frames_after(44_100, &r.effects), 22_050);
+    }
+
+    #[test]
+    fn the_same_rate_or_an_out_of_range_rate_is_no_conversion() {
+        let e = EditState::default_for(100);
+        assert!(resample_edit(&e, &[vec![0.0; 100]], 44_100, 44_100, 100).is_none());
+        assert!(resample_edit(&e, &[vec![0.0; 100]], 999, 44_100, 100).is_none());
+        assert!(resample_edit(&e, &[vec![0.0; 100]], 768_001, 44_100, 100).is_none());
+        // Nothing to convert, or a current rate of zero to convert from.
+        assert!(resample_edit(&e, &[], 22_050, 44_100, 100).is_none());
+        assert!(resample_edit(&e, &[Vec::new()], 22_050, 44_100, 100).is_none());
+        assert!(resample_edit(&e, &[vec![0.0; 100]], 22_050, 0, 100).is_none());
+    }
+
+    #[test]
+    fn a_tiny_rate_turns_a_short_loop_off_without_panicking() {
+        let mut e = EditState::default_for(96_000);
+        (e.loop_mode, e.loop_start, e.loop_end) = (LoopMode::Forward, 10, 60);
+        let r = resample_edit(&e, &[vec![0.0; 96_000]], 1_000, 96_000, 96_000).unwrap();
+        assert_eq!(r.loop_mode, LoopMode::Off);
+        assert_eq!(r.end, 999);
+    }
+
+    #[test]
+    fn frames_map_through_a_conversion() {
+        let r = resample_edit(
+            &EditState::default_for(1000),
+            &[vec![0.0; 1000]],
+            1000,
+            2000,
+            1000,
+        )
+        .unwrap();
+        assert_eq!(map_frame(&r.effects, 3), Some(2)); // 1.5 rounds up
+        assert_eq!(map_frame(&r.effects, 1000), Some(500)); // end of file lands on the new length
+        assert_eq!(map_range(&r.effects, 10, 21), Some((5, 11)));
+        // The last frame is held inside the new audio; non-conversion steps are ignored.
+        assert_eq!(map_frame(&r.effects, 999), Some(499));
+        assert_eq!(resample_map(&r.effects, 999), 499);
+        assert_eq!(resample_map(&[], 7), 7);
+    }
+
+    #[test]
+    fn replaying_a_conversion_gives_its_audio() {
+        let x = vec![(0..100).map(|i| i as f32 / 100.0).collect::<Vec<_>>()];
+        let r = resample_edit(&EditState::default_for(100), &x, 2000, 1000, 100).unwrap();
+        assert_eq!(process(&x, &r.effects)[0].len(), 200);
+    }
+
+    #[test]
+    fn clamped_keeps_a_conversion_that_fits_its_input() {
+        let r = resample_edit(
+            &EditState::default_for(1000),
+            &[vec![0.0; 1000]],
+            1000,
+            2000,
+            1000,
+        )
+        .unwrap();
+        assert_eq!(r.clone().clamped(1000), r);
+        // Against a shorter original the step's range no longer fits and is dropped.
+        assert!(r.clamped(500).effects.is_empty());
+    }
+
+    #[test]
+    fn a_conversion_with_the_wrong_channel_count_is_skipped() {
+        let step = AppliedEffect {
+            op: Op::Resample(Arc::new(Resample {
+                from: 1000,
+                to: 2000,
+                audio: vec![vec![0.0; 20]],
+            })),
+            first: 0,
+            last: 9,
+        };
+        let two = vec![vec![0.5; 10]; 2];
+        assert_eq!(process(&two, &[step]), two);
     }
 }
