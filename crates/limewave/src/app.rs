@@ -516,7 +516,7 @@ pub struct UiState {
     pub midi_learn: Option<u32>,
     /// The audition envelope, shared by every file and remembered between runs.
     pub envelope: Adsr,
-    /// The velocity of notes played from the computer keyboard, the on-screen keys and Play.
+    /// The velocity of notes played from the computer keyboard and the on-screen keys.
     pub velocity: u8,
     /// "Release plays after loop end" (v0.3 §7.3): released looped notes leave the loop and
     /// play on to End. Off by default and remembered between runs.
@@ -1147,7 +1147,10 @@ impl LimewaveApp {
     fn send(&mut self, c: Command) {
         if matches!(
             c,
-            Command::NoteOn { .. } | Command::PlayRange { .. } | Command::PreviewOn { .. }
+            Command::NoteOn { .. }
+                | Command::PlaySample { .. }
+                | Command::PlayRange { .. }
+                | Command::PreviewOn { .. }
         ) {
             self.cursor_watch.note_started(Instant::now());
         }
@@ -1192,7 +1195,8 @@ impl LimewaveApp {
         })
     }
 
-    /// Plays the root note from [`LimewaveApp::play_start`].
+    /// Plays the selected sample's root note from [`LimewaveApp::play_start`], never the
+    /// instrument.
     fn play(&mut self, from_loop: bool) {
         let (Some(from), Some(note)) = (
             self.play_start(from_loop),
@@ -1200,12 +1204,7 @@ impl LimewaveApp {
         ) else {
             return;
         };
-        let velocity = self.ui.velocity;
-        self.send(Command::NoteOn {
-            note,
-            from,
-            velocity,
-        });
+        self.send(Command::PlaySample { note, from });
     }
 
     /// Selects Start...End.
@@ -3377,6 +3376,44 @@ mod tests {
             unreachable!()
         };
         assert!(first.dialog_preview.is_none(), "the preview ended");
+    }
+
+    #[test]
+    fn play_sounds_the_selected_sample_even_with_an_instrument_set() {
+        use crate::audio::voice::{InstrumentPlay, Playback, RegionPlay};
+        let (engine, mut out) = crate::audio::engine::headless(48_000);
+        let mut app = LimewaveApp::build(egui::Context::default(), Some(engine), None);
+        app.files = vec![FileEntry::Loaded(Box::new(short_session()))];
+        app.select(0);
+        let session = app.selected_session().unwrap();
+        let session_source = session.source;
+        let mut buffer = session.play_buffer();
+        buffer.source = u64::MAX;
+        let region = RegionPlay {
+            buffer,
+            lokey: 0,
+            hikey: 127,
+            lovel: 1,
+            hivel: 127,
+            gain: 1.0,
+            veltrack: 0.0,
+            playback: Playback::Normal,
+            adsr: Adsr::DEFAULT,
+        };
+        app.engine
+            .as_ref()
+            .unwrap()
+            .set_instrument(Some(InstrumentPlay {
+                regions: vec![region],
+                source: u64::MAX,
+            }));
+        for from_loop in [false, true] {
+            app.play(from_loop);
+            out.render(64);
+            assert_eq!(out.voice_sources(), [session_source], "loop: {from_loop}");
+            app.release_all();
+            out.render(48_000);
+        }
     }
 
     #[test]

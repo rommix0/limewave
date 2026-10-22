@@ -12,7 +12,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, I24, SampleFormat, SizedSample, StreamConfig, U24};
 use limewave_core::edit::LoopMode;
 
-use super::voice::{Adsr, InstrumentPlay, PlayBuffer, Voice, velocity_gain};
+use super::voice::{Adsr, InstrumentPlay, PlayBuffer, STEAL_FADE_MS, Voice, velocity_gain};
 
 pub use super::voice::MAX_VOICES;
 
@@ -31,6 +31,12 @@ pub enum Command {
         note: u8,
         from: usize,
         velocity: u8,
+    },
+    /// Plays `note` from frame `from` of the current buffer, like `NoteOn` without an
+    /// instrument, even when one is set: the Play button always plays the shown sample.
+    PlaySample {
+        note: u8,
+        from: usize,
     },
     NoteOff {
         note: u8,
@@ -126,10 +132,8 @@ impl Default for Cursors {
     }
 }
 
-/// How long a stolen voice takes to fade out.
-const STEAL_FADE_MS: f32 = 5.0;
-/// Spare slots where stolen voices fade out.
-const DYING_VOICES: usize = 4;
+/// Spare slots where stolen voices fade out. One note-on can steal a voice per layer.
+const DYING_VOICES: usize = MAX_VOICES / 2;
 
 /// Voice slots owned by the audio callback.
 pub struct MixerState {
@@ -167,6 +171,9 @@ impl MixerState {
                 Some(instrument) => self.regions_on(note, velocity, instrument, device_rate),
                 None => self.note_on(note, from, None, None, buf, device_rate),
             },
+            Command::PlaySample { note, from } => {
+                self.note_on(note, from, None, None, buf, device_rate);
+            }
             Command::PreviewOn {
                 note,
                 from,
@@ -336,26 +343,30 @@ pub struct Sources<'a> {
 }
 
 impl<'a> Sources<'a> {
-    /// The buffer whose source is `source`: one of the two buffers, else a region of the
-    /// current then the previous instrument. Does not allocate.
-    fn find(&self, source: u64) -> Option<&'a PlayBuffer> {
-        let regions = [self.instrument, self.previous_instrument]
-            .into_iter()
-            .flatten()
-            .flat_map(|m| &m.regions)
-            .map(|r| &r.buffer);
-        [self.current, self.previous]
-            .into_iter()
-            .chain(regions)
-            .find(|b| b.source == source)
+    /// The buffer `v` plays: for an instrument voice the region with its source in the
+    /// current then the previous instrument, else whichever of the two buffers has it. Does
+    /// not allocate.
+    fn find(&self, v: &Voice) -> Option<&'a PlayBuffer> {
+        if v.is_instrument() {
+            [self.instrument, self.previous_instrument]
+                .into_iter()
+                .flatten()
+                .flat_map(|m| &m.regions)
+                .map(|r| &r.buffer)
+                .find(|b| b.source == v.source())
+        } else {
+            [self.current, self.previous]
+                .into_iter()
+                .find(|b| b.source == v.source())
+        }
     }
 }
 
 /// The body of the audio callback: applies pending commands (new notes play the current
 /// instrument, else the current buffer), then fills interleaved `out` (cleared first) with the
 /// mixed voices, stolen ones still fading included, clamped to [-1, 1]. Each voice plays
-/// whichever buffer or instrument region in `sources` has its source; a voice whose source is
-/// in none is dropped. Afterwards the voices' positions are published to `cursors`. Does not
+/// the buffer (or, for an instrument voice, the region) in `sources` with its source; a voice
+/// whose source is in none is dropped. Afterwards the voices' positions are published to `cursors`. Does not
 /// allocate.
 pub fn process(
     state: &mut MixerState,
@@ -373,7 +384,7 @@ pub fn process(
     if channels > 0 {
         for slot in state.voices.iter_mut().chain(&mut state.dying) {
             let Some(v) = slot else { continue };
-            let buf = sources.find(v.source());
+            let buf = sources.find(v);
             if !buf.is_some_and(|b| v.render_add(b, out, channels, device_rate)) {
                 *slot = None;
             }
@@ -741,9 +752,10 @@ fn report_stream_error(e: cpal::Error) {
 
 #[cfg(test)]
 mod tests {
-    use super::super::voice::{Adsr, Playback, RegionPlay, velocity_gain};
+    use super::super::voice::{Adsr, Playback, RegionPlay, ampeg_to_adsr, velocity_gain};
     use super::*;
     use limewave_core::edit::LoopMode;
+    use limewave_core::sfz::Ampeg;
 
     const RATE: u32 = 48_000;
     /// No attack or decay, so a voice plays at full level until its 10 ms (480 frame) release.
@@ -1944,5 +1956,101 @@ mod tests {
         });
         out.render(16);
         assert_eq!(out.voice_sources(), [1, 1]);
+    }
+    #[test]
+    fn a_region_with_no_release_still_fades() {
+        let (mut engine, mut out) = headless(RATE);
+        let mut r = region(constant(11, 0.25), (0, 127), (1, 127));
+        // The SFZ defaults: `ampeg_release=0`.
+        r.adsr = ampeg_to_adsr(&Ampeg {
+            attack: 0.0,
+            decay: 0.0,
+            sustain: 100.0,
+            release: 0.0,
+        });
+        engine.set_instrument(instrument(100, vec![r]));
+        engine.send(note_on(60, 100));
+        out.render(100);
+        engine.send(Command::NoteOff { note: 60 });
+        let got = left(&out.render(300));
+        assert!(got[..240].iter().all(|s| *s > 0.0), "sounds for 5 ms");
+        let worst = got
+            .windows(2)
+            .map(|w| (w[1] - w[0]).abs())
+            .fold(0.0f32, f32::max);
+        assert!(worst <= 0.25 / 240.0 + 1e-6, "a step of {worst}");
+        assert!(got[240..].iter().all(|s| *s == 0.0));
+        assert!(out.voice_sources().is_empty());
+    }
+
+    #[test]
+    fn play_sample_ignores_the_instrument() {
+        let (mut engine, mut out) = headless(RATE);
+        engine.set_buffer(constant(1, 0.25));
+        engine.set_envelope(FLAT);
+        engine.set_instrument(instrument(
+            100,
+            vec![region(constant(11, 0.5), (0, 127), (1, 127))],
+        ));
+        engine.send(Command::PlaySample { note: 60, from: 0 });
+        let got = left(&out.render(64));
+        assert!(
+            got.iter().all(|s| (*s - 0.25).abs() < 1e-6),
+            "{:?}",
+            &got[..4]
+        );
+        assert_eq!(out.voice_sources(), [1]);
+    }
+
+    #[test]
+    fn voices_look_for_their_source_only_among_their_own_kind() {
+        let (mut engine, mut out) = headless(RATE);
+        engine.set_buffer(constant(1, 0.25));
+        engine.set_envelope(FLAT);
+        // A region whose source is the buffer's too.
+        engine.set_instrument(instrument(
+            100,
+            vec![region(constant(1, 0.5), (60, 60), (1, 127))],
+        ));
+        engine.send(note_on(60, 100));
+        let got = left(&out.render(64));
+        assert!(got.iter().all(|s| (*s - 0.5).abs() < 1e-6), "the region");
+        engine.send(Command::AllOff);
+        out.render(600);
+        engine.send(Command::PlaySample { note: 60, from: 0 });
+        let got = left(&out.render(64));
+        assert!(got.iter().all(|s| (*s - 0.25).abs() < 1e-6), "the buffer");
+    }
+
+    #[test]
+    fn stolen_layers_fade_instead_of_cutting() {
+        let (mut engine, mut out) = headless(RATE);
+        // Eight layers of 0.04 with a 5 ms (240 frame) attack: two notes fill every slot.
+        let layers = (0..8)
+            .map(|i| {
+                let mut r = region(constant(11 + i, 0.04), (0, 127), (1, 127));
+                r.adsr = Adsr {
+                    attack_ms: 5.0,
+                    decay_ms: 0.0,
+                    sustain: 1.0,
+                    release_ms: 1000.0,
+                };
+                r
+            })
+            .collect();
+        engine.set_instrument(instrument(100, layers));
+        engine.send(note_on(60, 100));
+        engine.send(note_on(61, 100));
+        let mut got = left(&out.render(300));
+        assert!((got[299] - 0.64).abs() < 1e-5, "sixteen held voices");
+        // The third note steals all eight of the first note's voices at full level.
+        engine.send(note_on(62, 100));
+        got.extend(left(&out.render(600)));
+        let worst = got[250..]
+            .windows(2)
+            .map(|w| (w[1] - w[0]).abs())
+            .fold(0.0f32, f32::max);
+        assert!(worst <= 2.0 * 0.32 / 240.0 + 1e-6, "a step of {worst}");
+        assert!((got[899] - 0.64).abs() < 1e-5, "the stolen voices are gone");
     }
 }

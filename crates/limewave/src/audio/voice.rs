@@ -8,6 +8,9 @@ use limewave_core::sfz::Ampeg;
 
 /// Maximum simultaneous audition voices.
 pub const MAX_VOICES: usize = 16;
+/// How long a stolen or stopped voice takes to fade out, and the shortest release an
+/// instrument region plays (spec §6.2), so its notes never click off.
+pub const STEAL_FADE_MS: f32 = 5.0;
 /// Longest attack, decay or release time in milliseconds.
 const MAX_STAGE_MS: f32 = 10_000.0;
 
@@ -76,16 +79,21 @@ impl Adsr {
     }
 }
 
-/// An instrument region's `ampeg_*` values as an [`Adsr`]: seconds to milliseconds and the
-/// sustain percentage to 0…1, clamped.
+/// An instrument region's `ampeg_*` values as an [`Adsr`] for audition: seconds to
+/// milliseconds and the sustain percentage to 0…1, clamped, with the release at least
+/// [`STEAL_FADE_MS`] so a note-off never clicks (spec §6.2).
 pub fn ampeg_to_adsr(a: &Ampeg) -> Adsr {
-    Adsr {
+    let adsr = Adsr {
         attack_ms: a.attack * 1000.0,
         decay_ms: a.decay * 1000.0,
         sustain: a.sustain / 100.0,
         release_ms: a.release * 1000.0,
     }
-    .clamped()
+    .clamped();
+    Adsr {
+        release_ms: adsr.release_ms.max(STEAL_FADE_MS),
+        ..adsr
+    }
 }
 
 /// Output frames an envelope stage of `ms` lasts at `rate`.
@@ -142,7 +150,8 @@ pub enum Playback {
 #[derive(Clone, Debug)]
 pub struct RegionPlay {
     /// The region's sample with the region's start, end, loop and pitch. Its `source` is the
-    /// region's own and stays the same while the region is edited.
+    /// region's own: unique among the regions of the current and previous instruments, and
+    /// the same while the region is edited. Region voices look only among regions for it.
     pub buffer: PlayBuffer,
     pub lokey: u8,
     pub hikey: u8,
@@ -1260,14 +1269,15 @@ mod tests {
         assert!((got.decay_ms - 1500.0).abs() < 1e-3, "{got:?}");
         assert!((got.sustain - 0.4).abs() < 1e-6, "{got:?}");
         assert!((got.release_ms - 250.0).abs() < 1e-3, "{got:?}");
-        // The SFZ defaults: no attack, decay or release, full sustain.
+        // The SFZ defaults: no attack or decay, full sustain, and no release, which gets the
+        // 5 ms floor.
         let zero = Ampeg {
             attack: 0.0,
             decay: 0.0,
             sustain: 100.0,
             release: 0.0,
         };
-        assert_eq!(ampeg_to_adsr(&zero), adsr(0.0, 0.0, 1.0, 0.0));
+        assert_eq!(ampeg_to_adsr(&zero), adsr(0.0, 0.0, 1.0, STEAL_FADE_MS));
         // Out of range values are clamped.
         let wild = Ampeg {
             attack: 20.0,
