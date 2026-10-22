@@ -1818,3 +1818,19 @@ fn region_settings_are_read_once_per_change() {
     h.state_mut().redo();
     assert_eq!(unsaved_regions(st(&h), &h.state().files), [true, false]);
 }
+
+#[test]
+fn a_region_keeping_its_own_loop_says_so_above_the_waveform() {
+    let (_dir, mut h) = open_text(
+        "<region> sample=a.wav pitch_keycenter=60 hikey=59\n\
+         <region> sample=a.wav pitch_keycenter=62 lokey=60\n",
+    );
+    let note = "Loop edits change the shared sample; this region keeps its own loop";
+    h.state_mut().select_region(0);
+    h.run();
+    assert!(h.query_by_label(note).is_none(), "the first region follows");
+    h.state_mut().select_region(1);
+    h.run();
+    h.get_by_label(note);
+    assert_eq!(st(&h).selected_region, Some(1), "editing is not blocked");
+}

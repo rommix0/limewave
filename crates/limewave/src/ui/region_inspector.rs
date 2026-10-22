@@ -30,6 +30,11 @@ pub enum RegionEdit {
 /// What the inspector says of a region that keeps its own tuning and loop (spec 4.3).
 pub const OWN_TUNING: &str = "This region keeps its own tuning and loop";
 
+/// What the editor says above the waveform while such a region is selected: its markers still
+/// edit the shared sample.
+pub const OWN_LOOP_NOTE: &str =
+    "Loop edits change the shared sample; this region keeps its own loop";
+
 /// The selected region of an open instrument, as the inspector needs it.
 pub struct RegionContext<'a> {
     pub st: &'a InstrumentState,

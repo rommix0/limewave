@@ -51,7 +51,9 @@ use crate::ui::keymap::{KeyMapAction, key_map};
 use crate::ui::new_dialog::{BitDepth, NewDialogState, new_dialog};
 use crate::ui::overview::overview;
 use crate::ui::record_panel::{NO_INPUT, RecordPanelState, record_panel};
-use crate::ui::region_inspector::{OWN_TUNING, RegionContext, RegionEdit, region_only};
+use crate::ui::region_inspector::{
+    OWN_LOOP_NOTE, OWN_TUNING, RegionContext, RegionEdit, region_only,
+};
 use crate::ui::regions::{RegionListAction, region_list, unassigned_cached};
 use crate::ui::save_dialog::{
     InstrumentSaveRequest, SaveCommand, SaveDialogState, SaveFormat, SaveRequest, SaveResult,
@@ -3057,6 +3059,12 @@ impl LimewaveApp {
     }
 
     fn central(&mut self, ui: &mut egui::Ui, cursors: &[Cursor]) {
+        // The selected region keeps its own loop, yet the markers edit the sample it shares.
+        let own_loop = self.instrument.as_ref().is_some_and(|st| {
+            st.selected_region.is_some_and(|r| {
+                !RegionContext::new(st, r).follows && st.region_file(r) == self.selected
+            })
+        });
         let engine = self.engine.as_ref();
         let ui_state = &mut self.ui;
         let Some(entry) = self.selected.and_then(|i| self.files.get_mut(i)) else {
@@ -3067,6 +3075,9 @@ impl LimewaveApp {
         match entry {
             FileEntry::Loaded(s) => {
                 ui.label(format!("{} frames", s.frames()));
+                if own_loop {
+                    ui.label(egui::RichText::new(OWN_LOOP_NOTE).color(colors::LOOP));
+                }
                 overview(ui, s, cursors);
                 ui.add_space(4.0);
                 egui::Panel::bottom("seam")
