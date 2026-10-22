@@ -331,8 +331,8 @@ pub fn redraw_samples(
 ///
 /// Start, End and the loop points move with the audio, scaled by `round(f * to / from)` (see
 /// [`resample_map`]): Start and the loop start directly, End and the loop end as the position
-/// one past them, and the crossfade by the same ratio. A loop whose scaled length is
-/// under 2 frames is turned off. Returns `None` when `to` is the current rate or outside
+/// one past them, and the crossfade by the same ratio. An end never lies before its start,
+/// and a loop whose mapped points span fewer than 2 frames is turned off. Returns `None` when `to` is the current rate or outside
 /// `MIN_RATE..=MAX_RATE`, the current rate is 0, or `processed` holds no frames.
 pub fn resample_edit(
     e: &EditState,
@@ -357,13 +357,18 @@ pub fn resample_edit(
     };
     let scale = |f| resample_map(std::slice::from_ref(&step), f);
     // An inclusive end marker maps as the position one past it, so an End on the last frame
-    // lands on the new last frame and a loop keeps its length to within a frame.
+    // lands on the new last frame and a loop keeps its length to within a frame. Both steps
+    // saturate: a frame at the top of the range stays there, and position 0 stays at 0.
     let scale_end = |f: usize| scale(f.saturating_add(1)).saturating_sub(1);
     let mut r = e.clone();
     (r.start, r.end) = (scale(e.start), scale_end(e.end));
     (r.loop_start, r.loop_end) = (scale(e.loop_start), scale_end(e.loop_end));
+    // At a tiny rate a start and its end can cross; an end never lies before its start.
+    r.end = r.end.max(r.start);
+    r.loop_end = r.loop_end.max(r.loop_start);
     r.crossfade = resampled_len(e.crossfade, from, to);
-    if r.loop_mode != LoopMode::Off && resampled_len(e.loop_len(), from, to) < 2 {
+    // A loop that the scaling leaves under 2 frames cannot play.
+    if r.loop_mode != LoopMode::Off && r.loop_end + 1 - r.loop_start < 2 {
         r.loop_mode = LoopMode::Off;
     }
     r.effects.push(step);
@@ -1059,6 +1064,24 @@ mod tests {
         assert_eq!(r.loop_mode, LoopMode::Off);
         assert_eq!(r.end, 999);
         assert!(r.loop_start <= r.loop_end && r.loop_end <= r.end);
+        assert!(r.start <= r.end);
+    }
+
+    #[test]
+    fn crossing_markers_stay_in_order_at_a_tiny_rate() {
+        let mut e = EditState::default_for(96_000);
+        (e.start, e.end) = (50, 50);
+        let r = resample_edit(&e, &[vec![0.0; 96_000]], 1_000, 96_000, 96_000).unwrap();
+        assert!(r.start <= r.end);
+        assert!(r.loop_start <= r.loop_end);
+    }
+
+    #[test]
+    fn a_loop_the_mapping_squeezes_under_two_frames_is_turned_off() {
+        let mut e = EditState::default_for(100);
+        (e.loop_mode, e.loop_start, e.loop_end) = (LoopMode::Forward, 1, 3);
+        let r = resample_edit(&e, &[vec![0.0; 100]], 1000, 2000, 100).unwrap();
+        assert_eq!(r.loop_mode, LoopMode::Off);
     }
 
     #[test]
