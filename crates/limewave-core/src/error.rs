@@ -52,4 +52,6 @@ pub enum SaveError {
     NoFileName(PathBuf),
     #[error("saving to {} would overwrite the original without a backup", .0.display())]
     WouldOverwriteOriginal(PathBuf),
+    #[error("the saved instrument would not find the sample {}", .0.display())]
+    SamplePath(PathBuf),
 }

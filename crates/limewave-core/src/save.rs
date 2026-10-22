@@ -393,7 +393,7 @@ pub fn build_wav_bytes(doc: &WavDocument, e: &EditState) -> Vec<u8> {
 
 /// Whether two paths name the same file. Falls back to comparing the paths as given when
 /// either cannot be resolved (e.g. it does not exist).
-pub(crate) fn same_file(a: &Path, b: &Path) -> bool {
+fn same_file(a: &Path, b: &Path) -> bool {
     match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
         (Ok(a), Ok(b)) => a == b,
         _ => a == b,

@@ -1,17 +1,18 @@
 //! Saving an instrument: the `.sfz` and the WAVs it plays (spec 7).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
 use super::bind::{Binding, write_back};
 use super::model::Instrument;
+use super::paths::{is_absolute_text, normalize, same_file_key, sample_path, stays_inside};
 use super::write::write;
 use crate::document::WavDocument;
 use crate::edit::EditState;
 use crate::error::SaveError;
 use crate::save::{
-    Destination, SaveOutcome, backup_existing, build_wav_bytes, make_backup, same_file,
-    write_atomic,
+    Destination, SaveOutcome, backup_existing, build_wav_bytes, make_backup, write_atomic,
 };
 
 /// One loaded sample being saved.
@@ -55,25 +56,6 @@ pub fn wav_edit_for_save(doc: &WavDocument, edit: &EditState, write_smpl: bool) 
     }
 }
 
-/// `path` with `.` dropped and `..` folded into the part before it, without touching the disk.
-fn normalize(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for c in path.components() {
-        match c {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if matches!(out.components().next_back(), Some(Component::Normal(_))) {
-                    out.pop();
-                } else {
-                    out.push("..");
-                }
-            }
-            other => out.push(other.as_os_str()),
-        }
-    }
-    out
-}
-
 /// `file` relative to `dir` when it lies inside it (after normalising both).
 fn inside(dir: &Path, file: &Path) -> Option<PathBuf> {
     let rel = normalize(file)
@@ -83,6 +65,45 @@ fn inside(dir: &Path, file: &Path) -> Option<PathBuf> {
     (!rel.components().any(|c| matches!(c, Component::ParentDir))).then_some(rel)
 }
 
+/// `target` as a `/` path from the folder `base`, climbing with `..`; `None` when there is no
+/// such path (different drives or roots, or `base` itself climbs).
+fn relative_text(base: &Path, target: &Path) -> Option<String> {
+    let (base, target) = (normalize(base), normalize(target));
+    let b: Vec<Component> = base.components().collect();
+    let t: Vec<Component> = target.components().collect();
+    let common = b.iter().zip(&t).take_while(|(x, y)| x == y).count();
+    let rooted =
+        |c: Option<&Component>| matches!(c, Some(Component::Prefix(_) | Component::RootDir));
+    if common == 0 && (rooted(b.first()) || rooted(t.first())) {
+        return None;
+    }
+    if !b[common..]
+        .iter()
+        .all(|c| matches!(c, Component::Normal(_)))
+    {
+        return None;
+    }
+    let mut parts: Vec<String> = vec!["..".to_owned(); b.len() - common];
+    parts.extend(
+        t[common..]
+            .iter()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned()),
+    );
+    Some(parts.join("/"))
+}
+
+/// The `sample=` text that reaches `target` from a saved instrument in `target_dir` with this
+/// `default_path`: a path relative to the default folder, or the absolute path when none exists.
+fn moved_text(target_dir: &Path, default_path: &str, target: &Path) -> String {
+    let dp = default_path.replace('\\', "/");
+    let base = if is_absolute_text(&dp) {
+        PathBuf::from(&dp)
+    } else {
+        target_dir.join(&dp)
+    };
+    relative_text(&base, target).unwrap_or_else(|| target.to_string_lossy().replace('\\', "/"))
+}
+
 /// Where a sample is written, and the `sample=` text its regions need if that changed.
 struct Plan {
     /// Index into the binding's samples.
@@ -90,23 +111,6 @@ struct Plan {
     source: PathBuf,
     target: PathBuf,
     moved_text: Option<String>,
-}
-
-/// The `sample=` text for `samples/<name>` as resolved against `default_path`.
-fn moved_text(default_path: &str, name: &str) -> String {
-    let d = default_path.replace('\\', "/");
-    let parts: Vec<&str> = d
-        .split('/')
-        .filter(|p| !p.is_empty() && *p != ".")
-        .collect();
-    // A default path that is absolute or climbs out cannot be undone by a relative prefix.
-    let plain = !d.starts_with('/') && !d.contains(':') && !parts.contains(&"..");
-    let up = if plain {
-        "../".repeat(parts.len())
-    } else {
-        String::new()
-    };
-    format!("{up}samples/{name}")
 }
 
 /// The first free `name`, `stem (2).ext`, `stem (3).ext`, … in `samples/`; the chosen name is
@@ -127,19 +131,26 @@ fn free_name(taken: &mut HashSet<String>, name: &std::ffi::OsStr) -> String {
         .unwrap_or_default()
 }
 
-/// Targets for a save into `target_dir`: samples inside the instrument's folder keep their
-/// place under it; the rest are gathered in `samples/` (spec 7.1).
-fn plan_into(
-    binding: &Binding,
-    sfz_dir: &Path,
-    target_dir: &Path,
-    default_path: &str,
-) -> Vec<Plan> {
+/// Targets for a save into `target_dir`. A sample keeps its place under it only when every
+/// region names it by a relative text that stays inside the instrument's folder; any other
+/// (a `..` path, an absolute path or default path) is gathered in `samples/` (spec 7.1).
+fn plan_into(inst: &Instrument, binding: &Binding, sfz_dir: &Path, target_dir: &Path) -> Vec<Plan> {
+    let default_path = inst.default_path();
     let mut taken = HashSet::new();
     let mut plans: Vec<Option<Plan>> = binding.samples.iter().map(|_| None).collect();
     // Samples keeping their place go first, so they hold their names against moved ones.
     for (index, s) in binding.samples.iter().enumerate() {
-        if let Some(rel) = inside(sfz_dir, &s.path) {
+        let relative = s.regions.iter().all(|&r| {
+            inst.region_info(r)
+                .sample
+                .is_some_and(|text| stays_inside(&default_path, &text))
+        });
+        let rel = if relative {
+            inside(sfz_dir, &s.path)
+        } else {
+            None
+        };
+        if let Some(rel) = rel {
             taken.insert(rel.to_string_lossy().replace('\\', "/").to_lowercase());
             plans[index] = Some(Plan {
                 index,
@@ -152,11 +163,12 @@ fn plan_into(
     for (index, s) in binding.samples.iter().enumerate() {
         if plans[index].is_none() {
             let name = free_name(&mut taken, s.path.file_name().unwrap_or_default());
+            let target = target_dir.join("samples").join(&name);
             plans[index] = Some(Plan {
                 index,
                 source: s.path.clone(),
-                target: target_dir.join("samples").join(&name),
-                moved_text: Some(moved_text(default_path, &name)),
+                moved_text: Some(moved_text(target_dir, &default_path, &target)),
+                target,
             });
         }
     }
@@ -171,14 +183,39 @@ fn create_parent(target: &Path) -> Result<(), SaveError> {
     Ok(())
 }
 
+/// What identifies a file: its resolved path, or the path as given when it cannot be resolved.
+fn file_id(p: &Path) -> PathBuf {
+    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+}
+
+/// One WAV to write, decided before anything is touched.
+struct Job {
+    /// Index into the binding's samples.
+    index: usize,
+    source: PathBuf,
+    target: PathBuf,
+    /// An open handle on the source when the WAV is copied as it is; `None` when it is rebuilt.
+    copy: Option<std::fs::File>,
+    in_place: bool,
+}
+
 /// Saves the instrument and its samples (spec 7).
 ///
-/// `sfz_path` is where the instrument was read from (or the picked path when untitled), and
-/// `samples` is parallel to `binding.samples`: `None` for a sample that is not loaded, which is
-/// then copied or left as it is. Sample edits are written into the instrument's opcodes first.
-/// `Folder` and `File` write the `.sfz` and every sample under the new place; the two overwrite
-/// kinds write over the originals and skip unchanged WAVs. The WAVs are written first and the
-/// `.sfz` last.
+/// `sfz_path` is where the instrument was read from (or the picked path when untitled); it must
+/// be absolute. `samples` is parallel to `binding.samples`: `None` for a sample that is not
+/// loaded, which is then copied or left as it is. Sample edits are written into the
+/// instrument's opcodes first.
+///
+/// `Folder` and `File` write the `.sfz` and every sample under the new place, so a saved copy
+/// plays its own files. `Folder` refuses any target that is the same file as the source `.sfz`
+/// or any sample. The two overwrite kinds write over the originals and skip unchanged WAVs.
+/// `File` with a target that is its own source behaves the same way: unchanged files are
+/// skipped, changed ones are overwritten after a `.bak`.
+///
+/// Nothing is replaced until everything that can fail beforehand has passed: the targets are
+/// checked, every WAV to be copied is opened, and every backup (the `.sfz`'s too) is made. Then
+/// the WAVs are written, and the `.sfz` last. A failed backup or open aborts with nothing
+/// replaced (backups already made stay).
 pub fn save_instrument(
     inst: &Instrument,
     sfz_path: &Path,
@@ -187,6 +224,7 @@ pub fn save_instrument(
     dest: &Destination,
     write_smpl: bool,
 ) -> Result<InstrumentSaved, SaveError> {
+    debug_assert!(sfz_path.is_absolute(), "{}", sfz_path.display());
     let mut out = inst.clone();
     for (sample, save) in binding.samples.iter().zip(samples) {
         if let Some(s) = save {
@@ -204,8 +242,16 @@ pub fn save_instrument(
         Destination::OverwriteWithBackup | Destination::ReplaceSaved => sfz_path.to_path_buf(),
         Destination::File(p) => p.clone(),
     };
-    let plans = match dest {
-        Destination::OverwriteWithBackup | Destination::ReplaceSaved => binding
+    let moving = matches!(dest, Destination::Folder(_) | Destination::File(_));
+    let plans = if moving {
+        plan_into(
+            inst,
+            binding,
+            sfz_path.parent().unwrap_or(Path::new("")),
+            sfz_target.parent().unwrap_or(Path::new("")),
+        )
+    } else {
+        binding
             .samples
             .iter()
             .enumerate()
@@ -215,80 +261,127 @@ pub fn save_instrument(
                 target: s.path.clone(),
                 moved_text: None,
             })
-            .collect(),
-        Destination::Folder(_) | Destination::File(_) => plan_into(
-            binding,
-            sfz_path.parent().unwrap_or(Path::new("")),
-            sfz_target.parent().unwrap_or(Path::new("")),
-            &inst.default_path(),
-        ),
+            .collect()
     };
-    if matches!(dest, Destination::Folder(_)) {
-        let clash = std::iter::once((&sfz_target, sfz_path))
-            .chain(plans.iter().map(|p| (&p.target, p.source.as_path())))
-            .find(|(target, source)| same_file(target, source));
-        if let Some((target, _)) = clash {
-            return Err(SaveError::WouldOverwriteOriginal(target.clone()));
+
+    if moving {
+        // A target may be its own source only for `File` (see above); never another file's.
+        let strict = matches!(dest, Destination::Folder(_));
+        let mut by_id: HashMap<PathBuf, Vec<usize>> = HashMap::new();
+        let sources = std::iter::once(sfz_path).chain(plans.iter().map(|p| p.source.as_path()));
+        for (i, source) in sources.enumerate() {
+            by_id.entry(file_id(source)).or_default().push(i);
         }
-    }
-    for plan in &plans {
-        if let Some(text) = &plan.moved_text {
+        let targets = std::iter::once(&sfz_target).chain(plans.iter().map(|p| &p.target));
+        for (i, target) in targets.enumerate() {
+            let hits = by_id.get(&file_id(target));
+            if hits.is_some_and(|h| h.iter().any(|&s| strict || s != i)) {
+                return Err(SaveError::WouldOverwriteOriginal(target.clone()));
+            }
+        }
+        for plan in &plans {
+            if let Some(text) = &plan.moved_text {
+                for &region in &binding.samples[plan.index].regions {
+                    out.set(region, "sample", text);
+                }
+            }
+        }
+        // Every region must now reach its own target from the saved instrument.
+        let target_dir = sfz_target.parent().unwrap_or(Path::new(""));
+        let default_path = out.default_path();
+        for plan in &plans {
+            let want = same_file_key(&normalize(&plan.target));
             for &region in &binding.samples[plan.index].regions {
-                out.set(region, "sample", text);
+                let reached = out
+                    .region_info(region)
+                    .sample
+                    .map(|text| same_file_key(&sample_path(target_dir, &default_path, &text)));
+                if reached.as_deref() != Some(want.as_str()) {
+                    return Err(SaveError::SamplePath(plan.source.clone()));
+                }
             }
         }
     }
 
-    let mut written = Vec::new();
-    for plan in &plans {
-        let save = samples.get(plan.index).and_then(Option::as_ref);
-        let rewritten = save.and_then(|s| {
-            let e = wav_edit_for_save(s.doc, s.edit, write_smpl);
-            needs_rewrite(s.doc, &e).then(|| build_wav_bytes(s.doc, &e))
-        });
-        let in_place = same_file(&plan.target, &plan.source);
-        let bytes = match rewritten {
-            Some(b) => b,
-            None if in_place => continue,
-            None => std::fs::read(&plan.source)?,
+    // Phase 1: decide each WAV, open what is copied, make every backup.
+    let mut jobs = Vec::new();
+    for plan in plans {
+        let rewrite = samples
+            .get(plan.index)
+            .and_then(Option::as_ref)
+            .is_some_and(|s| needs_rewrite(s.doc, &wav_edit_for_save(s.doc, s.edit, write_smpl)));
+        let in_place = file_id(&plan.target) == file_id(&plan.source);
+        if in_place && !rewrite {
+            continue;
+        }
+        let copy = if rewrite {
+            None
+        } else {
+            Some(std::fs::File::open(&plan.source)?)
         };
-        let backup = if in_place {
+        jobs.push(Job {
+            index: plan.index,
+            source: plan.source,
+            target: plan.target,
+            copy,
+            in_place,
+        });
+    }
+    let mut outcomes = Vec::new();
+    for job in &jobs {
+        create_parent(&job.target)?;
+        let backup = if job.in_place {
             match dest {
                 Destination::ReplaceSaved => None,
-                _ => Some(make_backup(&plan.target)?),
+                _ => Some(make_backup(&job.target)?),
             }
         } else {
-            create_parent(&plan.target)?;
-            backup_existing(&plan.target)?
+            backup_existing(&job.target)?
         };
-        write_atomic(&plan.target, &plan.source, &bytes)?;
-        written.push(SaveOutcome {
-            written: plan.target.clone(),
+        outcomes.push(SaveOutcome {
+            written: job.target.clone(),
             backup,
         });
     }
-
     create_parent(&sfz_target)?;
-    let backup = match dest {
+    let sfz_backup = match dest {
         Destination::ReplaceSaved => None,
         _ => backup_existing(&sfz_target)?,
     };
+
+    // Phase 2: write the WAVs, then the `.sfz`.
+    for job in jobs {
+        let bytes = match job.copy {
+            Some(mut file) => {
+                let mut bytes = Vec::new();
+                file.read_to_end(&mut bytes)?;
+                bytes
+            }
+            None => {
+                let s = samples[job.index]
+                    .as_ref()
+                    .expect("a rebuilt sample is loaded");
+                build_wav_bytes(s.doc, &wav_edit_for_save(s.doc, s.edit, write_smpl))
+            }
+        };
+        write_atomic(&job.target, &job.source, &bytes)?;
+    }
     let source = if sfz_path.exists() {
         sfz_path
     } else {
         &sfz_target
     };
     write_atomic(&sfz_target, source, write(&out.file).as_bytes())?;
-    written.insert(
+    outcomes.insert(
         0,
         SaveOutcome {
             written: sfz_target.clone(),
-            backup,
+            backup: sfz_backup,
         },
     );
     Ok(InstrumentSaved {
         sfz: sfz_target,
-        written,
+        written: outcomes,
     })
 }
 
@@ -301,6 +394,7 @@ mod tests {
     use crate::sfz::bind::{bind, region_edit};
     use crate::sfz::model::Instrument;
     use crate::sfz::parse::{decode_text, parse};
+    use crate::sfz::paths::normalize;
     use crate::smpl::{Smpl, sample_period};
     use crate::testwav::{sine, wav_bytes};
     use crate::wav::SampleFormat;
@@ -415,6 +509,8 @@ mod tests {
         }
     }
 
+    /// Reopens a saved instrument: every region's sample is found, and each lies under the
+    /// folder of the `.sfz` (a copy plays its own files, not the originals).
     fn reopen_all_found(sfz: &Path) -> Binding {
         let o = open(sfz);
         assert!(
@@ -422,6 +518,14 @@ mod tests {
             "{:?}",
             o.binding.region_sample
         );
+        for s in &o.binding.samples {
+            assert!(
+                normalize(&s.path).starts_with(normalize(sfz.parent().unwrap())),
+                "{} is outside {}",
+                s.path.display(),
+                sfz.display()
+            );
+        }
         o.binding
     }
 
@@ -595,6 +699,144 @@ mod tests {
         assert_eq!(saved.sfz, picked);
         assert!(root.join("elsewhere/Samples/x.wav").is_file());
         reopen_all_found(&picked);
+    }
+
+    #[test]
+    fn absolute_sample_inside_the_folder_is_moved() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let x = put(root, "inst/Samples/x.wav", &wav_with(220.0, vec![]));
+        let abs = x.to_string_lossy().replace('\\', "/");
+        let sfz = put(
+            root,
+            "inst/a.sfz",
+            format!("<region> sample={abs} key=60\n").as_bytes(),
+        );
+        let o = open(&sfz);
+        assert_eq!(o.binding.samples.len(), 1);
+        let out = root.join("inst/limewave");
+        o.save(&Destination::Folder(out.clone()), false).unwrap();
+        let saved = text(&out.join("a.sfz"));
+        assert!(saved.contains("sample=samples/x.wav"), "{saved}");
+        assert!(out.join("samples/x.wav").is_file());
+        reopen_all_found(&out.join("a.sfz"));
+    }
+
+    #[test]
+    fn default_path_climbing_out_moves_every_sample() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let a = wav_with(220.0, vec![]);
+        put(root, "Samples/a.wav", &a);
+        let sfz = put(
+            root,
+            "inst/a.sfz",
+            b"<control> default_path=../Samples/\n<region> sample=a.wav key=60\n",
+        );
+        let o = open(&sfz);
+        assert_eq!(o.binding.region_sample, [Some(0)]);
+        let out = root.join("inst/limewave");
+        o.save(&Destination::Folder(out.clone()), false).unwrap();
+        assert_eq!(std::fs::read(out.join("samples/a.wav")).unwrap(), a);
+        reopen_all_found(&out.join("a.sfz"));
+        // Saving again from the copy still finds everything.
+        let again = open(&out.join("a.sfz"));
+        again
+            .save(&Destination::Folder(root.join("inst/limewave2")), false)
+            .unwrap();
+        reopen_all_found(&root.join("inst/limewave2/a.sfz"));
+    }
+
+    #[test]
+    fn default_path_with_all_samples_outside_reopens() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        put(root, "shared/y.wav", &wav_with(330.0, vec![]));
+        put(root, "shared/z.wav", &wav_with(440.0, vec![]));
+        let sfz = put(
+            root,
+            "inst/a.sfz",
+            b"<control> default_path=Kit/\n<region> sample=../../shared/y.wav key=60\n<region> sample=../../shared/z.wav key=62\n",
+        );
+        let o = open(&sfz);
+        assert_eq!(o.binding.samples.len(), 2);
+        let out = root.join("inst/limewave");
+        o.save(&Destination::Folder(out.clone()), false).unwrap();
+        let saved = text(&out.join("a.sfz"));
+        assert!(saved.contains("sample=../samples/y.wav"), "{saved}");
+        reopen_all_found(&out.join("a.sfz"));
+    }
+
+    #[test]
+    fn folder_refuses_to_write_over_another_samples_original() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let x = wav_with(220.0, vec![]);
+        let theirs = wav_with(330.0, vec![]);
+        put(root, "inst/x.wav", &x);
+        let other = put(root, "inst/limewave/x.wav", &theirs);
+        let sfz = put(
+            root,
+            "inst/a.sfz",
+            b"<region> sample=x.wav key=60\n<region> sample=limewave/x.wav key=62\n",
+        );
+        let o = open(&sfz);
+        assert_eq!(o.binding.samples.len(), 2);
+        let err = o
+            .save(&Destination::Folder(root.join("inst/limewave")), false)
+            .unwrap_err();
+        assert!(matches!(err, SaveError::WouldOverwriteOriginal(_)), "{err}");
+        assert_eq!(std::fs::read(&other).unwrap(), theirs);
+        assert!(!root.join("inst/limewave/a.sfz").exists());
+        assert!(!root.join("inst/limewave/limewave").exists());
+    }
+
+    #[test]
+    fn unreadable_copy_source_aborts_with_nothing_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        put(root, "inst/a.wav", &wav_with(220.0, vec![]));
+        let pb = put(root, "inst/b.wav", &wav_with(330.0, vec![]));
+        let sfz = put(
+            root,
+            "inst/i.sfz",
+            b"<region> sample=a.wav key=60\n<region> sample=b.wav key=62\n",
+        );
+        let out = root.join("out");
+        let old_sfz = put(&out, "i.sfz", b"old");
+        let old_a = put(&out, "a.wav", b"old a");
+        let mut o = open(&sfz);
+        // The first sample is rebuilt; the second is to be copied, and has vanished.
+        o.edits[0].end = 2999;
+        std::fs::remove_file(&pb).unwrap();
+        let err = o
+            .save(&Destination::Folder(out.clone()), false)
+            .unwrap_err();
+        assert!(matches!(err, SaveError::Io(_)), "{err}");
+        assert_eq!(std::fs::read(&old_sfz).unwrap(), b"old");
+        assert_eq!(std::fs::read(&old_a).unwrap(), b"old a");
+        assert!(!out.join("i.sfz.bak").exists());
+        assert!(!out.join("a.wav.bak").exists());
+        assert!(!out.join("b.wav").exists());
+    }
+
+    #[test]
+    fn folder_into_an_existing_folder_backs_up_what_it_replaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let x = wav_with(220.0, vec![]);
+        put(root, "inst/x.wav", &x);
+        let sfz = put(root, "inst/a.sfz", b"<region> sample=x.wav\n");
+        let out = root.join("inst/limewave");
+        let o = open(&sfz);
+        o.save(&Destination::Folder(out.clone()), false).unwrap();
+        let first_sfz = std::fs::read(out.join("a.sfz")).unwrap();
+
+        let saved = o.save(&Destination::Folder(out.clone()), false).unwrap();
+        assert_eq!(saved.written.len(), 2);
+        assert!(saved.written.iter().all(|w| w.backup.is_some()));
+        assert_eq!(std::fs::read(out.join("a.sfz.bak")).unwrap(), first_sfz);
+        assert_eq!(std::fs::read(out.join("x.wav.bak")).unwrap(), x);
     }
 
     #[test]

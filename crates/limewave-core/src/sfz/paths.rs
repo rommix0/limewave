@@ -2,37 +2,73 @@
 
 use std::path::{Component, Path, PathBuf};
 
-fn is_absolute_text(s: &str) -> bool {
+pub(crate) fn is_absolute_text(s: &str) -> bool {
     let b = s.as_bytes();
     s.starts_with('/') || (b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':')
 }
 
+/// `path` with `.` dropped and `..` folded into the part before it, without touching the
+/// disk. A `..` that has nothing to fold into is kept, except right after a root.
+pub fn normalize(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => match out.components().next_back() {
+                Some(Component::Normal(_)) => {
+                    out.pop();
+                }
+                Some(Component::RootDir | Component::Prefix(_)) => {}
+                _ => out.push(".."),
+            },
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// The text a sample resolves from: `/`-separated, `default_path` and the name joined unless
+/// the name is absolute.
+fn effective_text(default_path: &str, sample: &str) -> String {
+    let sample = sample.replace('\\', "/");
+    if is_absolute_text(&sample) {
+        return sample;
+    }
+    let mut d = default_path.replace('\\', "/");
+    if !d.is_empty() && !d.ends_with('/') {
+        d.push('/');
+    }
+    d + &sample
+}
+
+/// Whether a sample resolves to a place under the folder holding the `.sfz`: its effective
+/// text is relative and, once `.` and `..` are folded, does not climb out.
+pub fn stays_inside(default_path: &str, sample: &str) -> bool {
+    let text = effective_text(default_path, sample);
+    !is_absolute_text(&text)
+        && !normalize(Path::new(&text))
+            .components()
+            .any(|c| matches!(c, Component::ParentDir))
+}
+
 /// Path of a sample named in an instrument. `\` and `/` both separate folders;
 /// an absolute sample name is kept, else `default_path` and the name are
-/// joined onto the folder holding the `.sfz`.
+/// joined onto the folder holding the `.sfz`. `.` and `..` are folded in the
+/// text, so the result never depends on folders in between existing.
 pub fn sample_path(sfz_dir: &Path, default_path: &str, sample: &str) -> PathBuf {
-    let sample = sample.replace('\\', "/");
-    let mut text = if is_absolute_text(&sample) {
-        sample
-    } else {
-        let mut d = default_path.replace('\\', "/");
-        if !d.is_empty() && !d.ends_with('/') {
-            d.push('/');
-        }
-        d + &sample
-    };
+    let mut text = effective_text(default_path, sample);
     if is_absolute_text(&text) {
         // Collapse doubled separators but keep a leading one.
         while text.contains("//") && !text.starts_with("//") {
             text = text.replace("//", "/");
         }
-        return PathBuf::from(text);
+        return normalize(Path::new(&text));
     }
     let mut path = sfz_dir.to_path_buf();
     for part in text.split('/').filter(|p| !p.is_empty() && *p != ".") {
         path.push(part);
     }
-    path
+    normalize(&path)
 }
 
 /// The file at `path`: the exact one, else the one whose every component
@@ -97,10 +133,39 @@ mod tests {
             sample_path(dir, "", "Samples\\a b.wav"),
             dir.join("Samples").join("a b.wav")
         );
+        // `..` is folded in the text, so `base` need hold no folder to climb out of.
+        assert_eq!(sample_path(dir, "", "../x.wav"), PathBuf::from("x.wav"));
+        assert_eq!(sample_path(dir, "", "a/../b.wav"), dir.join("b.wav"));
         assert_eq!(
-            sample_path(dir, "", "../x.wav"),
-            dir.join("..").join("x.wav")
+            sample_path(Path::new("D:/Bank/Inst"), "Kit/", "../../shared/y.wav"),
+            PathBuf::from("D:/Bank/shared/y.wav")
         );
+    }
+
+    #[test]
+    fn dots_fold_lexically() {
+        assert_eq!(
+            normalize(Path::new("a/./b/../c")),
+            PathBuf::from("a").join("c")
+        );
+        assert_eq!(normalize(Path::new("../a")), PathBuf::from("..").join("a"));
+        assert_eq!(normalize(Path::new("a/../..")), PathBuf::from(".."));
+        assert_eq!(normalize(Path::new("/../a")), PathBuf::from("/a"));
+    }
+
+    #[test]
+    fn stays_inside_only_for_relative_texts_that_do_not_climb() {
+        assert!(stays_inside("", "Samples\\x.wav"));
+        assert!(stays_inside("Kit/", "../Kit/x.wav"));
+        assert!(stays_inside("", "a/../b.wav"));
+        assert!(!stays_inside("", "../x.wav"));
+        assert!(!stays_inside("Kit/", "../../x.wav"));
+        assert!(!stays_inside("../Samples/", "x.wav"));
+        assert!(!stays_inside("", "/abs/x.wav"));
+        assert!(!stays_inside("", "C:\\abs\\x.wav"));
+        // An absolute default path points anywhere, even into the folder.
+        assert!(!stays_inside("C:/inst/Kit/", "x.wav"));
+        assert!(!stays_inside("/inst/Kit/", "x.wav"));
     }
 
     #[test]
