@@ -37,8 +37,8 @@ use crate::audio::record::{Recorder, StopReason, Take};
 use crate::audio::voice::{Adsr, PlayBuffer, play_buffer};
 use crate::folder;
 use crate::instrument::{
-    InstrumentState, is_region_source, new_instrument_model, play_map, set_envelope, set_keys,
-    set_playback, set_velocities, set_volume,
+    InstrumentState, describe, is_region_source, new_instrument_model, play_map, set_envelope,
+    set_keys, set_playback, set_velocities, set_volume,
 };
 use crate::render_worker::{RenderKey, RenderSlot};
 use crate::theme::{self, colors};
@@ -1002,20 +1002,29 @@ impl LimewaveApp {
         let Some(dir) = self.folder.clone().filter(|_| self.can_new_instrument()) else {
             return;
         };
-        let (wavs, left_out): (Vec<(String, u8)>, Vec<_>) = self
+        let (sessions, left_out): (Vec<(String, &Session)>, Vec<_>) = self
             .files
             .iter()
             .filter_map(|f| match f {
-                FileEntry::Loaded(s) => Some((f.file_name(), s.edit().root)),
+                FileEntry::Loaded(s) => Some((f.file_name(), &**s)),
                 _ => None,
             })
             .partition(|(name, _)| value_round_trips("sample", name));
         let left_out = left_out.len();
-        if wavs.is_empty() {
+        if sessions.is_empty() {
             self.ui.message = Some(left_out_message(left_out));
             return;
         }
-        let inst = new_instrument_model(&wavs);
+        // Mapped where each WAV sounds now; each region then says what its sample's editor
+        // started from, so it follows the sample and a save writes the edits made since.
+        let wavs: Vec<(String, u8)> = sessions
+            .iter()
+            .map(|(name, s)| (name.clone(), s.edit().root))
+            .collect();
+        let mut inst = new_instrument_model(&wavs);
+        for (region, (_, s)) in sessions.iter().enumerate() {
+            describe(&mut inst, region, &s.doc.initial_edit(), s.history.first());
+        }
         let path = dir.join("Untitled instrument.sfz");
         let mut st = InstrumentState::new(path, inst, Some(PendingAction::OpenFolder(dir)));
         st.untitled = true;
@@ -1143,6 +1152,7 @@ impl LimewaveApp {
             return;
         };
         let root = session.edit().root;
+        let (wav, first) = (session.doc.initial_edit(), session.history.first().clone());
         let group = st
             .selected_region
             .and_then(|r| st.inst().group_of(r))
@@ -1151,7 +1161,10 @@ impl LimewaveApp {
             return;
         };
         let mut added = 0;
-        st.edit(|i| added = i.add_region(group, &text, root));
+        st.edit(|i| {
+            added = i.add_region(group, &text, root);
+            describe(i, added, &wav, &first);
+        });
         st.rebind(&self.files);
         self.settle_selection(Some(added));
     }

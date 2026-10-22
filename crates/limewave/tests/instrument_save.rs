@@ -811,3 +811,60 @@ fn a_one_shot_region_stays_one_shot_through_sample_edits_and_a_save() {
     assert!(first.contains("pitch_keycenter=62"), "{text}");
     assert!(first.contains("loop_start=100"), "{text}");
 }
+
+#[test]
+fn a_new_instrument_keeps_each_wavs_fine_tune() {
+    let dir = tempfile::tempdir().unwrap();
+    let smpl = Smpl {
+        manufacturer: 0,
+        product: 0,
+        sample_period: 22_675,
+        unity_note: 60,
+        pitch_fraction: 1 << 30,
+        smpte_format: 0,
+        smpte_offset: 0,
+        loops: Vec::new(),
+        sampler_data: Vec::new(),
+    };
+    let bytes = wav_bytes(
+        &[sine(440.0, 44100, 4410, 0.5)],
+        44100,
+        SampleFormat::Int { bits: 16 },
+        vec![Chunk {
+            id: *b"smpl",
+            data: smpl.to_bytes(),
+        }],
+    );
+    std::fs::write(dir.path().join("a.wav"), bytes).unwrap();
+    let mut app = LimewaveApp::for_test();
+    app.open_folder(dir.path().to_path_buf());
+    let mut h = harness(app);
+    wait_loaded(&mut h);
+    assert_eq!(region_cents(&h), 25.0, "the WAV is 25 cents sharp");
+    h.state_mut().new_instrument();
+    h.run();
+    assert_eq!(
+        st(&h).inst().get(0, "tune").map(|t| t.0).as_deref(),
+        Some("-25")
+    );
+    assert_eq!(st(&h).binding.samples[0].follows, [true]);
+
+    let target = dir.path().join("out").join("kit.sfz");
+    h.state_mut().save_picker = Box::new(move |_| Some(target.clone()));
+    h.state_mut().save();
+    wait_loaded(&mut h);
+    assert!(st(&h).path.ends_with("out/kit.sfz"));
+    assert_eq!(region_cents(&h), 25.0, "reopened with its fine tune");
+}
+
+/// The fine tune of the first loaded file's editor.
+fn region_cents(h: &Harness<'static, LimewaveApp>) -> f32 {
+    h.state()
+        .files
+        .iter()
+        .find_map(|f| match f {
+            FileEntry::Loaded(s) => Some(s.edit().cents),
+            _ => None,
+        })
+        .expect("a loaded file")
+}

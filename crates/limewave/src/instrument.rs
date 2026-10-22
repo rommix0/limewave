@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use limewave_core::edit::{EditState, History, LoopMode};
 use limewave_core::save::Destination;
-use limewave_core::sfz::bind::{self, Binding};
+use limewave_core::sfz::bind::{self, Binding, SampleBinding, SampleStates};
 use limewave_core::sfz::format_number;
 use limewave_core::sfz::map::auto_map;
 use limewave_core::sfz::model::{Instrument, Keycenter, SfzLoopMode};
@@ -56,9 +56,10 @@ pub struct InstrumentState {
     /// The Unassigned WAVs list with what it was worked out from, so the folders are read again
     /// only when that changes.
     pub unassigned: Option<(Vec<String>, Vec<PathBuf>)>,
-    /// Parallel to `binding.samples`: each loaded WAV's own `initial_edit`, `None` while it
-    /// loads or if it failed. Lets [`InstrumentState::edit`] rebind without the file list.
-    wavs: Vec<Option<EditState>>,
+    /// Parallel to `binding.samples`: each loaded WAV's own `initial_edit` and the first entry
+    /// of its session's history, which its regions are compared with (spec 4.3); `None` while
+    /// it loads or if it failed. Lets [`InstrumentState::edit`] rebind without the file list.
+    wavs: Vec<Option<SampleStates>>,
     /// The instrument as a key map drag shows it, not yet in the history.
     pub preview: Option<Instrument>,
     /// Counts preview changes, so the audio follows a drag.
@@ -207,7 +208,7 @@ impl InstrumentState {
         let mut next = self.inst().clone();
         f(&mut next);
         self.history.push(next);
-        let known: HashMap<String, (Option<usize>, Option<EditState>)> = self
+        let known: HashMap<String, (Option<usize>, Option<SampleStates>)> = self
             .binding
             .samples
             .iter()
@@ -245,7 +246,9 @@ impl InstrumentState {
             .sample_file
             .iter()
             .map(|f| match f.and_then(|i| files.get(i)) {
-                Some(FileEntry::Loaded(s)) => Some(s.doc.initial_edit()),
+                Some(FileEntry::Loaded(s)) => {
+                    Some((s.doc.initial_edit(), s.history.first().clone()))
+                }
                 _ => None,
             })
             .collect();
@@ -294,7 +297,11 @@ pub fn play_map(st: &InstrumentState, files: &[FileEntry]) -> InstrumentPlay {
         let last = buffer.audio.first().map_or(0, Vec::len).saturating_sub(1);
         buffer.end = info.end.unwrap_or(current.end).min(current.end);
         buffer.start = info.offset.max(current.start).min(buffer.end);
-        buffer.loop_mode = edit.loop_mode;
+        // A `no_loop` region following a looped sample plays through it.
+        buffer.loop_mode = match info.loop_mode {
+            Some(SfzLoopMode::NoLoop) => LoopMode::Off,
+            _ => edit.loop_mode,
+        };
         buffer.loop_end = edit.loop_end.min(last);
         buffer.loop_start = edit.loop_start.min(buffer.loop_end);
         buffer.root = (i32::from(edit.root) - info.transpose).clamp(0, 127) as u8;
@@ -345,6 +352,23 @@ pub fn new_instrument_model(wavs: &[(String, u8)]) -> Instrument {
         tokens,
         crlf: cfg!(windows),
     })
+}
+
+/// Writes onto `region` the opcodes that make it ask, over `wav` (its WAV's own state), for the
+/// root key, fine tune and loop of `state`: the state its sample's editor starts from, so the
+/// region follows that sample (spec 4.3). Nothing is written where it already does.
+pub fn describe(inst: &mut Instrument, region: usize, wav: &EditState, state: &EditState) {
+    let now = EditState {
+        start: state.start,
+        end: state.end,
+        ..bind::region_edit(inst, region, wav)
+    };
+    let one = SampleBinding {
+        path: PathBuf::new(),
+        regions: vec![region],
+        follows: vec![true],
+    };
+    bind::write_back(inst, &one, &now, state);
 }
 
 /// Sets `region`'s key range, writing only the ends that change. A key already written as a

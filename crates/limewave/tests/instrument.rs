@@ -1567,7 +1567,11 @@ fn new_instrument_is_unsaved_and_wavs_untouched() {
     }
     let s = app.instrument.as_ref().unwrap();
     assert!(s.untitled && s.unsaved(&app.files));
-    assert_eq!(opcode(&h, 1, "pitch_keycenter").unwrap().0, "50");
+    // The region says the WAV's own root and follows the sample, which sounds at 50: mapped
+    // there now, and written by a save with the other edits made before.
+    assert_eq!(opcode(&h, 1, "pitch_keycenter").unwrap().0, "60");
+    assert_eq!(s.binding.samples[1].follows, [true]);
+    assert_eq!(s.region_root(&app.files, 1), 50);
     assert_eq!(keys(s, 0), (0, 49));
     assert_eq!(keys(s, 1), (50, 127));
     // Leaving an untitled instrument returns to the folder.
@@ -1692,4 +1696,73 @@ fn add_unassigned_refuses_a_name_that_cannot_be_written() {
         h.state().ui.message.as_deref(),
         Some("x y=z.wav can't be added: its name can't be written in an SFZ file")
     );
+}
+
+#[test]
+fn deleting_the_first_region_keeps_the_others_own_values() {
+    let (_dir, mut h) = open_text(
+        "<region> sample=a.wav pitch_keycenter=60 hikey=59\n\
+         <region> sample=a.wav pitch_keycenter=62 lokey=60\n",
+    );
+    assert_eq!(st(&h).binding.samples[0].follows, [true, false]);
+    h.state_mut()
+        .region_action(RegionListAction::DeleteRegion(0));
+    let s = st(&h);
+    assert_eq!(s.inst().regions().len(), 1);
+    assert_eq!(
+        s.binding.samples[0].follows,
+        [false],
+        "the sample's state stays the deleted region's"
+    );
+    assert_eq!(s.region_root(&h.state().files, 0), 62);
+}
+
+#[test]
+fn a_one_shot_region_leaves_its_sibling_following() {
+    let (_dir, mut h) = open_text(
+        "<region> sample=a.wav loop_mode=loop_continuous loop_start=100 loop_end=900 hikey=59\n\
+         <region> sample=a.wav loop_mode=loop_continuous loop_start=100 loop_end=900 lokey=60\n",
+    );
+    assert_eq!(st(&h).binding.samples[0].follows, [true, true]);
+    for region in [0, 1] {
+        h.state_mut().select_region(region);
+        region_edits(&mut h, &[RegionEdit::Playback(Playback::OneShot)]);
+        assert_eq!(
+            st(&h).binding.samples[0].follows,
+            [true, true],
+            "region {region} one-shot"
+        );
+        h.state_mut().undo();
+    }
+    // With region 1 one-shot, a loop edit on the sample is heard on both.
+    h.state_mut().select_region(1);
+    region_edits(&mut h, &[RegionEdit::Playback(Playback::OneShot)]);
+    let i = h.state().selected.unwrap();
+    let FileEntry::Loaded(s) = &mut h.state_mut().files[i] else {
+        panic!("not loaded");
+    };
+    let e = EditState {
+        loop_start: 200,
+        loop_end: 800,
+        ..s.edit().clone()
+    };
+    s.apply(e, None);
+    let map = play_map(st(&h), &h.state().files);
+    for r in &map.regions {
+        assert_eq!((r.buffer.loop_start, r.buffer.loop_end), (200, 800));
+    }
+    assert_eq!(map.regions[1].playback, Playback::OneShot);
+}
+
+#[test]
+fn a_no_loop_region_following_a_looped_sample_plays_without_the_loop() {
+    let (_dir, mut h) = open_text(
+        "<region> sample=a.wav loop_mode=loop_continuous loop_start=100 loop_end=900 hikey=59\n\
+         <region> sample=a.wav loop_mode=loop_continuous loop_start=100 loop_end=900 lokey=60\n",
+    );
+    st_mut(&mut h).edit(|i| i.set(1, "loop_mode", "no_loop"));
+    assert_eq!(st(&h).binding.samples[0].follows, [true, true]);
+    let map = play_map(st(&h), &h.state().files);
+    assert_eq!(map.regions[0].buffer.loop_mode, LoopMode::Forward);
+    assert_eq!(map.regions[1].buffer.loop_mode, LoopMode::Off);
 }

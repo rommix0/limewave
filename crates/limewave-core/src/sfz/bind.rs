@@ -18,7 +18,7 @@ pub struct SampleBinding {
     /// Region numbers using this file, in file order.
     pub regions: Vec<usize>,
     /// Parallel to `regions`: does the region follow the sample's tuning and
-    /// loop (true), or keep its own (spec 4.3)? `regions[0]` always follows.
+    /// loop (true), or keep its own (spec 4.3)?
     pub follows: Vec<bool>,
 }
 
@@ -108,28 +108,40 @@ pub fn region_edit(inst: &Instrument, region: usize, wav: &EditState) -> EditSta
     e.clamped(wav.end + 1)
 }
 
-/// What two regions must share to follow the same sample.
-fn tuning_and_loop(e: &EditState) -> (u8, f32, LoopMode, Option<(usize, usize)>) {
-    let points = (e.loop_mode != LoopMode::Off).then_some((e.loop_start, e.loop_end));
-    (e.root, e.cents, e.loop_mode, points)
+/// Whether `region` asks for the same tuning and loop as `reference`: the same root key and
+/// fine tune and, when both loop, the same loop points and direction. A loop that is off on
+/// one side (a region playing `one_shot` or `no_loop`, say) is no disagreement.
+fn agrees(inst: &Instrument, region: usize, wav: &EditState, reference: &EditState) -> bool {
+    let e = region_edit(inst, region, wav);
+    let both_loop = e.loop_mode != LoopMode::Off && reference.loop_mode != LoopMode::Off;
+    (e.root, e.cents) == (reference.root, reference.cents)
+        && (!both_loop
+            || (e.loop_mode, e.loop_start, e.loop_end)
+                == (
+                    reference.loop_mode,
+                    reference.loop_start,
+                    reference.loop_end,
+                ))
 }
 
-/// Sets each sample's `follows`: a region follows when its root key, fine tune
-/// and loop equal those of the sample's first region. `wavs[i]` is sample `i`'s
-/// `initial_edit`, `None` while it loads or if it failed (all follow then).
-pub fn complete(b: &mut Binding, inst: &Instrument, wavs: &[Option<EditState>]) {
+/// A loaded sample's WAV's own `initial_edit`, and the state its editor started from.
+pub type SampleStates = (EditState, EditState);
+
+/// Sets each sample's `follows` (spec 4.3): a region follows when it asks for the tuning and
+/// loop of the sample's reference state. `states[i]` is sample `i`'s pair of the WAV's own
+/// `initial_edit` and that reference, the state the sample's editor started from (fixed until
+/// the instrument is saved or opened again); `None` while it loads or if it failed, and then
+/// every region follows.
+pub fn complete(b: &mut Binding, inst: &Instrument, states: &[Option<SampleStates>]) {
     for (i, s) in b.samples.iter_mut().enumerate() {
-        s.follows = vec![true; s.regions.len()];
-        let Some(Some(wav)) = wavs.get(i) else {
-            continue;
+        s.follows = match states.get(i) {
+            Some(Some((wav, reference))) => s
+                .regions
+                .iter()
+                .map(|&region| agrees(inst, region, wav, reference))
+                .collect(),
+            _ => vec![true; s.regions.len()],
         };
-        let Some(&first) = s.regions.first() else {
-            continue;
-        };
-        let want = tuning_and_loop(&region_edit(inst, first, wav));
-        for (follows, &region) in s.follows.iter_mut().zip(&s.regions).skip(1) {
-            *follows = tuning_and_loop(&region_edit(inst, region, wav)) == want;
-        }
     }
 }
 
@@ -499,7 +511,7 @@ mod tests {
         touch(dir.path(), "a.wav");
         let mut b = bind(&i, dir.path());
         let w = wav();
-        complete(&mut b, &i, &[Some(w.clone())]);
+        complete(&mut b, &i, &[Some((w.clone(), region_edit(&i, 0, &w)))]);
         assert_eq!(b.samples[0].follows, [true, false]);
 
         let before = region_edit(&i, 0, &w);
@@ -521,8 +533,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         touch(dir.path(), "a.wav");
         let mut b = bind(&i, dir.path());
-        complete(&mut b, &i, &[Some(wav())]);
-        assert_eq!(b.samples[0].follows, [true, true, false, false]);
+        complete(&mut b, &i, &[Some((wav(), region_edit(&i, 0, &wav())))]);
+        // The last loops where the sample does not: no loop to disagree about.
+        assert_eq!(b.samples[0].follows, [true, true, false, true]);
         complete(&mut b, &i, &[None]);
         assert_eq!(b.samples[0].follows, [true; 4]);
         complete(&mut b, &i, &[]);
@@ -538,8 +551,37 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         touch(dir.path(), "a.wav");
         let mut b = bind(&i, dir.path());
-        complete(&mut b, &i, &[Some(wav())]);
+        complete(&mut b, &i, &[Some((wav(), region_edit(&i, 0, &wav())))]);
         assert_eq!(b.samples[0].follows, [true, true]);
+    }
+
+    #[test]
+    fn regions_are_compared_with_the_samples_reference_not_the_first_region() {
+        let w = looped(LoopMode::Forward, 100, 200);
+        let dir = tempfile::tempdir().unwrap();
+        touch(dir.path(), "a.wav");
+        let i = inst(
+            "<region> sample=a.wav pitch_keycenter=60
+<region> sample=a.wav pitch_keycenter=62",
+        );
+        let reference = region_edit(&i, 0, &w);
+        // The first region is gone; the other still keeps its own root.
+        let mut j = i.clone();
+        j.delete_region(0);
+        let mut b = bind(&j, dir.path());
+        complete(&mut b, &j, &[Some((w.clone(), reference.clone()))]);
+        assert_eq!(b.samples[0].follows, [false]);
+        // A region whose loop is off by its playback mode still follows; a loop that
+        // differs from the sample's does not.
+        let k = inst(
+            "<region> sample=a.wav pitch_keycenter=60 loop_mode=one_shot
+             <region> sample=a.wav pitch_keycenter=60 loop_mode=no_loop
+             <region> sample=a.wav pitch_keycenter=60 loop_mode=loop_continuous loop_start=0
+             <region> sample=a.wav pitch_keycenter=60 loop_mode=loop_continuous",
+        );
+        let mut b = bind(&k, dir.path());
+        complete(&mut b, &k, &[Some((w, reference))]);
+        assert_eq!(b.samples[0].follows, [true, true, false, true]);
     }
 
     #[test]
