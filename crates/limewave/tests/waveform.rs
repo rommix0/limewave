@@ -860,6 +860,15 @@ fn a_wrapped_toolbar_costs_only_its_own_row() {
 }
 
 #[test]
+fn the_narrowest_window_costs_only_one_toolbar_row() {
+    // At the minimum width (900) the toolbar wraps to two rows, as it does at 1100.
+    let narrow = looped_harness_sized(eframe::egui::vec2(900.0, 700.0), 0.25);
+    let wide = looped_harness();
+    assert_eq!(waveform_rect(&narrow).top(), waveform_rect(&wide).top());
+    assert!(waveform_rect(&narrow).height() >= 140.0);
+}
+
+#[test]
 fn the_toolbar_fits_one_row_in_a_1280_window() {
     let h = looped_harness_sized(eframe::egui::vec2(1280.0, 700.0), 0.25);
     let open = h.get_by_label("Open file…").rect();
