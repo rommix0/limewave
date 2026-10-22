@@ -115,11 +115,21 @@ impl RecordPanelState {
         }
     }
 
+    /// The device failed during a take: closes the input and shows `text` as the error, so
+    /// Record stays disabled until a device opens again.
+    pub(crate) fn device_failed(&mut self, text: String) {
+        self.stream = None;
+        self.recorder = None;
+        self.holds.clear();
+        self.error = Some(text);
+        self.notice = None;
+    }
+
     fn recording(&self) -> bool {
         self.recorder.as_ref().is_some_and(Recorder::recording)
     }
 
-    fn can_record(&self) -> bool {
+    pub(crate) fn can_record(&self) -> bool {
         self.error.is_none() && self.recorder.is_some()
     }
 
@@ -263,42 +273,51 @@ pub fn record_panel(ctx: &egui::Context, app: &mut LimewaveApp) {
     }
 }
 
-/// The Device and Input choosers. Changing either reopens the input.
+/// The Device and Input choosers. Changing either reopens the input; while an error shows,
+/// choosing the current one again retries it.
 fn choosers(ui: &mut Ui, p: &mut RecordPanelState) {
-    let mut device = p.device;
+    let mut device = None;
     ui.horizontal(|ui| {
         let label = ui.label("Device");
-        let current = p.devices.get(device).map_or("", |d| d.name.as_str());
+        let current = p.devices.get(p.device).map_or("", |d| d.name.as_str());
         ComboBox::from_id_salt("record_device")
             .selected_text(current)
             .show_ui(ui, |ui| {
                 for (i, d) in p.devices.iter().enumerate() {
-                    ui.selectable_value(&mut device, i, &d.name);
+                    if ui.selectable_label(i == p.device, &d.name).clicked() {
+                        device = Some(i);
+                    }
                 }
             })
             .response
             .labelled_by(label.id);
     });
     let channels = p.devices.get(p.device).map_or(1, |d| d.channels);
-    let mut choice = p.choice;
+    let mut choice = None;
     ui.horizontal(|ui| {
         let label = ui.label("Input");
         ComboBox::from_id_salt("record_input")
-            .selected_text(choice.label(channels))
+            .selected_text(p.choice.label(channels))
             .show_ui(ui, |ui| {
                 for c in input_choices(channels) {
-                    ui.selectable_value(&mut choice, c, c.label(channels));
+                    if ui
+                        .selectable_label(c == p.choice, c.label(channels))
+                        .clicked()
+                    {
+                        choice = Some(c);
+                    }
                 }
             })
             .response
             .labelled_by(label.id);
     });
-    if device != p.device {
-        p.device = device;
-        p.choice = default_choice(p.devices[device].channels);
+    let retry = p.error.is_some();
+    if let Some(i) = device.filter(|&i| i != p.device || retry) {
+        p.device = i;
+        p.choice = default_choice(p.devices[i].channels);
         p.reopen();
-    } else if choice != p.choice {
-        p.choice = choice;
+    } else if let Some(c) = choice.filter(|&c| c != p.choice || retry) {
+        p.choice = c;
         p.reopen();
     }
 }

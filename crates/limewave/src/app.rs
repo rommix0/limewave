@@ -824,22 +824,49 @@ impl LimewaveApp {
 
     /// Adds `take` as a new untitled "Recording N.wav" at the device's rate and selects it.
     /// Why the take stopped, if not by Stop, becomes the Record panel's notice (or the
-    /// toolbar message once the panel is closed). A take with no frames adds no file.
+    /// toolbar message once the panel is closed). A device failure also closes the panel's
+    /// input and shows as its error, which disables Record. A take with no frames adds no
+    /// file.
     pub fn add_recording(&mut self, take: Take, bits: BitDepth) {
         let notice = match &take.stopped {
             StopReason::Device(text) => Some(text.clone()),
             reason => reason.message().map(str::to_owned),
         };
+        let failed = matches!(take.stopped, StopReason::Device(_));
         if take.frames() > 0 {
             let name = self.next_name(NewName::Recording);
             let doc = new_document(name, take.audio, take.rate, bits.format(), 60, false);
             self.add_untitled(doc);
         }
-        match &mut self.ui.record_panel {
-            Some(panel) => panel.notice = notice,
-            None if notice.is_some() => self.ui.message = notice,
-            None => {}
+        match (&mut self.ui.record_panel, notice) {
+            (Some(panel), Some(text)) if failed => panel.device_failed(text),
+            (Some(panel), notice) => panel.notice = notice,
+            (None, Some(text)) => self.ui.message = Some(text),
+            (None, None) => {}
         }
+    }
+
+    /// The window was asked to close. A take in progress is kept as an unsaved recording
+    /// and the Record panel closes, so it never hides the unsaved prompt. Returns true when
+    /// unsaved files hold the close for that prompt.
+    fn hold_close(&mut self) -> bool {
+        if let Some(mut panel) = self.ui.record_panel.take() {
+            let bits = panel.bits;
+            let takes: Vec<Take> = match &mut panel.recorder {
+                Some(recorder) => recorder.poll().into_iter().chain(recorder.stop()).collect(),
+                None => Vec::new(),
+            };
+            // Closes the input before the takes become files.
+            drop(panel);
+            for take in takes {
+                self.add_recording(take, bits);
+            }
+        }
+        let hold = self.dirty_count() > 0;
+        if hold {
+            self.pending = Some(PendingAction::Close);
+        }
+        hold
     }
 
     /// Asks where the untitled file `i` goes and writes it there. On success it becomes an
@@ -1574,9 +1601,8 @@ impl LimewaveApp {
 
     fn handle_close_request(&mut self, ctx: &egui::Context) {
         let requested = ctx.input(|i| i.viewport().close_requested());
-        if requested && !self.allow_close && self.dirty_count() > 0 {
+        if requested && !self.allow_close && self.hold_close() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.pending = Some(PendingAction::Close);
         }
     }
 
@@ -2896,14 +2922,92 @@ mod tests {
         let take = Take {
             audio: vec![Vec::new(), Vec::new()],
             rate: 48_000,
-            stopped: StopReason::Device("Input device error: gone".into()),
+            stopped: StopReason::Overflow,
         };
         app.add_recording(take, BitDepth::Int16);
         assert!(app.files.is_empty());
         assert_eq!(
             app.ui.record_panel.as_ref().unwrap().notice.as_deref(),
-            Some("Input device error: gone")
+            StopReason::Overflow.message()
         );
+    }
+
+    #[test]
+    fn a_device_failure_keeps_the_take_and_disables_record() {
+        let (mut panel, mut feed) = RecordPanelState::with_recorder(48_000, 2, Pair(0));
+        let recorder = panel.recorder.as_mut().unwrap();
+        recorder.start();
+        feed.push(&stereo(1000));
+        feed.errors().report("Input device error: gone".into());
+        let take = recorder.stop().expect("a take");
+        let mut app = LimewaveApp::for_test();
+        app.ui.record_panel = Some(panel);
+        app.add_recording(take, BitDepth::Int16);
+
+        assert_eq!(app.files.len(), 1, "what was captured is kept");
+        assert_eq!(app.files[0].file_name(), "Recording 1.wav");
+        let panel = app.ui.record_panel.as_ref().expect("the panel stays open");
+        assert_eq!(panel.error.as_deref(), Some("Input device error: gone"));
+        assert_eq!(panel.notice, None, "shown once, as the error");
+        assert!(!panel.can_record(), "Record is disabled");
+        assert!(
+            panel.recorder.is_none() && panel.stream.is_none(),
+            "the input is closed"
+        );
+    }
+
+    /// Runs one frame of `app.handle_close_request` with a window close requested, and says
+    /// whether it held the close.
+    fn request_window_close(app: &mut LimewaveApp) -> bool {
+        let ctx = app.ctx.clone();
+        let mut input = egui::RawInput::default();
+        input
+            .viewports
+            .entry(egui::ViewportId::ROOT)
+            .or_default()
+            .events
+            .push(egui::ViewportEvent::Close);
+        let mut out = ctx.run_ui(input, |_| app.handle_close_request(&ctx));
+        // The font atlas of this first frame is never uploaded anywhere.
+        out.textures_delta.clear();
+        out.viewport_output[&egui::ViewportId::ROOT]
+            .commands
+            .contains(&egui::ViewportCommand::CancelClose)
+    }
+
+    #[test]
+    fn closing_the_window_mid_take_keeps_the_take() {
+        let (mut panel, mut feed) = RecordPanelState::with_recorder(48_000, 2, Pair(0));
+        panel.recorder.as_mut().unwrap().start();
+        feed.push(&stereo(1000));
+        let mut app = LimewaveApp::for_test();
+        app.ui.record_panel = Some(panel);
+        assert!(request_window_close(&mut app), "the window stays open");
+        assert!(app.ui.record_panel.is_none(), "the panel closes");
+        assert_eq!(app.files.len(), 1);
+        assert_eq!(app.files[0].file_name(), "Recording 1.wav");
+        let FileEntry::Loaded(s) = &app.files[0] else {
+            panic!("the take is not loaded");
+        };
+        assert_eq!(s.frames(), 1000);
+        assert_eq!(
+            app.pending,
+            Some(PendingAction::Close),
+            "the unsaved prompt asks"
+        );
+    }
+
+    #[test]
+    fn closing_the_window_with_the_panel_idle_closes_both() {
+        let (panel, _feed) = RecordPanelState::with_recorder(48_000, 2, Pair(0));
+        let mut app = LimewaveApp::for_test();
+        app.ui.record_panel = Some(panel);
+        assert!(
+            !request_window_close(&mut app),
+            "nothing unsaved: the window closes"
+        );
+        assert!(app.ui.record_panel.is_none());
+        assert_eq!(app.pending, None);
     }
 
     /// Steps `h` until `done` holds, for at most 5 s.
