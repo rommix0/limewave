@@ -393,7 +393,7 @@ pub fn build_wav_bytes(doc: &WavDocument, e: &EditState) -> Vec<u8> {
 
 /// Whether two paths name the same file. Falls back to comparing the paths as given when
 /// either cannot be resolved (e.g. it does not exist).
-fn same_file(a: &Path, b: &Path) -> bool {
+pub(crate) fn same_file(a: &Path, b: &Path) -> bool {
     match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
         (Ok(a), Ok(b)) => a == b,
         _ => a == b,
@@ -403,7 +403,7 @@ fn same_file(a: &Path, b: &Path) -> bool {
 /// Writes `bytes` to a temporary file next to `target`, then renames it over `target`.
 /// The result takes the permissions of the file it replaces, or of `source` when `target`
 /// is new. On any error the temporary file is removed and `target` is untouched.
-fn write_atomic(target: &Path, source: &Path, bytes: &[u8]) -> Result<(), SaveError> {
+pub(crate) fn write_atomic(target: &Path, source: &Path, bytes: &[u8]) -> Result<(), SaveError> {
     let dir = match target.parent() {
         Some(p) if !p.as_os_str().is_empty() => p,
         _ => Path::new("."),
@@ -475,7 +475,7 @@ pub fn save_wav(
 }
 
 /// A numbered backup of `target` when something is there, else `None`.
-fn backup_existing(target: &Path) -> Result<Option<PathBuf>, SaveError> {
+pub(crate) fn backup_existing(target: &Path) -> Result<Option<PathBuf>, SaveError> {
     match std::fs::symlink_metadata(target) {
         Ok(_) => make_backup(target).map(Some),
         Err(_) => Ok(None),
@@ -506,7 +506,7 @@ pub fn backup_path(original: &Path) -> PathBuf {
 /// created exclusively, so an existing file or link is never written through or replaced
 /// (a name taken in the meantime moves on to the next number), and a partial copy is
 /// removed.
-fn make_backup(original: &Path) -> Result<PathBuf, SaveError> {
+pub(crate) fn make_backup(original: &Path) -> Result<PathBuf, SaveError> {
     let mut source = std::fs::File::open(original).map_err(|source| SaveError::Backup {
         path: backup_candidate(original, 0),
         source,
