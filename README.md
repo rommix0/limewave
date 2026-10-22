@@ -2,7 +2,7 @@
 
 Limewave is an open-source loop and one-shot WAV sample editor, written in Rust. Open a WAV file or a folder of them, set the loop points, root key and fine tune by hand, listen to the result while you edit, and save files that samplers read correctly. It runs on Windows, macOS and Linux.
 
-What it does in version 0.4:
+What it does in version 0.5:
 
 - Reads and writes PCM (8/16/24/32-bit) and 32/64-bit float WAV files, mono or stereo, at any sample rate.
 - **New…** (toolbar): creates a blank, silent sample to draw on. Choose the length (in milliseconds or frames, up to 600 seconds), the sample rate, mono or stereo, the bit depth (16-bit, 24-bit or 32-bit float) and the root key, and whether to loop the whole file. **One cycle of** a note (such as A4) sets the length to one cycle of that note, the root key to the note and the loop to the whole file, and shows how many cents off the whole-frame cycle is. Creating a sample turns **Draw** on. The new file is called Untitled 1, 2 and so on, and counts as unsaved until you save it.
@@ -21,6 +21,7 @@ What it does in version 0.4:
 - Playback cursors in the waveform, the overview and the seam view show where each sounding note is. A click on the waveform sets the point the **Play** button starts from.
 - Right-click a key on the on-screen keyboard to set the root key. With a MIDI keyboard connected, "Set from MIDI" sets the root key from the next note you play.
 - The window size and position are saved between runs by eframe's standard persistence, which also keeps egui's own layout memory, such as panel sizes. This has not yet been checked by hand.
+- **SFZ instruments:** open an `.sfz` file, edit its regions and the samples they use, hear the whole instrument from the keyboard, build a new instrument from a folder of WAVs and save it with its samples. See [SFZ instruments](#sfz-instruments).
 - Undo and redo for every edit.
 
 *Screenshot coming soon.*
@@ -53,6 +54,47 @@ sudo apt-get install -y libasound2-dev libudev-dev libxkbcommon-dev
 
 The application icon sources and PNGs live in `assets/icon`.
 
+## SFZ instruments
+
+An SFZ instrument is a plain-text file that spreads a set of WAV files across the keyboard, often in velocity layers. Limewave opens one, lets you fix what is wrong with it, plays it as a whole, and saves it with its samples.
+
+**Opening.** Use **Open file…** and pick an `.sfz`, or click one in a folder's file list (instruments are listed at the top). Only one instrument is open at a time. While it is open, the file list is replaced by the region list and the keyboard strip by the key map. **Close instrument** (in the region list header) returns to what was open before.
+
+**Region list** (left):
+
+- One section per `<group>`, titled by its `group_label` or "Group 1", "Group 2" and so on. Each row shows the sample, root key, key range, a loop glyph, a dot if the region or its sample is unsaved, and "missing" if the sample file cannot be found. Click a row to select the region and open its sample in the editor.
+- **Unassigned WAVs** lists WAV files in the instrument's sample folders that no region uses. **Add** adds a region for one.
+- **Add group** adds an empty group. **Delete region** removes the selected region.
+
+**Key map** (bottom) shows all 128 keys with a keyboard along its bottom edge.
+
+- **Keys × velocity** draws a box per region over its key range and velocity range; **Keys only** draws one row per overlapping region. Keys that no region covers are hatched, and the boxes of the regions that are sounding light up.
+- Click a box to select its region (click again to cycle through boxes that overlap). Drag a box's left or right edge to change its key range, and its top or bottom edge to change its velocity range. A drag is one undo step.
+- Right-drag across the keyboard sets the selected region's key range to the keys you drag over.
+- The **Velocity** control sets the velocity of notes played from the computer keyboard and the on-screen keys.
+- **Auto-map from root keys** lays out the key ranges of the selected region's group from their root keys, each range reaching halfway to its neighbours. **Fill gaps** extends ranges to close the gaps between regions without shrinking any. Both change key ranges only and are one undo step.
+
+**Inspector.** A **Region** section above the usual ones edits the selected region:
+
+- **Keys** (as note names) and **Velocity**; **Group**, which moves the region to the end of another group; **Volume** in dB.
+- **Playback**: **Normal**, **One-shot** (plays the whole sample and ignores note-off) or **Sustain loop** (loops while the key is held, plays on past the loop end on release).
+- **Envelope**: attack, decay, sustain and release for this region, saved as `ampeg_*`. A region with none uses the SFZ defaults.
+- **Other settings (kept as written)**: every other setting that applies to the region, read-only, with where it comes from. Those Limewave does not play are marked as not heard.
+
+The **Tuning** and **Loop** sections edit the region's sample. Their values come from the instrument (`pitch_keycenter`, `tune`, `loop_*`), not from the WAV, because the instrument is what a sampler plays. **Fine tune is the opposite sign of `tune`**: Limewave's fine tune says how sharp the recording is, while `tune` says how much to raise it, so `tune=14` shows as a fine tune of -14 cents and is written back as `tune=14`.
+
+**Shared samples.** Two regions can use the same WAV. The editor shows one waveform with one loop, labelled "Shared by N regions", and an edit changes every region that follows the sample. If a later region disagrees with the first about the root key, tuning or loop, it is marked as keeping its own tuning and loop: its values are read-only, are written back exactly as read, and are used when it plays.
+
+**New instrument** (button at the top of a folder's file list) makes an unsaved instrument with one region per open WAV, then runs Auto-map on it. The WAVs are not changed. WAVs whose names cannot be written as an SFZ value are left out (see Known limitations).
+
+**Saving.** **Save** and **Save as…** open the save dialog with **SFZ instrument** chosen. For an instrument that has never been saved, a save-file picker asks for the name instead.
+
+- **New folder** (the default) writes into `limewave` inside the instrument's folder. The samples go at the same relative paths, so the folder is complete on its own. Samples outside the instrument's folder (a `..` or absolute path) are gathered into `samples/` and the instrument's paths are changed to match.
+- **Overwrite originals** replaces the `.sfz` and each changed WAV, first copying each to a numbered `.bak`.
+- **Also write loop and root key into each WAV (smpl)** is off by default. Off, each WAV keeps the loop and root key it had, and the instrument carries your edits. On, the edited values are written into the WAV as well.
+- **Individual WAV files** saves the samples only, without changing the instrument, which stays unsaved.
+- After saving, the saved instrument is reopened from disk with the same region selected, and undo history starts fresh.
+
 ## Keyboard shortcuts
 
 Notes play when the **Audition** toggle is on and no text field has focus.
@@ -62,8 +104,8 @@ Notes play when the **Audition** toggle is on and no text field has focus.
 | Z S X D C V G B H N J M , | Lower row of notes (white keys on the bottom row, black keys on the row above). Starts at C3 by default. |
 | Q 2 W 3 E R 5 T 6 Y 7 U I | Upper row of notes, one octave higher than the lower row. |
 | - and = | Move both rows down or up one octave. |
-| Ctrl/Cmd+Z | Undo |
-| Ctrl/Cmd+Shift+Z or Ctrl/Cmd+Y | Redo |
+| Ctrl/Cmd+Z | Undo. With an instrument open, this undoes the most recent edit, whether it was to the instrument (a key range, a region) or to the selected sample. |
+| Ctrl/Cmd+Shift+Z or Ctrl/Cmd+Y | Redo, in the same order |
 | Ctrl/Cmd+A | Select Start…End |
 | Escape | Cancel "Set from MIDI"; otherwise turn Draw off; otherwise clear the selection and the play-from point. With a menu open, Escape only closes the menu. |
 | Ctrl/Cmd+S | Save |
@@ -76,8 +118,11 @@ Notes play when the **Audition** toggle is on and no text field has focus.
 | Drag a sample dot (zoomed in until samples show as dots, with Draw off) | Move that sample up or down; drag sideways to draw over the samples you pass, like a pencil. Each stroke is one undo step. |
 | Draw (toolbar) | Drag on a channel to draw its waveform at any zoom; each stroke is one undo step. Escape turns it off. |
 | Hold Shift while drawing samples (with Draw off) | Fine control: the sample moves a tenth as far as the pointer |
+| Right-drag across the key map's keyboard (instrument open) | Set the selected region's key range to the keys you drag over. Right-click without dragging still sets the root key. |
 
 Note names follow the convention that MIDI note 60 is C4.
+
+With an instrument open, notes from the computer keyboard and the on-screen keys use the **Velocity** control in the key map (1 to 127, default 100). Notes from a MIDI keyboard use their own velocity.
 
 ## What gets written when you save
 
@@ -88,6 +133,15 @@ Note names follow the convention that MIDI note 60 is C4.
 - Effects, a generated tail or spectrum loop, a crossfade and trims are baked into the saved audio. A tail replaces everything after the End marker, and a spectrum loop replaces the range it was made from, so the saved file can be longer or shorter than the original; the `fact` chunk, cue positions and later loops follow. The save dialog lists any extra `smpl` loops that a tail or spectrum loop replaced, since those cannot be kept. A WAV file does not record that they were applied, so a saved file reopens with a crossfade of 0 and no effects to undo.
 - Other chunks are copied through unchanged, in their original order. When you change the root key or fine tune, existing `inst` and `acid` chunks have their root note (and, for `inst`, fine tune) updated to agree with the `smpl` chunk; otherwise they are left as they are. A file without a `smpl` chunk opens with the root key and fine tune of its `inst` chunk, or else the root key of its `acid` chunk when that chunk marks it as set.
 - A file you open and save with no edits comes back byte for byte, apart from the `ISFT` tag.
+
+When you save an SFZ instrument:
+
+- Only the settings you edited are changed in the `.sfz`, and always in the region itself: a value a region inherits from its group is written as a setting of its own, and the group is not touched.
+- Comments, `#define` lines, headers Limewave does not use and settings it does not understand are kept, in their original order and with their original text. Values that used a `$NAME` are written back with the `$NAME`.
+- The layout is normalised: each header starts a line, settings follow one per line, and a blank line separates regions. Line endings follow the original file.
+- Key range edits are written as note names only where the existing value is a note name; otherwise as numbers.
+- When a sample's root key, tuning or loop changes, every region that follows it gets explicit `pitch_keycenter`, `tune`, `loop_mode`, `loop_start` and `loop_end` (and `loop_type` unless forward). When a sample's Start marker moves, `offset`, `end` and the loop settings of the regions that use it shift with it.
+- The WAVs follow the rules above. A WAV whose content would come out the same is copied byte for byte (new folder) or left alone (overwrite).
 
 Where files go:
 
@@ -119,14 +173,17 @@ This writes three 48 kHz, 16-bit mono files, each with root note 69 (A4): `sine_
 - The Harmonic method's sustain body drifts in level more than the other two (about 3.6 dB on one real tonal sample, against about 1 dB for Granular and 0.6 dB for Smooth). Listen before relying on it for a sustained loop.
 - Spectrum loops at very low pitches and high sample rates take a few seconds to render. They render in the background, so the window stays usable.
 - A tail or spectrum loop is stored as the audio it rendered. To change its settings, undo it and apply it again.
+- SFZ: `#include` is not supported. An instrument that uses it is refused with a message, and nothing is opened.
+- SFZ: these are kept when you save but are not heard in Limewave: filters, pitch and filter envelopes, LFOs, pan and width, round robins, crossfaded layers, release triggers, keyswitches, controller (CC) modulation and effects.
+- SFZ: only one instrument can be open at a time.
+- SFZ: WAV names that cannot be written as an SFZ value (for example a space followed by `name=`, or a name containing `<`, `//` or `$`) are left out of new instruments.
 
 ## Roadmap
 
-1. **SFZ instruments:** a region list and key-by-velocity map, saving `.sfz` with its WAVs, opening existing `.sfz` files.
-2. **Pitch detection:** detect the root key and fine tune, with octave fixes and root keys read from file names.
-3. **Classifier:** tell one-shots, truncated samples, sustained sounds and rhythmic material apart, and suggest sensible editor defaults.
-4. **Auto loop finder:** ranked loop candidates found from self-similarity and refined at sample level, shown beside the seam view.
-5. **Beat slicing:** cut rhythmic loops into hits at detected onsets, with a rendered tail for each slice.
+1. **Pitch detection:** detect the root key and fine tune, with octave fixes and root keys read from file names.
+2. **Classifier:** tell one-shots, truncated samples, sustained sounds and rhythmic material apart, and suggest sensible editor defaults.
+3. **Auto loop finder:** ranked loop candidates found from self-similarity and refined at sample level, shown beside the seam view.
+4. **Beat slicing:** cut rhythmic loops into hits at detected onsets, with a rendered tail for each slice.
 
 Possible later: batch processing over a folder, a command-line tool, a CLAP plugin.
 
