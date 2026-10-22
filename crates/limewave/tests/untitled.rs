@@ -3,9 +3,9 @@
 
 use eframe::egui::vec2;
 use egui_kittest::Harness;
-use egui_kittest::kittest::Queryable;
+use egui_kittest::kittest::{NodeT, Queryable};
 use limewave::app::{FileEntry, LimewaveApp, NewName, PendingAction, Session};
-use limewave::ui::new_dialog::BitDepth;
+use limewave::ui::new_dialog::{BitDepth, NewDialogState};
 use limewave_core::document::new_document;
 use limewave_core::edit::{EditState, LoopMode};
 use limewave_core::save::Destination;
@@ -268,4 +268,21 @@ fn cancel_closes_the_new_dialog_without_a_file() {
     h.run();
     assert!(h.state().ui.new_dialog.is_none());
     assert!(h.state().files.is_empty());
+}
+
+#[test]
+fn an_over_limit_length_shows_the_limit_and_disables_create() {
+    let mut app = LimewaveApp::for_test();
+    app.ui.new_dialog = Some(NewDialogState {
+        length: 600_001.0,
+        ..NewDialogState::default()
+    });
+    let mut h = harness(app);
+    assert!(h.get_by_label("Create").accesskit_node().is_disabled());
+    h.get_by_label("1 frame to 600 s");
+
+    h.state_mut().ui.new_dialog.as_mut().unwrap().length = 1000.0;
+    h.run();
+    assert!(!h.get_by_label("Create").accesskit_node().is_disabled());
+    assert!(h.query_by_label("1 frame to 600 s").is_none());
 }

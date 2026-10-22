@@ -127,7 +127,8 @@ impl NewDialogState {
         }
     }
 
-    /// Switches the unit and converts the length so the duration stays.
+    /// Switches the unit and converts the length so the duration stays. Milliseconds are not
+    /// rounded, so switching back and forth keeps the frame count.
     fn set_unit(&mut self, unit: LengthUnit) {
         if unit == self.unit {
             return;
@@ -135,7 +136,7 @@ impl NewDialogState {
         let per_ms = f64::from(self.rate) / 1000.0;
         self.length = match unit {
             LengthUnit::Frames => (self.length * per_ms).round(),
-            LengthUnit::Millis => (self.length / per_ms * 10.0).round() / 10.0,
+            LengthUnit::Millis => self.length / per_ms,
         };
         self.unit = unit;
     }
@@ -224,15 +225,16 @@ pub fn new_dialog(ctx: &egui::Context, app: &mut LimewaveApp) {
 fn length_row(ui: &mut egui::Ui, d: &mut NewDialogState) {
     ui.horizontal(|ui| {
         let label = ui.label("Length");
-        let max = f64::from(MAX_NEW_SECONDS) * f64::from(d.rate);
+        // The fields take any non-negative value: a length outside the limits shows the limit
+        // and leaves Create disabled instead of being clamped.
         let drag = match d.unit {
             LengthUnit::Frames => DragValue::new(&mut d.length)
-                .range(0.0..=max)
+                .range(0.0..=f64::MAX)
                 .max_decimals(0)
                 .speed(10.0),
             LengthUnit::Millis => DragValue::new(&mut d.length)
-                .range(0.0..=f64::from(MAX_NEW_SECONDS) * 1000.0)
-                .max_decimals(1)
+                .range(0.0..=f64::MAX)
+                .max_decimals(3)
                 .speed(5.0),
         };
         if ui.add(drag).labelled_by(label.id).changed() {
@@ -242,9 +244,14 @@ fn length_row(ui: &mut egui::Ui, d: &mut NewDialogState) {
         ui.selectable_value(&mut unit, LengthUnit::Millis, "ms");
         ui.selectable_value(&mut unit, LengthUnit::Frames, "frames");
         d.set_unit(unit);
-        ui.weak(format!("up to {MAX_NEW_SECONDS} s"));
+        if d.frames().is_none() {
+            ui.colored_label(colors::END, LIMIT_TEXT);
+        }
     });
 }
+
+/// Shown beside the length while it is outside the limits.
+const LIMIT_TEXT: &str = "1 frame to 600 s";
 
 /// The one-cycle-of-a-note shortcut, with the pitch it gives.
 fn cycle_row(ui: &mut egui::Ui, d: &mut NewDialogState) {
@@ -313,6 +320,27 @@ mod tests {
         d.length_edited();
         assert!(d.cycle_note.is_empty());
         assert_eq!(d.cents(), None);
+    }
+
+    #[test]
+    fn switching_the_unit_keeps_the_frame_count() {
+        let mut d = NewDialogState::default();
+        d.set_cycle_note("A4");
+        d.set_unit(LengthUnit::Millis);
+        d.set_unit(LengthUnit::Frames);
+        assert_eq!(d.frames(), Some(100));
+        d.set_unit(LengthUnit::Millis);
+        assert_eq!(d.frames(), Some(100));
+        assert!(d.cents().is_some_and(|c| c.abs() < 20.0));
+        let mut d = NewDialogState {
+            length: 1.0,
+            unit: LengthUnit::Frames,
+            ..NewDialogState::default()
+        };
+        d.set_unit(LengthUnit::Millis);
+        assert_eq!(d.frames(), Some(1));
+        d.set_unit(LengthUnit::Frames);
+        assert_eq!(d.frames(), Some(1));
     }
 
     #[test]
