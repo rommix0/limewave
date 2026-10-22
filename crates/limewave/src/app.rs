@@ -37,8 +37,8 @@ use crate::audio::record::{Recorder, StopReason, Take};
 use crate::audio::voice::{Adsr, PlayBuffer, play_buffer};
 use crate::folder;
 use crate::instrument::{
-    InstrumentState, is_region_source, play_map, set_envelope, set_keys, set_playback,
-    set_velocities, set_volume,
+    InstrumentState, is_region_source, new_instrument_model, play_map, set_envelope, set_keys,
+    set_playback, set_velocities, set_volume,
 };
 use crate::render_worker::{RenderKey, RenderSlot};
 use crate::theme::{self, colors};
@@ -956,6 +956,42 @@ impl LimewaveApp {
         } else {
             self.loader = Some(folder::load_in_background(paths, self.ctx.clone()));
         }
+    }
+
+    /// Whether New instrument can run: a folder is open without an instrument, and at least
+    /// one of its WAVs has loaded.
+    pub fn can_new_instrument(&self) -> bool {
+        self.instrument.is_none()
+            && !self.single_file
+            && self.folder.is_some()
+            && self.files.iter().any(|f| matches!(f, FileEntry::Loaded(_)))
+    }
+
+    /// Makes an untitled instrument from the folder's loaded WAVs (spec 4.4): a region per
+    /// WAV, in list order, at its current root key, mapped across the keyboard. The WAVs stay
+    /// open as they are; nothing is reloaded or marked changed.
+    pub fn new_instrument(&mut self) {
+        let Some(dir) = self.folder.clone().filter(|_| self.can_new_instrument()) else {
+            return;
+        };
+        let wavs: Vec<(String, u8)> = self
+            .files
+            .iter()
+            .filter_map(|f| match f {
+                FileEntry::Loaded(s) => Some((f.file_name(), s.edit().root)),
+                _ => None,
+            })
+            .collect();
+        let Some(inst) = new_instrument_model(&wavs) else {
+            return;
+        };
+        let path = dir.join("Untitled instrument.sfz");
+        let mut st = InstrumentState::new(path, inst, Some(PendingAction::OpenFolder(dir)));
+        st.untitled = true;
+        st.rebind(&self.files);
+        self.ui.message = None;
+        self.instrument = Some(st);
+        self.select_region(0);
     }
 
     /// Closes the instrument and opens again the folder or file that was open before it, or
@@ -2523,6 +2559,7 @@ impl LimewaveApp {
         let mut save = None;
         let mut record = false;
         let mut record_hovered = false;
+        let mut new_instrument = false;
         egui::Panel::top("toolbar").show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 // A widget that does not fit moves whole to the next row; its text is never
@@ -2530,6 +2567,20 @@ impl LimewaveApp {
                 ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
                 if ui.button("New…").clicked() {
                     self.ui.new_dialog = Some(NewDialogState::default());
+                }
+                // Only in folder mode, which is also what keeps the toolbar of a single file
+                // on one row in the default window.
+                if self.folder.is_some()
+                    && !self.single_file
+                    && ui
+                        .add_enabled(
+                            self.can_new_instrument(),
+                            egui::Button::new("New instrument"),
+                        )
+                        .on_hover_text("Make an instrument with a region for each open WAV")
+                        .clicked()
+                {
+                    new_instrument = true;
                 }
                 if ui.button("Open file…").clicked()
                     && let Some(p) = rfd::FileDialog::new()
@@ -2620,6 +2671,9 @@ impl LimewaveApp {
                 self.status(ui);
             });
         });
+        if new_instrument {
+            self.new_instrument();
+        }
         if let Some(from_loop) = play {
             self.play(from_loop);
         }

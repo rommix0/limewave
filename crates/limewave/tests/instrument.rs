@@ -1485,3 +1485,177 @@ fn the_narrowest_window_keeps_the_key_map_toolbar_and_region_section_reachable()
     assert_eq!(keys(st(&h), 0), (0, 55));
     assert_eq!(keys(st(&h), 1), (56, 127));
 }
+
+/// A folder of WAVs `a.wav`, `b.wav`, ... with the given roots, opened as a folder.
+fn open_wav_folder(roots: &[u32]) -> (tempfile::TempDir, Harness<'static, LimewaveApp>) {
+    let dir = tempfile::tempdir().unwrap();
+    for (i, &root) in roots.iter().enumerate() {
+        write_wav(
+            dir.path(),
+            &format!("{}.wav", (b'a' + i as u8) as char),
+            Some(root),
+        );
+    }
+    let mut app = LimewaveApp::for_test();
+    app.open_folder(dir.path().to_path_buf());
+    let mut h = harness(app);
+    wait_loaded(&mut h);
+    (dir, h)
+}
+
+#[test]
+fn new_instrument_maps_open_wavs_by_root() {
+    let (dir, mut h) = open_wav_folder(&[48, 60, 72]);
+    h.get_by_label("New instrument").click();
+    h.run();
+    let app = h.state();
+    let s = app.instrument.as_ref().expect("the instrument opened");
+    assert_eq!(s.inst().regions().len(), 3);
+    assert_eq!(keys(s, 0), (0, 54));
+    assert_eq!(keys(s, 1), (55, 66));
+    assert_eq!(keys(s, 2), (67, 127));
+    for (r, (name, root)) in [("a.wav", 48), ("b.wav", 60), ("c.wav", 72)]
+        .into_iter()
+        .enumerate()
+    {
+        assert_eq!(opcode(&h, r, "sample").unwrap().0, name);
+        assert_eq!(
+            opcode(&h, r, "pitch_keycenter").unwrap().0,
+            root.to_string()
+        );
+        assert_eq!(s.region_file(r), Some(r));
+    }
+    assert_eq!(s.path, dir.path().join("Untitled instrument.sfz"));
+    assert_eq!(s.inst().file.crlf, cfg!(windows));
+    assert_eq!(s.selected_region, Some(0));
+    assert_eq!(app.selected, Some(0));
+    assert!(matches!(
+        &s.return_to,
+        Some(PendingAction::OpenFolder(d)) if d == dir.path()
+    ));
+    assert_eq!(play_map(s, &app.files).regions.len(), 3);
+    assert!(
+        s.binding
+            .samples
+            .iter()
+            .all(|b| b.follows.iter().all(|&f| f))
+    );
+}
+
+#[test]
+fn new_instrument_is_unsaved_and_wavs_untouched() {
+    let (_dir, mut h) = open_wav_folder(&[48, 60]);
+    // A sample whose root was changed in the editor keeps that root, and stays its own edit.
+    let FileEntry::Loaded(s) = &mut h.state_mut().files[1] else {
+        panic!("not loaded");
+    };
+    let e = EditState {
+        root: 50,
+        ..s.edit().clone()
+    };
+    s.apply(e, None);
+    assert_eq!(h.state().dirty_count(), 1);
+    h.state_mut().new_instrument();
+    h.run();
+    let app = h.state();
+    assert_eq!(app.dirty_count(), 2, "the instrument, and the changed WAV");
+    for (i, f) in app.files.iter().enumerate() {
+        let FileEntry::Loaded(s) = f else {
+            panic!("not loaded");
+        };
+        assert_eq!(s.unsaved(), i == 1, "only the WAV edited before is unsaved");
+    }
+    let s = app.instrument.as_ref().unwrap();
+    assert!(s.untitled && s.unsaved(&app.files));
+    assert_eq!(opcode(&h, 1, "pitch_keycenter").unwrap().0, "50");
+    assert_eq!(keys(s, 0), (0, 49));
+    assert_eq!(keys(s, 1), (50, 127));
+    // Leaving an untitled instrument returns to the folder.
+    h.state_mut().close_instrument();
+    wait_loaded(&mut h);
+    assert!(h.state().instrument.is_none());
+    assert_eq!(h.state().files.len(), 2);
+}
+
+#[test]
+fn new_instrument_uses_only_loaded_wavs() {
+    // One entry fails to load, the other is fine: only the loaded WAV gets a region.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.wav"), b"not a wav").unwrap();
+    write_wav(dir.path(), "b.wav", Some(60));
+    let mut app = LimewaveApp::for_test();
+    app.open_folder(dir.path().to_path_buf());
+    let mut h = harness(app);
+    wait_loaded(&mut h);
+    assert!(matches!(h.state().files[0], FileEntry::Failed(..)));
+    h.state_mut().new_instrument();
+    h.run();
+    let s = st(&h);
+    assert_eq!(s.inst().regions().len(), 1);
+    assert_eq!(opcode(&h, 0, "sample").unwrap().0, "b.wav");
+    assert_eq!(keys(s, 0), (0, 127));
+    assert_eq!(s.region_file(0), Some(1));
+}
+
+#[test]
+fn button_disabled_without_wavs() {
+    // An empty folder.
+    let (_dir, mut h) = open_wav_folder(&[]);
+    assert!(
+        h.get_by_label("New instrument")
+            .accesskit_node()
+            .is_disabled()
+    );
+    h.state_mut().new_instrument();
+    assert!(h.state().instrument.is_none());
+    // No folder at all, and a single file: the button is not offered, and does nothing.
+    let mut h = harness(LimewaveApp::for_test());
+    assert!(h.query_by_label("New instrument").is_none());
+    h.state_mut().new_instrument();
+    assert!(h.state().instrument.is_none());
+    let dir = tempfile::tempdir().unwrap();
+    let wav = write_wav(dir.path(), "a.wav", Some(60));
+    let mut app = LimewaveApp::for_test();
+    app.open_file(wav);
+    let mut h = harness(app);
+    assert!(h.query_by_label("New instrument").is_none());
+    h.state_mut().new_instrument();
+    assert!(h.state().instrument.is_none());
+    // Enabled with WAVs, disabled again once an instrument is open.
+    let (_dir, mut h) = open_wav_folder(&[60]);
+    assert!(
+        !h.get_by_label("New instrument")
+            .accesskit_node()
+            .is_disabled()
+    );
+    h.state_mut().new_instrument();
+    h.run();
+    assert!(
+        h.get_by_label("New instrument")
+            .accesskit_node()
+            .is_disabled()
+    );
+    let before = h.state().instrument.as_ref().unwrap().history.stamp();
+    h.state_mut().new_instrument();
+    assert_eq!(
+        h.state().instrument.as_ref().unwrap().history.stamp(),
+        before
+    );
+}
+
+#[test]
+fn new_instrument_keeps_file_names_with_spaces() {
+    let dir = tempfile::tempdir().unwrap();
+    write_wav(dir.path(), "EP A1 mp.wav", Some(33));
+    write_wav(dir.path(), "EP C2 mp.wav", Some(36));
+    let mut app = LimewaveApp::for_test();
+    app.open_folder(dir.path().to_path_buf());
+    let mut h = harness(app);
+    wait_loaded(&mut h);
+    h.state_mut().new_instrument();
+    h.run();
+    assert_eq!(opcode(&h, 0, "sample").unwrap().0, "EP A1 mp.wav");
+    assert_eq!(opcode(&h, 1, "sample").unwrap().0, "EP C2 mp.wav");
+    assert_eq!(opcode(&h, 1, "pitch_keycenter").unwrap().0, "36");
+    assert_eq!(st(&h).region_file(1), Some(1));
+}

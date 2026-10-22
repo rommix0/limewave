@@ -11,7 +11,9 @@ use limewave_core::notes::note_name;
 use limewave_core::save::Destination;
 use limewave_core::sfz::bind::{self, Binding};
 use limewave_core::sfz::format_number;
+use limewave_core::sfz::map::auto_map;
 use limewave_core::sfz::model::{Instrument, Keycenter, SfzLoopMode};
+use limewave_core::sfz::parse::parse;
 use limewave_core::sfz::paths::same_file_key;
 
 use crate::app::{FileEntry, PendingAction, Session};
@@ -315,6 +317,22 @@ pub fn play_map(st: &InstrumentState, files: &[FileEntry]) -> InstrumentPlay {
         regions,
         source: st.region_sources,
     }
+}
+
+/// A new instrument (spec 4.4): one `<group>` and, for each `(sample file name, root key)` in
+/// order, a region with `pitch_keycenter` and the key range Auto-map gives it. Line endings
+/// are the platform's (spec 7.2).
+pub fn new_instrument_model(wavs: &[(String, u8)]) -> Option<Instrument> {
+    let roots: Vec<u8> = wavs.iter().map(|w| w.1).collect();
+    let mut text = String::from("<group>\n");
+    for ((name, root), (lo, hi)) in wavs.iter().zip(auto_map(&roots)) {
+        text.push_str(&format!(
+            "<region>\nsample={name}\npitch_keycenter={root}\nlokey={lo}\nhikey={hi}\n"
+        ));
+    }
+    let mut file = parse(&text).ok()?;
+    file.crlf = cfg!(windows);
+    Some(Instrument::new(file))
 }
 
 /// Sets `region`'s key range, writing only the ends that change. A key already written as a
