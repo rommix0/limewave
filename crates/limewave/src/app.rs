@@ -2808,22 +2808,26 @@ impl LimewaveApp {
             None if inst.groups().is_empty() => None,
             None => return,
         };
-        let members: Vec<usize> = (0..inst.regions().len())
-            .filter(|&r| inst.group_of(r) == group)
+        let infos = inst.region_infos();
+        let members: Vec<usize> = (inst.region_groups().into_iter().enumerate())
+            .filter(|&(_, g)| g == group)
+            .map(|(r, _)| r)
             .collect();
         let ranges = if fill {
             let now: Vec<(u8, u8)> = members
                 .iter()
-                .map(|&r| {
-                    let info = inst.region_info(r);
-                    (info.lokey, info.hikey)
-                })
+                .map(|&r| (infos[r].lokey, infos[r].hikey))
                 .collect();
             fill_gaps(&now)
         } else {
+            // The key each region sounds at: where it plays its sample at the recorded pitch,
+            // its root moved by `transpose` as the play map moves it.
             let roots: Vec<u8> = members
                 .iter()
-                .map(|&r| st.region_root(&self.files, r))
+                .map(|&r| {
+                    let root = i32::from(st.region_root(&self.files, r));
+                    (root - infos[r].transpose).clamp(0, 127) as u8
+                })
                 .collect();
             auto_map(&roots)
         };

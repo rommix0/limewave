@@ -857,6 +857,25 @@ fn dragging_a_right_edge_changes_hikey_in_one_undo_step() {
 }
 
 #[test]
+fn auto_map_sorts_by_the_key_each_region_sounds_at() {
+    // Region 1 is transposed two octaves down: its sample plays at its recorded pitch on
+    // key 84, so it maps above region 2.
+    let (_dir, mut h) = open_text(
+        "<group> <region> sample=a.wav pitch_keycenter=48\n\
+         <region> sample=b.wav pitch_keycenter=60 transpose=-24\n\
+         <region> sample=c.wav pitch_keycenter=72\n",
+    );
+    h.state_mut().select_region(0);
+    h.run();
+    h.get_by_label("Auto-map from root keys").click();
+    h.run();
+    let s = st(&h);
+    assert_eq!(keys(s, 0), (0, 60));
+    assert_eq!(keys(s, 2), (61, 78));
+    assert_eq!(keys(s, 1), (79, 127));
+}
+
+#[test]
 fn auto_map_lays_out_ranges_by_root() {
     let (_dir, mut h) = open_text(
         "<group> <region> sample=a.wav pitch_keycenter=48\n\
