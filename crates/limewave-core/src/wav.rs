@@ -140,6 +140,20 @@ pub fn fmt_with_channels(fmt: &[u8], channels: u16) -> Vec<u8> {
     out
 }
 
+/// A copy of the `fmt ` payload `fmt` for sampling rate `rate`: the rate and the byte rate
+/// (`rate` × block align, saturating) are updated and everything else stays. A payload shorter
+/// than 16 bytes is returned unchanged.
+pub fn fmt_with_rate(fmt: &[u8], rate: u32) -> Vec<u8> {
+    let mut out = fmt.to_vec();
+    if out.len() < 16 {
+        return out;
+    }
+    let byte_rate = rate.saturating_mul(u32::from(u16_at(&out, 12)));
+    out[4..8].copy_from_slice(&rate.to_le_bytes());
+    out[8..12].copy_from_slice(&byte_rate.to_le_bytes());
+    out
+}
+
 /// A plain 16-byte `fmt ` payload for `fmt`: tag 1 (PCM) or 3 (float), channels, rate, byte
 /// rate, block align and bits per sample.
 pub fn fmt_bytes(fmt: &WavFormat) -> Vec<u8> {
@@ -528,5 +542,36 @@ mod tests {
     #[test]
     fn fmt_with_channels_leaves_a_short_chunk_alone() {
         assert_eq!(fmt_with_channels(&[1, 0, 2], 1), vec![1, 0, 2]);
+    }
+
+    #[test]
+    fn fmt_with_rate_sets_rate_and_byte_rate() {
+        // Plain PCM: the rate and the byte rate change, the rest stays.
+        let plain = fmt_with_rate(&fmt_chunk(1, 2, 16), 31_250);
+        let f = parse_fmt(&plain).unwrap();
+        assert_eq!((f.sample_rate, f.channels, f.block_align), (31_250, 2, 4));
+        assert_eq!(u32_at(&plain, 8), 31_250 * 4);
+        assert_eq!(plain[12..], fmt_chunk(1, 2, 16)[12..]);
+
+        // Float keeps its tag.
+        let float = fmt_with_rate(&fmt_chunk(3, 1, 32), 96_000);
+        assert_eq!(float[..4], fmt_chunk(3, 1, 32)[..4]);
+        assert_eq!(parse_fmt(&float).unwrap().sample_rate, 96_000);
+        assert_eq!(u32_at(&float, 8), 96_000 * 4);
+
+        // Extensible: everything after the byte rate is untouched, including the mask.
+        let ext = extensible_fmt(2, 24, 3);
+        let out = fmt_with_rate(&ext, 22_050);
+        assert_eq!(parse_fmt(&out).unwrap().sample_rate, 22_050);
+        assert_eq!(u32_at(&out, 8), 22_050 * 6);
+        assert_eq!(out[12..], ext[12..]);
+    }
+
+    #[test]
+    fn fmt_with_rate_saturates_and_leaves_a_short_chunk_alone() {
+        let mut wide = fmt_chunk(1, 2, 16);
+        wide[12..14].copy_from_slice(&u16::MAX.to_le_bytes());
+        assert_eq!(u32_at(&fmt_with_rate(&wide, u32::MAX), 8), u32::MAX);
+        assert_eq!(fmt_with_rate(&[1, 0, 2], 8_000), vec![1, 0, 2]);
     }
 }

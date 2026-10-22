@@ -8,7 +8,7 @@ use crate::cue::remap_markers;
 use crate::document::WavDocument;
 use crate::edit::{EditState, LoopMode};
 use crate::effects::{
-    AppliedEffect, Op, changes_length, frames_after, map_frame, map_range, process,
+    AppliedEffect, Op, changes_length, frames_after, map_frame, map_range, process, rate_after,
 };
 use crate::error::SaveError;
 use crate::meta::{info_set, sync_acid, sync_inst};
@@ -16,7 +16,9 @@ use crate::render::crossfade_region;
 use crate::riff::{Chunk, RiffFile, find, write_riff};
 use crate::smpl::{Smpl, SmplLoop, sample_period, tuning_to_smpl};
 use crate::software_tag;
-use crate::wav::{WavFormat, encode_frames, fmt_with_channels, frame_stride, parse_fmt};
+use crate::wav::{
+    WavFormat, encode_frames, fmt_with_channels, fmt_with_rate, frame_stride, parse_fmt,
+};
 
 /// Where a save goes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -136,13 +138,13 @@ fn tuning_or_loop_changed(init: &EditState, e: &EditState) -> bool {
     e.root != init.root || e.cents != init.cents || loop_changed
 }
 
-/// The `smpl` chunk for `e` (clamped), keeping the original's other fields and those of
+/// The `smpl` chunk for `e` (clamped) at sampling rate `rate`, keeping the original's other fields and those of
 /// its extra loops that are saved (see [`saved_extra_loop`]).
 ///
 /// Loop 0 is type 0 (forward), 1 (ping-pong) or 2 (backward), except that an original
 /// unknown type (3 and up, shown as forward) is kept while the loop mode and points
 /// are unchanged from `init`.
-fn edited_smpl(doc: &WavDocument, init: &EditState, e: &EditState) -> Smpl {
+fn edited_smpl(doc: &WavDocument, init: &EditState, e: &EditState, rate: u32) -> Smpl {
     let mut s = doc.smpl.clone().unwrap_or(Smpl {
         manufacturer: 0,
         product: 0,
@@ -154,7 +156,7 @@ fn edited_smpl(doc: &WavDocument, init: &EditState, e: &EditState) -> Smpl {
         loops: Vec::new(),
         sampler_data: Vec::new(),
     });
-    s.sample_period = sample_period(doc.format.sample_rate);
+    s.sample_period = sample_period(rate);
     (s.unity_note, s.pitch_fraction) = tuning_to_smpl(e.root, e.cents);
 
     let loop_unchanged =
@@ -249,7 +251,7 @@ pub fn dropped_extra_loops(doc: &WavDocument, e: &EditState) -> Vec<SmplLoop> {
 
 /// Whether the original `smpl` chunk can be written back as it is: the loop mode, points, root
 /// and cents are those of the file, nothing moves the sample numbers (no head trim, no
-/// marker-mirroring reverse, no splice), and every extra loop still lies inside the kept
+/// marker-mirroring reverse, no splice, no sample-rate conversion), and every extra loop still lies inside the kept
 /// frames, as does loop 0 after a tail trim.
 fn smpl_unchanged(doc: &WavDocument, init: &EditState, e: &EditState) -> bool {
     let Some(smpl) = &doc.smpl else {
@@ -270,6 +272,7 @@ fn smpl_unchanged(doc: &WavDocument, init: &EditState, e: &EditState) -> bool {
                 Op::Reverse {
                     mirror_markers: true
                 } | Op::Splice(_)
+                    | Op::Resample(_)
             )
         })
         && smpl
@@ -312,16 +315,23 @@ pub fn build_wav_bytes_with_smpl(doc: &WavDocument, e: &EditState, smpl: &EditSt
     let tuning = smpl_state(e, smpl).clamped(doc.frames);
     let e = e.clone().clamped(doc.frames);
     let init = doc.initial_edit();
+    let rate = rate_after(doc.format.sample_rate, &e.effects);
     let mut smpl = (!smpl_unchanged(doc, &init, &tuning)
         && (doc.smpl.is_some() || tuning_or_loop_changed(&init, &tuning)))
-    .then(|| edited_smpl(doc, &init, &tuning).to_bytes());
+    .then(|| edited_smpl(doc, &init, &tuning, rate).to_bytes());
     let audio = process(&doc.audio, &e.effects);
-    // `fmt ` is rewritten only when the effects changed the channel count.
-    let mut new_fmt = u16::try_from(audio.len())
+    // `fmt ` is rewritten only when the effects changed the channel count or the rate, once
+    // for both.
+    let channels = u16::try_from(audio.len())
         .ok()
-        .filter(|&n| n != doc.format.channels)
-        .zip(find(&doc.riff.chunks, b"fmt "))
-        .map(|(n, i)| fmt_with_channels(&doc.riff.chunks[i].data, n));
+        .filter(|&n| n != doc.format.channels);
+    let mut new_fmt = find(&doc.riff.chunks, b"fmt ")
+        .filter(|_| channels.is_some() || rate != doc.format.sample_rate)
+        .map(|i| {
+            let data = &doc.riff.chunks[i].data;
+            let data = channels.map_or_else(|| data.clone(), |n| fmt_with_channels(data, n));
+            fmt_with_rate(&data, rate)
+        });
     let format = new_fmt
         .as_deref()
         .and_then(|bytes| parse_fmt(bytes).ok())
@@ -577,7 +587,8 @@ mod tests {
     use super::*;
     use crate::cue::{CuePoint, cue_bytes, parse_cue};
     use crate::document::{load_wav, load_wav_bytes};
-    use crate::edit::FadeShape;
+    use crate::dsp::resample::resampled_len;
+    use crate::edit::{FadeShape, resample_edit};
     use crate::effects::{
         AppliedEffect, Effect, MonoSource, Op, Splice, SpliceKind, frames_after, mirror_edit,
         plan_effect, process,
@@ -1683,6 +1694,93 @@ mod tests {
             let avg = (d.audio[0][i] + d.audio[1][i]) / 2.0;
             assert!((back.audio[0][i] - avg).abs() <= LSB, "frame {i}");
         }
+    }
+
+    /// A one-second stereo file at 44.1 kHz with a forward loop 1000..=30000, a `cue ` marker at
+    /// 20000 and the extra `smpl` loops `extra`.
+    fn second_long_file(loop0: (u32, u32), extra: &[SmplLoop]) -> Vec<u8> {
+        let audio = vec![
+            sine(441.0, RATE, 44_100, 0.8),
+            sine(330.0, RATE, 44_100, 0.4),
+        ];
+        let mut loops = vec![fwd(loop0.0, loop0.1)];
+        loops.extend_from_slice(extra);
+        wav_bytes(
+            &audio,
+            RATE,
+            I16,
+            vec![
+                smpl_chunk(loops),
+                chunk(b"cue ", cue_bytes(&[cue_point(1, 20_000)])),
+            ],
+        )
+    }
+
+    #[test]
+    fn a_converted_file_saves_and_reloads_at_its_new_rate() {
+        const TO: u32 = 31_250;
+        let d = doc(&second_long_file((1000, 30_000), &[]));
+        let processed = process(&d.audio, &d.initial_edit().effects);
+        let e = resample_edit(&d.initial_edit(), &processed, TO, RATE, d.frames).unwrap();
+        let out = build_wav_bytes(&d, &e);
+
+        let fmt = fmt_of(&out);
+        assert_eq!(u32_at(&fmt, 8), TO * 4);
+        let back = doc(&out);
+        assert_eq!(back.format.sample_rate, TO);
+        assert_eq!(back.frames, resampled_len(44_100, RATE, TO));
+        // The inclusive loop end maps as the position one past it.
+        assert_eq!(
+            (back.initial_edit().loop_start, back.initial_edit().loop_end),
+            (709, 21_258)
+        );
+        let c = chunks(&out);
+        let cues = parse_cue(&c[find(&c, b"cue ").unwrap()].data).unwrap();
+        assert_eq!(cues[0].position, 14_172);
+        assert_eq!(smpl_of(&out).unwrap().sample_period, 32_000);
+    }
+
+    #[test]
+    fn a_converted_file_whose_loop_did_not_move_still_writes_new_frames() {
+        // At 44.1 kHz -> 44.101 kHz the loop 0..=2000 maps to itself, so the UI loop is
+        // unchanged and the original `smpl` chunk must not be written back as it is.
+        const TO: u32 = 44_101;
+        let d = doc(&second_long_file((0, 2000), &[fwd(40_000, 41_000)]));
+        let processed = process(&d.audio, &d.initial_edit().effects);
+        let e = resample_edit(&d.initial_edit(), &processed, TO, RATE, d.frames).unwrap();
+        let init = d.initial_edit();
+        assert_eq!(
+            (e.loop_mode, e.loop_start, e.loop_end),
+            (init.loop_mode, init.loop_start, init.loop_end)
+        );
+
+        let s = smpl_of(&build_wav_bytes(&d, &e)).unwrap();
+        assert_eq!(s.sample_period, sample_period(TO));
+        assert_ne!(sample_period(TO), sample_period(RATE));
+        // The extra loop moved with the audio.
+        assert_eq!(s.loops[1].start, 40_001);
+        assert_eq!(s.loops[1].end, 41_001);
+    }
+
+    #[test]
+    fn a_conversion_and_a_channel_tool_together_rewrite_fmt_once() {
+        let d = doc(&stereo_file());
+        let e = with_effect(
+            &d,
+            d.initial_edit(),
+            Effect::StereoToMono(MonoSource::Mix),
+            None,
+        );
+        let processed = process(&d.audio, &e.effects);
+        let e = resample_edit(&e, &processed, 22_050, RATE, d.frames).unwrap();
+        let out = build_wav_bytes(&d, &e);
+
+        let f = parse_fmt(&fmt_of(&out)).unwrap();
+        assert_eq!((f.channels, f.sample_rate, f.block_align), (1, 22_050, 2));
+        assert_eq!(u32_at(&fmt_of(&out), 8), 44_100);
+        let back = doc(&out);
+        assert_eq!(back.audio.len(), 1);
+        assert_eq!(back.frames, resampled_len(FRAMES, RATE, 22_050));
     }
 
     #[test]
