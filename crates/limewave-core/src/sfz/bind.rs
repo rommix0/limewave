@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use super::model::{Instrument, Keycenter, Level, LoopDir, SfzLoopMode};
+use super::model::{Instrument, Keycenter, LoopDir, SfzLoopMode};
 use super::paths::{find_sample, same_file_key, sample_path};
 use super::write::format_number;
 use crate::edit::{EditState, LoopMode};
@@ -78,6 +78,11 @@ pub fn region_edit(inst: &Instrument, region: usize, wav: &EditState) -> EditSta
     // `tune` raises playback; fine tune says how sharp the recording is. The
     // subtraction from 0.0 keeps a zero tune from becoming -0.
     e.cents = 0.0 - info.tune;
+    // Whole semitones of fine tune move to the root, so cents stay within
+    // +-50 and the pitch is unchanged.
+    let semitones = (e.cents / 100.0).round();
+    e.root = (i32::from(e.root) + semitones as i32).clamp(0, 127) as u8;
+    e.cents -= 100.0 * semitones;
 
     let wav_loops = wav.loop_mode != LoopMode::Off;
     let on = match info.loop_mode {
@@ -101,7 +106,9 @@ pub fn region_edit(inst: &Instrument, region: usize, wav: &EditState) -> EditSta
     e.loop_start = ls.min(le);
     e.loop_end = le;
     e.loop_mode = if on && ls <= le { dir } else { LoopMode::Off };
-    e
+    // Hold the state the app would force on its first edit (a loop of at
+    // least 2 frames, cents in range), so reading is not itself an edit.
+    e.clamped(wav.end + 1)
 }
 
 /// What two regions must share to follow the same sample.
@@ -134,11 +141,12 @@ fn put(inst: &mut Instrument, region: usize, name: &str, value: impl ToString) {
     inst.set(region, name, &value.to_string());
 }
 
-/// Moves the sample-relative opcodes a region itself has by the trim, so they
-/// keep pointing at the same audio, clamped to the trimmed length.
+/// Moves the sample-relative opcodes a region has, own or inherited, by the
+/// trim so they keep pointing at the same audio, clamped to the trimmed
+/// length. A shifted inherited value is written at region level.
 fn shift_for_trim(inst: &mut Instrument, region: usize, shift: i64, max: i64) {
     for name in ["offset", "end", "loop_start", "loop_end"] {
-        let Some((text, Level::Region)) = inst.get(region, name) else {
+        let Some((text, _)) = inst.get(region, name) else {
             continue;
         };
         let Ok(v) = text.trim().parse::<usize>() else {
@@ -204,7 +212,14 @@ fn write_tuning_and_loop(
         LoopMode::PingPong => (LoopDir::Alternate, "alternate"),
         _ => (LoopDir::Forward, "forward"),
     };
-    if info.loop_dir != dir {
+    // Against `before` too: a WAV looping backward and switched to forward
+    // must say so, as the WAV's own `smpl` may not be rewritten.
+    let before_dir = match before.loop_mode {
+        LoopMode::Backward => LoopDir::Backward,
+        LoopMode::PingPong => LoopDir::Alternate,
+        _ => LoopDir::Forward,
+    };
+    if info.loop_dir != dir || before_dir != dir {
         put(inst, region, "loop_type", name);
     }
 }
@@ -237,6 +252,7 @@ pub fn write_back(inst: &mut Instrument, b: &SampleBinding, before: &EditState, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sfz::model::Level;
     use crate::sfz::parse::parse;
     use crate::sfz::write::write;
 
@@ -583,8 +599,7 @@ mod tests {
             assert_eq!(value(&i, r, "loop_end").as_deref(), Some("300"));
             assert_eq!(value(&i, r, "loop_type").as_deref(), Some("alternate"));
         }
-        // Back to forward: a stale direction is rewritten, but forward is
-        // never added to a region that did not have one.
+        // Back to forward: forward is written, since the direction changed.
         let before = after.clone();
         let after = EditState {
             loop_mode: LoopMode::Forward,
@@ -592,8 +607,17 @@ mod tests {
         };
         let mut j = inst("<region> sample=a.wav\n<region> sample=a.wav loop_type=backward");
         write_back(&mut j, &all_follow(2), &before, &after);
-        assert_eq!(value(&j, 0, "loop_type"), None);
+        assert_eq!(value(&j, 0, "loop_type").as_deref(), Some("forward"));
         assert_eq!(value(&j, 1, "loop_type").as_deref(), Some("forward"));
+        // Forward to forward writes nothing.
+        let mut k = inst("<region> sample=a.wav");
+        write_back(
+            &mut k,
+            &all_follow(1),
+            &wav(),
+            &looped(LoopMode::Forward, 1, 9),
+        );
+        assert_eq!(value(&k, 0, "loop_type"), None);
     }
 
     #[test]
@@ -614,7 +638,7 @@ mod tests {
         assert_eq!(value(&i, 0, "offset").as_deref(), Some("0"));
         assert_eq!(value(&i, 1, "offset").as_deref(), Some("200"));
         assert_eq!(value(&i, 2, "loop_start").as_deref(), Some("50"));
-        // 900 - 100 is past the trimmed length of 499 frames.
+        // 900 - 100 is past the trimmed length: 500 frames, last index 499.
         assert_eq!(value(&i, 2, "loop_end").as_deref(), Some("499"));
         assert_eq!(value(&i, 2, "end").as_deref(), Some("499"));
         // No opcode is added where there was none.
@@ -622,15 +646,73 @@ mod tests {
     }
 
     #[test]
-    fn trim_leaves_inherited_values_alone() {
-        let mut i = inst("<group> offset=300 <region> sample=a.wav");
+    fn trim_shifts_inherited_values_into_the_region() {
+        let mut i = inst(
+            "<group> offset=300 <region> sample=a.wav
+<region> sample=b.wav",
+        );
         let before = wav();
         let after = EditState {
             start: 100,
             ..before.clone()
         };
         write_back(&mut i, &all_follow(1), &before, &after);
-        assert_eq!(i.get(0, "offset"), Some(("300".into(), Level::Group)));
+        assert_eq!(i.get(0, "offset"), Some(("200".into(), Level::Region)));
+        // The group, and a region of another sample, are unchanged.
+        assert_eq!(i.get(1, "offset"), Some(("300".into(), Level::Group)));
+    }
+
+    #[test]
+    fn region_edit_is_already_what_the_app_would_clamp_to() {
+        let w = wav();
+        for text in [
+            "<region> tune=80",
+            "<region> tune=-130",
+            "<region> loop_mode=loop_continuous loop_start=500 loop_end=500",
+            "<region> loop_mode=loop_continuous loop_start=999 loop_end=999",
+            "<region> pitch_keycenter=127 tune=-90",
+        ] {
+            let e = region_edit(&inst(text), 0, &w);
+            assert_eq!(e.clone().clamped(1000), e, "{text}");
+        }
+    }
+
+    #[test]
+    fn whole_semitones_of_tune_move_to_the_root() {
+        let w = wav();
+        let e = region_edit(&inst("<region> pitch_keycenter=60 tune=80"), 0, &w);
+        assert_eq!((e.root, e.cents), (59, 20.0));
+        let e = region_edit(&inst("<region> pitch_keycenter=60 tune=-130"), 0, &w);
+        assert_eq!((e.root, e.cents), (61, 30.0));
+        // Within half a semitone nothing moves.
+        let e = region_edit(&inst("<region> pitch_keycenter=60 tune=14"), 0, &w);
+        assert_eq!((e.root, e.cents), (60, -14.0));
+    }
+
+    #[test]
+    fn a_one_frame_loop_becomes_two_frames() {
+        let e = region_edit(
+            &inst("<region> loop_mode=loop_continuous loop_start=500 loop_end=500"),
+            0,
+            &wav(),
+        );
+        assert_eq!(e.loop_mode, LoopMode::Forward);
+        assert_eq!((e.loop_start, e.loop_end), (500, 501));
+    }
+
+    #[test]
+    fn switching_a_wavs_backward_loop_to_forward_writes_loop_type() {
+        let w = looped(LoopMode::Backward, 100, 200);
+        let mut i = inst("<region> sample=a.wav");
+        let before = region_edit(&i, 0, &w);
+        assert_eq!(before.loop_mode, LoopMode::Backward);
+        let after = EditState {
+            loop_mode: LoopMode::Forward,
+            ..before.clone()
+        };
+        write_back(&mut i, &all_follow(1), &before, &after);
+        assert_eq!(value(&i, 0, "loop_type").as_deref(), Some("forward"));
+        assert_eq!(region_edit(&i, 0, &w).loop_mode, LoopMode::Forward);
     }
 
     #[test]

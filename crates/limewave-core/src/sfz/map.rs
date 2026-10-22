@@ -31,10 +31,10 @@ fn gap_split(a: u8, b: u8) -> u8 {
 /// Grows `ranges` (parallel output) to cover the whole keyboard: each run of
 /// keys no range covers is split at its middle between the ranges on either
 /// side, and at the ends of the keyboard the nearest range is extended.
-/// Ranges never shrink. Inverted ranges are left as they are.
+/// Ranges never shrink. Inverted ranges, and ranges above key 127, are left as they are.
 pub fn fill_gaps(ranges: &[(u8, u8)]) -> Vec<(u8, u8)> {
     let mut covered = [false; 128];
-    for &(lo, hi) in ranges.iter().filter(|r| r.0 <= r.1) {
+    for &(lo, hi) in ranges.iter().filter(|r| r.0 <= r.1 && r.0 <= 127) {
         for k in lo..=hi.min(127) {
             covered[k as usize] = true;
         }
@@ -42,7 +42,7 @@ pub fn fill_gaps(ranges: &[(u8, u8)]) -> Vec<(u8, u8)> {
     ranges
         .iter()
         .map(|&(lo, hi)| {
-            if lo > hi {
+            if lo > hi || lo > 127 {
                 return (lo, hi);
             }
             let (mut new_lo, mut new_hi) = (lo, hi);
@@ -118,6 +118,12 @@ mod tests {
             assert!(b.0 <= a.0 && b.1 >= a.1, "{a:?} -> {b:?}");
         }
         assert_eq!(out, [(40, 80), (60, 127), (0, 50)]);
+    }
+
+    #[test]
+    fn fill_gaps_ignores_keys_above_127() {
+        assert_eq!(fill_gaps(&[(200, 210), (10, 20)]), [(200, 210), (0, 127)]);
+        assert_eq!(fill_gaps(&[(100, 200)]), [(0, 200)]);
     }
 
     #[test]
