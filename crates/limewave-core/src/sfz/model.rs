@@ -73,8 +73,9 @@ pub struct RegionInfo {
     pub attack_trigger: bool,
 }
 
-/// Opcodes the editor understands, so `other_settings` leaves them out.
-const KNOWN: [&str; 25] = [
+/// Opcodes the editor has controls for, so `other_settings` leaves them out. (`trigger` is
+/// read, to leave release regions silent, but has no control, so it is listed.)
+const KNOWN: [&str; 24] = [
     "sample",
     "lokey",
     "hikey",
@@ -99,7 +100,6 @@ const KNOWN: [&str; 25] = [
     "ampeg_decay",
     "ampeg_sustain",
     "ampeg_release",
-    "trigger",
 ];
 
 /// The one spelling Limewave treats an opcode under.
@@ -890,6 +890,16 @@ mod tests {
             ]
         );
         assert_eq!(i.region_info(0).ampeg.sustain, 99.5);
+    }
+
+    #[test]
+    fn trigger_is_listed_with_the_other_settings() {
+        let i = inst("<group> trigger=release <region> sample=a.wav");
+        assert_eq!(
+            i.other_settings(0),
+            vec![("trigger".into(), "release".into(), Level::Group)]
+        );
+        assert!(!i.region_info(0).attack_trigger, "and still read");
     }
 
     #[test]

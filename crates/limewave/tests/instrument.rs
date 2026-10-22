@@ -1355,14 +1355,16 @@ fn session_envelope_hidden_with_instrument() {
 
 #[test]
 fn other_settings_are_listed_and_marked() {
-    let (_dir, mut h) = open_text("<group> polyphony=4 <region> sample=a.wav cutoff=800 pan=20\n");
+    let (_dir, mut h) =
+        open_text("<group> polyphony=4 <region> sample=a.wav cutoff=800 pan=20 trigger=first\n");
     h.get_by_label("Other settings (kept as written)").click();
     h.run();
     h.get_by_label("cutoff");
     h.get_by_label("polyphony");
+    h.get_by_label("trigger");
     assert_eq!(
         h.get_all_by_label("region, not heard in Limewave").count(),
-        2
+        3
     );
     h.get_by_label("group");
 }
