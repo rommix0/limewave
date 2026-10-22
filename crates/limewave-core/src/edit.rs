@@ -329,8 +329,9 @@ pub fn redraw_samples(
 /// the rate of the file on disk; the rate converted from is [`rate_after`] the steps so far.
 /// The audio is rendered here, from `processed`.
 ///
-/// Start, End and the loop points move with the audio, each scaled by `round(f * to / from)`
-/// (see [`resample_map`]), and the crossfade by the same ratio. A loop whose scaled length is
+/// Start, End and the loop points move with the audio, scaled by `round(f * to / from)` (see
+/// [`resample_map`]): Start and the loop start directly, End and the loop end as the position
+/// one past them, and the crossfade by the same ratio. A loop whose scaled length is
 /// under 2 frames is turned off. Returns `None` when `to` is the current rate or outside
 /// `MIN_RATE..=MAX_RATE`, the current rate is 0, or `processed` holds no frames.
 pub fn resample_edit(
@@ -355,9 +356,12 @@ pub fn resample_edit(
         last: frames - 1,
     };
     let scale = |f| resample_map(std::slice::from_ref(&step), f);
+    // An inclusive end marker maps as the position one past it, so an End on the last frame
+    // lands on the new last frame and a loop keeps its length to within a frame.
+    let scale_end = |f: usize| scale(f.saturating_add(1)).saturating_sub(1);
     let mut r = e.clone();
-    (r.start, r.end) = (scale(e.start), scale(e.end));
-    (r.loop_start, r.loop_end) = (scale(e.loop_start), scale(e.loop_end));
+    (r.start, r.end) = (scale(e.start), scale_end(e.end));
+    (r.loop_start, r.loop_end) = (scale(e.loop_start), scale_end(e.loop_end));
     r.crossfade = resampled_len(e.crossfade, from, to);
     if r.loop_mode != LoopMode::Off && resampled_len(e.loop_len(), from, to) < 2 {
         r.loop_mode = LoopMode::Off;
@@ -459,7 +463,7 @@ impl<T: Clone + PartialEq> History<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::effects::{Splice, SpliceKind};
+    use crate::effects::{Splice, SpliceKind, map_frame, map_range, process};
     use std::sync::Arc;
 
     fn looped(frames: usize, end: usize, ls: usize, le: usize) -> EditState {
@@ -995,8 +999,6 @@ mod tests {
         assert!(redraw_samples(&e, &audio, 0, 2, &[f32::NAN]).is_none());
     }
 
-    use crate::effects::{map_frame, map_range, process};
-
     #[test]
     fn rate_after_takes_the_last_conversion() {
         assert_eq!(rate_after(44_100, &[]), 44_100);
@@ -1056,6 +1058,25 @@ mod tests {
         let r = resample_edit(&e, &[vec![0.0; 96_000]], 1_000, 96_000, 96_000).unwrap();
         assert_eq!(r.loop_mode, LoopMode::Off);
         assert_eq!(r.end, 999);
+        assert!(r.loop_start <= r.loop_end && r.loop_end <= r.end);
+    }
+
+    #[test]
+    fn an_end_on_the_last_frame_lands_on_the_new_last_frame() {
+        let e = EditState::default_for(100);
+        let r = resample_edit(&e, &[vec![0.0; 100]], 2000, 1000, 100).unwrap();
+        assert_eq!((r.start, r.end, r.loop_end), (0, 199, 199));
+        assert_eq!(frames_after(100, &r.effects), 200);
+    }
+
+    #[test]
+    fn a_loop_keeps_its_length_to_within_a_frame() {
+        let mut e = EditState::default_for(100);
+        (e.loop_mode, e.loop_start, e.loop_end) = (LoopMode::Forward, 10, 29);
+        let r = resample_edit(&e, &[vec![0.0; 100]], 1500, 1000, 100).unwrap();
+        assert_eq!(r.loop_mode, LoopMode::Forward);
+        let len = r.loop_end + 1 - r.loop_start;
+        assert!((29..=31).contains(&len), "loop is {len} frames");
     }
 
     #[test]
