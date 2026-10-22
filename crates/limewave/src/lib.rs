@@ -3,6 +3,7 @@
 pub mod app;
 pub mod audio;
 pub mod folder;
+pub mod instrument;
 pub mod render_worker;
 pub mod theme;
 pub mod ui;

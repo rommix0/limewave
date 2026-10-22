@@ -9,13 +9,23 @@ use limewave_core::document::{WavDocument, load_wav};
 /// The `.wav` files directly inside `dir` (not recursive), sorted by file name. Unreadable
 /// folders give an empty list.
 pub fn wav_files(dir: &Path) -> Vec<PathBuf> {
+    files_with_extension(dir, "wav")
+}
+
+/// The `.sfz` instruments directly inside `dir`, like [`wav_files`].
+pub fn sfz_files(dir: &Path) -> Vec<PathBuf> {
+    files_with_extension(dir, "sfz")
+}
+
+/// The files directly inside `dir` whose extension is `ext` in any case, sorted by file name.
+fn files_with_extension(dir: &Path, ext: &str) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
     let mut files: Vec<PathBuf> = entries
         .filter_map(Result::ok)
         .map(|e| e.path())
-        .filter(|p| p.is_file() && p.extension().is_some_and(|x| x.eq_ignore_ascii_case("wav")))
+        .filter(|p| p.is_file() && p.extension().is_some_and(|x| x.eq_ignore_ascii_case(ext)))
         .collect();
     files.sort_by_key(|p| p.file_name().map(|n| n.to_string_lossy().to_lowercase()));
     files
@@ -57,6 +67,19 @@ mod tests {
             .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
         assert_eq!(names, ["a.wav", "b.WAV"]);
+    }
+
+    #[test]
+    fn sfz_files_filters_and_sorts() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["b.SFZ", "a.sfz", "c.wav"] {
+            std::fs::write(dir.path().join(name), b"x").unwrap();
+        }
+        let names: Vec<_> = sfz_files(dir.path())
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["a.sfz", "b.SFZ"]);
     }
 
     #[test]

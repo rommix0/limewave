@@ -1,4 +1,7 @@
-//! The folder-mode file list: one row per file with a thumbnail, name, root key and chips.
+//! The folder-mode file list: the folder's instruments, then one row per file with a
+//! thumbnail, name, root key and chips.
+
+use std::path::{Path, PathBuf};
 
 use eframe::egui::{
     self, Align, Color32, Layout, RichText, ScrollArea, Sense, Stroke, Ui, UiBuilder, vec2,
@@ -12,23 +15,92 @@ use crate::theme::colors;
 const ROW_HEIGHT: f32 = 40.0;
 const THUMB: egui::Vec2 = vec2(44.0, 26.0);
 
-/// Draws the list and returns the row the user clicked, if any.
-pub fn file_list(ui: &mut Ui, files: &[FileEntry], selected: Option<usize>) -> Option<usize> {
-    if files.is_empty() {
+/// A row the user clicked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileListClick {
+    /// An index into the files.
+    File(usize),
+    /// An index into the instruments.
+    Instrument(usize),
+}
+
+/// Draws the list, `instruments` first, and returns the row the user clicked, if any.
+pub fn file_list(
+    ui: &mut Ui,
+    files: &[FileEntry],
+    instruments: &[PathBuf],
+    selected: Option<usize>,
+) -> Option<FileListClick> {
+    if files.is_empty() && instruments.is_empty() {
         ui.weak("No .wav files in this folder.");
         return None;
     }
+    let n = instruments.len();
     let mut clicked = None;
     ScrollArea::vertical()
         .auto_shrink([false, false])
-        .show_rows(ui, ROW_HEIGHT, files.len(), |ui, range| {
+        .show_rows(ui, ROW_HEIGHT, n + files.len(), |ui, range| {
             for i in range {
-                if row(ui, &files[i], selected == Some(i)) {
-                    clicked = Some(i);
+                if i < n {
+                    if instrument_row(ui, &instruments[i]) {
+                        clicked = Some(FileListClick::Instrument(i));
+                    }
+                } else if row(ui, &files[i - n], selected == Some(i - n)) {
+                    clicked = Some(FileListClick::File(i - n));
                 }
             }
         });
     clicked
+}
+
+/// A row for an `.sfz` file: a keyboard glyph, its name and an "instrument" chip.
+fn instrument_row(ui: &mut Ui, path: &Path) -> bool {
+    let (rect, response) =
+        ui.allocate_exact_size(vec2(ui.available_width(), ROW_HEIGHT), Sense::click());
+    if response.hovered() {
+        ui.painter()
+            .rect_filled(rect, 4.0, Color32::from_white_alpha(10));
+    }
+    let mut inner = ui.new_child(
+        UiBuilder::new()
+            .max_rect(rect.shrink2(vec2(6.0, 3.0)))
+            .layout(Layout::left_to_right(Align::Center)),
+    );
+    inner.style_mut().interaction.selectable_labels = false;
+    keys_glyph(&mut inner);
+    let name = path
+        .file_name()
+        .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+    inner.vertical(|ui| {
+        ui.add(egui::Label::new(name).truncate());
+        ui.label(RichText::new("instrument").small().color(colors::LIME));
+    });
+    response.on_hover_text("Open this instrument").clicked()
+}
+
+/// A small keyboard drawn in the thumbnail's place (drawn, as not every font has a glyph).
+fn keys_glyph(ui: &mut Ui) {
+    let (rect, _) = ui.allocate_exact_size(THUMB, Sense::hover());
+    let painter = ui.painter_at(rect);
+    let keys = rect.shrink2(vec2(6.0, 2.0));
+    painter.rect_filled(keys, 2.0, Color32::from_gray(220));
+    let white = keys.width() / 7.0;
+    for k in 1..7 {
+        let x = keys.left() + white * k as f32;
+        painter.line_segment(
+            [egui::pos2(x, keys.top()), egui::pos2(x, keys.bottom())],
+            Stroke::new(1.0, Color32::from_gray(90)),
+        );
+    }
+    // Black keys sit after white keys 1, 2, 4, 5 and 6 of the octave.
+    for k in [1, 2, 4, 5, 6] {
+        let x = keys.left() + white * k as f32;
+        let black = egui::Rect::from_min_max(
+            egui::pos2(x - white * 0.3, keys.top()),
+            egui::pos2(x + white * 0.3, keys.top() + keys.height() * 0.6),
+        );
+        painter.rect_filled(black, 0.0, Color32::from_gray(30));
+    }
 }
 
 fn row(ui: &mut Ui, entry: &FileEntry, selected: bool) -> bool {

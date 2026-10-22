@@ -21,6 +21,10 @@ use limewave_core::effects::{
 use limewave_core::notes::note_name;
 use limewave_core::render::render;
 use limewave_core::save::{Destination, default_folder};
+use limewave_core::sfz::bind;
+use limewave_core::sfz::model::Instrument;
+use limewave_core::sfz::parse::{decode_text, parse};
+use limewave_core::sfz::paths::{same_file_key, sample_path};
 use limewave_core::wav::SampleFormat;
 
 use crate::audio::engine::{AudioEngine, Command, Cursor};
@@ -30,11 +34,12 @@ use crate::audio::midi::{MidiConnection, connect_midi, decode_last_note, list_mi
 use crate::audio::record::{Recorder, StopReason, Take};
 use crate::audio::voice::{Adsr, PlayBuffer, play_buffer};
 use crate::folder;
+use crate::instrument::InstrumentState;
 use crate::render_worker::{RenderKey, RenderSlot};
 use crate::theme::{self, colors};
 use crate::ui::coords::ViewTransform;
 use crate::ui::effects::{EffectDialog, EffectParams, edit_menu, effect_dialog, effects_menu};
-use crate::ui::filelist;
+use crate::ui::filelist::{self, FileListClick};
 use crate::ui::inspector::{InspectorAction, inspector};
 use crate::ui::keyboard::{KeyEvent, keyboard_strip};
 use crate::ui::new_dialog::{BitDepth, NewDialogState, new_dialog};
@@ -128,6 +133,12 @@ fn next_source() -> u64 {
 impl Session {
     pub fn new(doc: WavDocument) -> Session {
         let initial = doc.initial_edit();
+        Session::with_initial(doc, initial)
+    }
+
+    /// A session that starts from `initial` instead of the WAV's own state, as a sample of an
+    /// instrument does (spec 4.2). Starting there is not an edit.
+    pub fn with_initial(doc: WavDocument, initial: EditState) -> Session {
         let processed = process(&doc.audio, &initial.effects);
         let peaks = processed.iter().map(|c| PeakPyramid::build(c)).collect();
         let mono = mono_sum(&processed);
@@ -460,6 +471,45 @@ fn trim_peak(audio: &[Vec<f32>], e: &EditState) -> f32 {
     peak(audio, e.start.min(e.end), e.start.max(e.end))
 }
 
+/// The session for file `i` loaded from `doc`. A sample of `instrument` starts from the tuning
+/// and loop its first region asks for (spec 4.2).
+fn sample_session(instrument: Option<&InstrumentState>, i: usize, doc: WavDocument) -> Session {
+    let first_region = instrument.and_then(|st| {
+        let sample = st.sample_file.iter().position(|&f| f == Some(i))?;
+        Some((st, *st.binding.samples[sample].regions.first()?))
+    });
+    match first_region {
+        Some((st, region)) => {
+            let initial = bind::region_edit(st.inst(), region, &doc.initial_edit());
+            Session::with_initial(doc, initial)
+        }
+        None => Session::new(doc),
+    }
+}
+
+/// Where the instrument's regions name samples that are not on disk: one path per file, in
+/// region order.
+fn missing_samples(st: &InstrumentState) -> Vec<PathBuf> {
+    let inst = st.inst();
+    let dir = st.path.parent().unwrap_or(Path::new(""));
+    let default_path = inst.default_path();
+    let mut seen = BTreeSet::new();
+    let mut missing = Vec::new();
+    for (region, sample) in st.binding.region_sample.iter().enumerate() {
+        if sample.is_some() {
+            continue;
+        }
+        let Some(name) = inst.region_info(region).sample else {
+            continue;
+        };
+        let path = sample_path(dir, &default_path, &name);
+        if seen.insert(same_file_key(&path)) {
+            missing.push(path);
+        }
+    }
+    missing
+}
+
 /// A slot in the file list.
 pub enum FileEntry {
     Loading(PathBuf),
@@ -481,7 +531,7 @@ impl FileEntry {
             .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
     }
 
-    fn is_dirty(&self) -> bool {
+    pub(crate) fn is_dirty(&self) -> bool {
         matches!(self, FileEntry::Loaded(s) if s.unsaved())
     }
 }
@@ -576,6 +626,21 @@ pub enum PendingAction {
     Close,
     OpenFile(PathBuf),
     OpenFolder(PathBuf),
+    OpenInstrument(PathBuf),
+    CloseInstrument,
+}
+
+/// What opening `path` from Open file… does: an `.sfz` opens as an instrument, anything else
+/// as a WAV.
+pub fn open_action(path: PathBuf) -> PendingAction {
+    if path
+        .extension()
+        .is_some_and(|x| x.eq_ignore_ascii_case("sfz"))
+    {
+        PendingAction::OpenInstrument(path)
+    } else {
+        PendingAction::OpenFile(path)
+    }
 }
 
 /// The velocity of notes from the computer keyboard and the on-screen keys.
@@ -640,6 +705,12 @@ fn system_save_picker(name: &str) -> Option<PathBuf> {
 pub struct LimewaveApp {
     pub files: Vec<FileEntry>,
     pub selected: Option<usize>,
+    /// The open instrument; its samples are `files`.
+    pub instrument: Option<InstrumentState>,
+    /// The folder last opened, while it (or an instrument opened from it) is open.
+    pub folder: Option<PathBuf>,
+    /// The `.sfz` files in the open folder.
+    pub folder_instruments: Vec<PathBuf>,
     pub engine: Option<AudioEngine>,
     pub audio_error: Option<String>,
     pub ui: UiState,
@@ -740,6 +811,9 @@ impl LimewaveApp {
         LimewaveApp {
             files: Vec::new(),
             selected: None,
+            instrument: None,
+            folder: None,
+            folder_instruments: Vec::new(),
             engine,
             audio_error,
             ui: UiState::default(),
@@ -779,19 +853,131 @@ impl LimewaveApp {
             Ok(doc) => FileEntry::Loaded(Box::new(Session::new(doc))),
             Err(e) => FileEntry::Failed(p, e.to_string()),
         };
+        self.drop_instrument();
+        self.folder = None;
+        self.folder_instruments.clear();
         self.files = vec![entry];
         self.single_file = true;
         self.loader = None;
         self.select(0);
     }
 
-    /// Lists the folder's WAV files and loads them in the background.
+    /// Lists the folder's WAV files and instruments and loads the WAVs in the background.
     pub fn open_folder(&mut self, dir: PathBuf) {
+        self.drop_instrument();
         let paths = folder::wav_files(&dir);
+        self.folder_instruments = folder::sfz_files(&dir);
+        self.folder = Some(dir);
         self.files = paths.iter().cloned().map(FileEntry::Loading).collect();
         self.single_file = false;
         self.selected = None;
         self.loader = Some(folder::load_in_background(paths, self.ctx.clone()));
+    }
+
+    /// Reads the instrument at `path` and loads its samples in the background; they replace
+    /// the open files. An instrument that can't be read (one using `#include`, say) opens
+    /// nothing and says why in the toolbar.
+    pub fn open_instrument(&mut self, path: PathBuf) {
+        let name = path
+            .file_name()
+            .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+        let parsed = std::fs::read(&path)
+            .map_err(|e| format!("Couldn't open {name}: {e}"))
+            .and_then(|bytes| parse(&decode_text(&bytes)).map_err(|e| e.to_string()));
+        let file = match parsed {
+            Ok(file) => file,
+            Err(message) => {
+                self.ui.message = Some(message);
+                return;
+            }
+        };
+        // Close instrument goes back to what was open before any instrument.
+        let return_to = match self.instrument.take() {
+            Some(old) => old.return_to,
+            None => match (&self.folder, self.files.first()) {
+                (Some(dir), _) => Some(PendingAction::OpenFolder(dir.clone())),
+                (None, Some(f)) if self.single_file => {
+                    Some(PendingAction::OpenFile(f.path().to_path_buf()))
+                }
+                _ => None,
+            },
+        };
+        self.drop_instrument();
+        let st = InstrumentState::new(path, Instrument::new(file), return_to);
+        let paths: Vec<PathBuf> = st.binding.samples.iter().map(|s| s.path.clone()).collect();
+        self.files = paths.iter().cloned().map(FileEntry::Loading).collect();
+        self.files.extend(
+            missing_samples(&st)
+                .into_iter()
+                .map(|p| FileEntry::Failed(p, "missing".into())),
+        );
+        self.single_file = false;
+        self.selected = None;
+        self.ui.message = None;
+        self.instrument = Some(st);
+        if paths.is_empty() {
+            self.loader = None;
+            self.finish_instrument_load();
+        } else {
+            self.loader = Some(folder::load_in_background(paths, self.ctx.clone()));
+        }
+    }
+
+    /// Closes the instrument and opens again the folder or file that was open before it, or
+    /// nothing.
+    pub fn close_instrument(&mut self) {
+        let Some(st) = self.instrument.take() else {
+            return;
+        };
+        self.drop_instrument();
+        match st.return_to {
+            Some(action) => self.perform(action),
+            None => {
+                self.files.clear();
+                self.selected = None;
+                self.loader = None;
+            }
+        }
+    }
+
+    /// Forgets the open instrument and takes it out of the audio engine.
+    fn drop_instrument(&mut self) {
+        self.instrument = None;
+        if let Some(engine) = &self.engine {
+            engine.set_instrument(None);
+        }
+    }
+
+    /// Selects `region` and opens its sample in the editor; a region whose sample is not
+    /// loaded leaves the editor empty.
+    pub fn select_region(&mut self, region: usize) {
+        let Some(st) = &mut self.instrument else {
+            return;
+        };
+        st.selected_region = Some(region);
+        let file = st.region_file(region);
+        self.select_entry(file);
+    }
+
+    /// The instrument's samples have all loaded (or failed): bind with each WAV's own state
+    /// and select the first region with a loaded sample, unless one is selected already.
+    fn finish_instrument_load(&mut self) {
+        let Some(st) = &mut self.instrument else {
+            return;
+        };
+        st.rebind(&self.files);
+        if st.selected_region.is_some() {
+            return;
+        }
+        let first = (0..st.binding.region_sample.len()).find(|&r| {
+            matches!(
+                st.region_file(r).and_then(|i| self.files.get(i)),
+                Some(FileEntry::Loaded(_))
+            )
+        });
+        if let Some(region) = first {
+            self.select_region(region);
+        }
     }
 
     /// The next free "Untitled N.wav" or "Recording N.wav" (no folder).
@@ -1097,35 +1283,63 @@ impl LimewaveApp {
             }
             PendingAction::OpenFile(p) => self.open_file(p),
             PendingAction::OpenFolder(d) => self.open_folder(d),
+            PendingAction::OpenInstrument(p) => self.open_instrument(p),
+            PendingAction::CloseInstrument => self.close_instrument(),
         }
     }
 
+    /// The open files with unsaved changes, plus one for an instrument with unsaved changes
+    /// of its own.
     pub fn dirty_count(&self) -> usize {
-        self.files.iter().filter(|f| f.is_dirty()).count()
+        let instrument = self
+            .instrument
+            .as_ref()
+            .is_some_and(|st| st.history.is_dirty() || st.untitled);
+        self.files.iter().filter(|f| f.is_dirty()).count() + usize::from(instrument)
     }
 
     /// Makes `i` the edited file and hands its sound to the audio engine. Notes still sounding
     /// from the previous file are released.
     pub fn select(&mut self, i: usize) {
+        self.select_entry(Some(i));
+    }
+
+    /// Makes `i` the edited file, or leaves the editor empty for `None`; see
+    /// [`LimewaveApp::select`].
+    fn select_entry(&mut self, i: Option<usize>) {
         // The render dialogs belong to the file they were opened for.
         let tail = self.ui.tail_dialog.take().is_some();
         let spectrum = self.ui.spectrum_dialog.take().is_some();
         if tail || spectrum {
             self.end_preview();
         }
-        self.selected = Some(i);
+        self.selected = i;
         self.ui.marker_entry = None;
         self.ui.selection = None;
         self.ui.play_from = None;
         self.ui.message = None;
         self.release_all();
-        let loaded = matches!(self.files.get(i), Some(FileEntry::Loaded(_)));
-        match (self.files.get(i), &mut self.engine) {
+        let entry = i.and_then(|i| self.files.get(i));
+        let loaded = matches!(entry, Some(FileEntry::Loaded(_)));
+        match (entry, &mut self.engine) {
             (Some(FileEntry::Loaded(s)), Some(engine)) => engine.set_buffer(s.play_buffer()),
             (_, Some(engine)) => engine.silence(),
             _ => {}
         }
         self.silenced = !loaded;
+    }
+
+    /// A click on file `i` in the list. With an instrument open it selects the first region
+    /// playing that file.
+    fn select_file(&mut self, i: usize) {
+        let region = self.instrument.as_ref().and_then(|st| {
+            let sample = st.sample_file.iter().position(|&f| f == Some(i))?;
+            st.binding.samples[sample].regions.first().copied()
+        });
+        match region {
+            Some(region) => self.select_region(region),
+            None => self.select(i),
+        }
     }
 
     /// The selected file, if it is loaded.
@@ -1627,20 +1841,32 @@ impl LimewaveApp {
         if finished {
             self.loader = None;
         }
+        let arrived = !results.is_empty();
         for (i, result) in results {
             let Some(slot) = self.files.get_mut(i) else {
                 continue;
             };
             *slot = match result {
-                Ok(doc) => FileEntry::Loaded(Box::new(Session::new(doc))),
+                Ok(doc) => {
+                    FileEntry::Loaded(Box::new(sample_session(self.instrument.as_ref(), i, doc)))
+                }
                 Err(e) => FileEntry::Failed(slot.path().to_path_buf(), e),
             };
-            // The first loaded file is selected; a file selected while it was still loading
-            // gets its sound now.
+            // In a folder the first loaded file is selected; an instrument selects a region
+            // once all its samples are in. A file selected while it was still loading gets
+            // its sound now.
             let loaded = matches!(self.files[i], FileEntry::Loaded(_));
-            if loaded && self.selected.is_none_or(|s| s == i) {
+            let first = self.selected.is_none() && self.instrument.is_none();
+            if loaded && (first || self.selected == Some(i)) {
                 self.select(i);
             }
+        }
+        let loading = self
+            .files
+            .iter()
+            .any(|f| matches!(f, FileEntry::Loading(_)));
+        if arrived && !loading {
+            self.finish_instrument_load();
         }
     }
 
@@ -1754,15 +1980,39 @@ impl LimewaveApp {
         self.toolbar(ui);
         if !self.single_file {
             let mut clicked = None;
+            let mut close = false;
             egui::Panel::left("file_list")
                 .resizable(true)
                 .default_size(280.0)
                 .size_range(200.0..=480.0)
-                .show(ui, |ui| {
-                    clicked = filelist::file_list(ui, &self.files, self.selected);
+                .show(ui, |ui| match &self.instrument {
+                    Some(st) => {
+                        ui.horizontal(|ui| {
+                            let name = st.path.file_name().unwrap_or_default();
+                            ui.strong(name.to_string_lossy());
+                            close = ui.button("Close instrument").clicked();
+                        });
+                        clicked = filelist::file_list(ui, &self.files, &[], self.selected);
+                    }
+                    None => {
+                        clicked = filelist::file_list(
+                            ui,
+                            &self.files,
+                            &self.folder_instruments,
+                            self.selected,
+                        );
+                    }
                 });
-            if let Some(i) = clicked {
-                self.select(i);
+            match clicked {
+                Some(FileListClick::File(i)) => self.select_file(i),
+                Some(FileListClick::Instrument(i)) => {
+                    let path = self.folder_instruments[i].clone();
+                    self.request(PendingAction::OpenInstrument(path));
+                }
+                None => {}
+            }
+            if close {
+                self.request(PendingAction::CloseInstrument);
             }
         }
         self.inspector_panel(ui);
@@ -1894,10 +2144,12 @@ impl LimewaveApp {
                 }
                 if ui.button("Open file…").clicked()
                     && let Some(p) = rfd::FileDialog::new()
+                        .add_filter("Audio and instruments", &["wav", "WAV", "sfz", "SFZ"])
                         .add_filter("WAV audio", &["wav", "WAV"])
+                        .add_filter("SFZ instrument", &["sfz", "SFZ"])
                         .pick_file()
                 {
-                    action = Some(PendingAction::OpenFile(p));
+                    action = Some(open_action(p));
                 }
                 if ui.button("Open folder…").clicked()
                     && let Some(d) = rfd::FileDialog::new().pick_folder()
