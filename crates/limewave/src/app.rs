@@ -8,7 +8,7 @@ use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Event, Key, KeyboardShortcut, Modifiers};
-use limewave_core::document::{WavDocument, load_wav};
+use limewave_core::document::{WavDocument, load_wav, new_document};
 use limewave_core::dsp::{PeakPyramid, mono_sum};
 use limewave_core::edit::{
     EditState, History, Marker, crop_to_loop, crop_to_selection, redraw_samples,
@@ -35,6 +35,7 @@ use crate::ui::effects::{EffectDialog, EffectParams, edit_menu, effect_dialog, e
 use crate::ui::filelist;
 use crate::ui::inspector::{InspectorAction, inspector};
 use crate::ui::keyboard::{KeyEvent, keyboard_strip};
+use crate::ui::new_dialog::{BitDepth, NewDialogState, new_dialog};
 use crate::ui::overview::overview;
 use crate::ui::save_dialog::{
     SaveCommand, SaveDialogState, SaveRequest, SaveResult, other_file_in_the_way, perform_save,
@@ -517,6 +518,8 @@ pub struct UiState {
     pub release_after_loop: bool,
     /// Whether a MIDI input is connected; set each frame for the inspector.
     pub midi_connected: bool,
+    /// The New… dialog, while it is open.
+    pub new_dialog: Option<NewDialogState>,
     /// The Generate tail… dialog, while it is open.
     pub tail_dialog: Option<TailDialogState>,
     /// The Make loop from spectrum… dialog, while it is open.
@@ -550,6 +553,7 @@ impl Default for UiState {
             release_after_loop: false,
             midi_connected: false,
             message: None,
+            new_dialog: None,
             tail_dialog: None,
             spectrum_dialog: None,
             render_debounce: RENDER_DEBOUNCE,
@@ -783,6 +787,23 @@ impl LimewaveApp {
         self.select(self.files.len() - 1);
     }
 
+    /// Adds a silent untitled sample and turns Draw on, ready to draw on.
+    pub fn create_new(
+        &mut self,
+        frames: usize,
+        rate: u32,
+        channels: usize,
+        bits: BitDepth,
+        root: u8,
+        whole_loop: bool,
+    ) {
+        let name = self.next_name(NewName::Untitled);
+        let audio = vec![vec![0.0; frames]; channels];
+        let doc = new_document(name, audio, rate, bits.format(), root, whole_loop);
+        self.add_untitled(doc);
+        self.ui.draw = true;
+    }
+
     /// Asks where the untitled file `i` goes and writes it there. On success it becomes an
     /// ordinary file that saves back to that folder. Returns false when the user cancels or
     /// the save fails (the results are then shown).
@@ -942,12 +963,13 @@ impl LimewaveApp {
         }
     }
 
-    /// True while a modal (unsaved prompt, save dialog, save results, an effect, tail or
-    /// spectrum-loop dialog) is up.
+    /// True while a modal (unsaved prompt, save dialog, save results, the New, effect, tail
+    /// or spectrum-loop dialog) is up.
     fn modal_open(&self) -> bool {
         self.pending.is_some()
             || self.ui.save_dialog.open
             || self.save_results.is_some()
+            || self.ui.new_dialog.is_some()
             || self.ui.effect_dialog.is_some()
             || self.ui.tail_dialog.is_some()
             || self.ui.spectrum_dialog.is_some()
@@ -1633,6 +1655,7 @@ impl LimewaveApp {
         }
         egui::CentralPanel::default().show(ui, |ui| self.central(ui, &cursors));
         self.unsaved_prompt(&ctx);
+        new_dialog(&ctx, self);
         effect_dialog(&ctx, self);
         tail_dialog(&ctx, self);
         spectrum_dialog(&ctx, self);
@@ -1741,6 +1764,9 @@ impl LimewaveApp {
                 // A widget that does not fit moves whole to the next row; its text is never
                 // split into the leftover width.
                 ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+                if ui.button("New…").clicked() {
+                    self.ui.new_dialog = Some(NewDialogState::default());
+                }
                 if ui.button("Open file…").clicked()
                     && let Some(p) = rfd::FileDialog::new()
                         .add_filter("WAV audio", &["wav", "WAV"])
@@ -2756,6 +2782,9 @@ mod tests {
         assert!(app.modal_open());
         app.ui.tail_dialog = None;
         app.ui.spectrum_dialog = Some(SpectrumDialogState::default());
+        assert!(app.modal_open());
+        app.ui.spectrum_dialog = None;
+        app.ui.new_dialog = Some(NewDialogState::default());
         assert!(app.modal_open());
     }
 

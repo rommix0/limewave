@@ -5,6 +5,7 @@ Limewave is an open-source loop and one-shot WAV sample editor, written in Rust.
 What it does in version 0.3:
 
 - Reads and writes PCM (8/16/24/32-bit) and 32/64-bit float WAV files, mono or stereo, at any sample rate.
+- **New…** (toolbar): creates a blank, silent sample to draw on. Choose the length (in milliseconds or frames, up to 600 seconds), the sample rate, mono or stereo, the bit depth (16-bit, 24-bit or 32-bit float) and the root key, and whether to loop the whole file. **One cycle of** a note (such as A4) sets the length to one cycle of that note, the root key to the note and the loop to the whole file, and shows how many cents off the whole-frame cycle is. Creating a sample turns **Draw** on. The new file is called Untitled 1, 2 and so on, and counts as unsaved until you save it.
 - Reads the loop, root key and fine tune stored in the file's `smpl` chunk. Forward, ping-pong and backward loops are supported.
 - Waveform view with zoom, scroll and an overview strip; draggable Start, Loop start, Loop end and End markers with optional zero-crossing snap. Drag a marker by its label as well as its line, or double-click the label to type an exact frame.
 - A seam view that overlays the audio before the loop end on the audio after the loop start, so you can see a bad splice before you hear it, with nudge buttons and a "lock length" option.

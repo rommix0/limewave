@@ -3,7 +3,9 @@
 
 use eframe::egui::vec2;
 use egui_kittest::Harness;
+use egui_kittest::kittest::Queryable;
 use limewave::app::{FileEntry, LimewaveApp, NewName, PendingAction, Session};
+use limewave::ui::new_dialog::BitDepth;
 use limewave_core::document::new_document;
 use limewave_core::edit::{EditState, LoopMode};
 use limewave_core::save::Destination;
@@ -215,4 +217,55 @@ fn save_all_stopped_by_a_cancelled_picker_still_reports_earlier_failures() {
     assert_eq!(results.len(), 1);
     assert!(results[0].1.is_err());
     assert!(session(&mut app, 1).untitled);
+}
+
+#[test]
+fn create_new_adds_a_silent_selected_file_and_turns_draw_on() {
+    let mut app = LimewaveApp::for_test();
+    app.create_new(441, 48_000, 2, BitDepth::Int24, 62, true);
+    assert_eq!(app.files.len(), 1);
+    assert_eq!(app.selected, Some(0));
+    assert!(app.ui.draw);
+    let s = session(&mut app, 0);
+    assert!(s.untitled);
+    assert_eq!(s.doc.format.channels, 2);
+    assert_eq!(s.doc.format.sample_rate, 48_000);
+    assert_eq!(s.doc.format.format, SampleFormat::Int { bits: 24 });
+    assert_eq!(s.doc.frames, 441);
+    assert!(s.doc.audio.iter().all(|c| c.len() == 441));
+    assert!(s.doc.audio.iter().flatten().all(|v| *v == 0.0));
+    let e = s.edit();
+    assert_eq!(e.root, 62);
+    assert_eq!(e.loop_mode, LoopMode::Forward);
+    assert_eq!((e.loop_start, e.loop_end), (0, 440));
+}
+
+#[test]
+fn the_new_button_opens_the_dialog_and_create_uses_the_defaults() {
+    let mut h = harness(LimewaveApp::for_test());
+    h.get_by_label("New…").click();
+    h.run();
+    assert!(h.state().ui.new_dialog.is_some());
+    h.get_by_label("Create").click();
+    h.run();
+    let app = h.state_mut();
+    assert!(app.ui.new_dialog.is_none());
+    assert_eq!(app.files.len(), 1);
+    assert_eq!(app.files[0].file_name(), "Untitled 1.wav");
+    let s = session(app, 0);
+    assert_eq!(s.doc.frames, 44_100);
+    assert_eq!(s.doc.format.channels, 1);
+    assert_eq!(s.doc.format.sample_rate, 44_100);
+    assert_eq!(s.doc.format.format, SampleFormat::Int { bits: 16 });
+}
+
+#[test]
+fn cancel_closes_the_new_dialog_without_a_file() {
+    let mut h = harness(LimewaveApp::for_test());
+    h.get_by_label("New…").click();
+    h.run();
+    h.get_by_label("Cancel").click();
+    h.run();
+    assert!(h.state().ui.new_dialog.is_none());
+    assert!(h.state().files.is_empty());
 }
