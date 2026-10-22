@@ -178,7 +178,7 @@ pub fn key_map(
     keys_only: &mut bool,
 ) -> Vec<KeyMapAction> {
     let mut actions = Vec::new();
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         let label = ui.label("Velocity");
         ui.add(DragValue::new(velocity).range(1..=127))
             .labelled_by(label.id);

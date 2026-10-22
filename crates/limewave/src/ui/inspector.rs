@@ -472,6 +472,7 @@ pub fn adsr_fields(ui: &mut Ui, envelope: &mut Adsr) -> AdsrFields {
             let field = ui.add(
                 DragValue::new(ms)
                     .range(0.0..=10_000.0)
+                    .clamp_existing_to_range(false)
                     .speed(1.0)
                     .max_decimals(1)
                     .suffix(" ms"),
@@ -489,6 +490,7 @@ pub fn adsr_fields(ui: &mut Ui, envelope: &mut Adsr) -> AdsrFields {
             let field = ui.add(
                 DragValue::new(&mut percent)
                     .range(0.0..=100.0)
+                    .clamp_existing_to_range(false)
                     .speed(0.5)
                     .max_decimals(1)
                     .suffix(" %"),

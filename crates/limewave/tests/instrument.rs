@@ -64,7 +64,7 @@ fn folder(sfz: &str) -> (tempfile::TempDir, PathBuf) {
 
 fn harness(app: LimewaveApp) -> Harness<'static, LimewaveApp> {
     Harness::builder()
-        .with_size(eframe::egui::vec2(1280.0, 800.0))
+        .with_size(eframe::egui::vec2(1100.0, 700.0))
         .allow_missing_glyphs()
         .build_ui_state(|ui, app: &mut LimewaveApp| app.show(ui), app)
 }
@@ -1102,8 +1102,8 @@ fn region_section_edits_keys_and_volume() {
     assert_eq!(st(&h).history.cursor(), 1);
     assert_eq!(
         opcode(&h, 0, "lokey").unwrap().0,
-        "C3",
-        "written as a note name"
+        "48",
+        "a numeric key stays numeric"
     );
     region_edits(&mut h, &[RegionEdit::Vel(20, 90), RegionEdit::Commit]);
     assert_eq!(opcode(&h, 0, "lovel").unwrap().0, "20");
@@ -1395,4 +1395,93 @@ fn a_region_without_a_sample_still_has_its_settings() {
     region_edits(&mut h, &[RegionEdit::Volume(-3.0), RegionEdit::Commit]);
     assert_eq!(opcode(&h, 0, "volume").unwrap().0, "-3");
     assert!(h.query_by_label("Fine tune").is_none());
+}
+
+#[test]
+fn showing_a_region_with_out_of_range_values_writes_nothing() {
+    let (_dir, mut h) = open_text(
+        "<region> sample=a.wav volume=12 ampeg_release=20 ampeg_attack=15 lovel=0\n\
+         <region> sample=b.wav volume=-200\n",
+    );
+    for region in [0, 1, 0] {
+        h.state_mut().select_region(region);
+        h.run();
+    }
+    let s = st(&h);
+    assert_eq!(s.history.cursor(), 0, "no undo step");
+    assert!(!s.unsaved(&h.state().files));
+    assert_eq!(h.state().dirty_count(), 0);
+    let info = s.inst().region_info(0);
+    assert_eq!(
+        (info.volume, info.ampeg.release, info.lovel),
+        (12.0, 20.0, 0)
+    );
+    assert_eq!(s.inst().region_info(1).volume, -200.0);
+}
+
+#[test]
+fn numeric_key_text_stays_numeric_and_names_stay_names() {
+    let (_dir, mut h) =
+        open_text("<region> sample=a.wav lokey=36 hikey=c4\n<region> sample=b.wav\n");
+    region_edits(&mut h, &[RegionEdit::Keys(40, 72), RegionEdit::Commit]);
+    assert_eq!(
+        opcode(&h, 0, "lokey").unwrap().0,
+        "40",
+        "numeric stays numeric"
+    );
+    assert_eq!(
+        opcode(&h, 0, "hikey").unwrap().0,
+        "C5",
+        "a name stays a name"
+    );
+    h.state_mut().select_region(1);
+    region_edits(&mut h, &[RegionEdit::Keys(40, 72), RegionEdit::Commit]);
+    assert_eq!(
+        opcode(&h, 1, "lokey").unwrap().0,
+        "E2",
+        "a new opcode is a name"
+    );
+    // The key map's own drag keeps the style too.
+    h.state_mut().select_region(0);
+    st_mut(&mut h).edit(|i| set_keys(i, 0, 41, 72));
+    assert_eq!(opcode(&h, 0, "lokey").unwrap().0, "41");
+}
+
+fn st_mut<'a>(h: &'a mut Harness<'static, LimewaveApp>) -> &'a mut InstrumentState {
+    h.state_mut().instrument.as_mut().unwrap()
+}
+
+/// The narrowest supported window in instrument mode: the key-map toolbar wraps, its buttons
+/// work and the Region section is reachable.
+#[test]
+fn the_narrowest_window_keeps_the_key_map_toolbar_and_region_section_reachable() {
+    let (_dir, path) = folder(
+        "<region> sample=a.wav lokey=40 hikey=50\n<region> sample=b.wav lokey=60 hikey=70\n",
+    );
+    let mut app = LimewaveApp::for_test();
+    app.open_instrument(path);
+    let size = eframe::egui::vec2(900.0, 700.0);
+    let mut h = Harness::builder()
+        .with_size(size)
+        .allow_missing_glyphs()
+        .build_ui_state(|ui, app: &mut LimewaveApp| app.show(ui), app);
+    wait_loaded(&mut h);
+    let window = Rect::from_min_size(Pos2::ZERO, size);
+    let map = map_area(&h);
+    for label in ["Auto-map from root keys", "Fill gaps"] {
+        let r = h.get_by_label(label).rect();
+        assert!(window.contains_rect(r), "{label} {r:?} inside the window");
+        assert!(
+            r.right() <= map.right() + 1.0,
+            "{label} {r:?} inside the key map"
+        );
+    }
+    for label in ["Low key", "Volume"] {
+        let r = h.get_by_label(label).rect();
+        assert!(window.contains_rect(r), "{label} {r:?}");
+    }
+    h.get_by_label("Fill gaps").click();
+    h.run();
+    assert_eq!(keys(st(&h), 0), (0, 55));
+    assert_eq!(keys(st(&h), 1), (56, 127));
 }

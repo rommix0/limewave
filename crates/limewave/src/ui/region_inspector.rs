@@ -152,13 +152,23 @@ pub fn region_section(ui: &mut Ui, st: &InstrumentState, region: usize) -> Vec<R
 
             let (mut lo, mut hi) = (info.lovel, info.hivel);
             let name = ui.label("Low velocity");
-            let field = ui.add(DragValue::new(&mut lo).range(1..=hi).speed(0.5));
+            let field = ui.add(
+                DragValue::new(&mut lo)
+                    .range(1..=hi)
+                    .clamp_existing_to_range(false)
+                    .speed(0.5),
+            );
             push_edit(&mut out, &field.labelled_by(name.id), || {
                 RegionEdit::Vel(lo, hi)
             });
             ui.end_row();
             let name = ui.label("High velocity");
-            let field = ui.add(DragValue::new(&mut hi).range(info.lovel..=127).speed(0.5));
+            let field = ui.add(
+                DragValue::new(&mut hi)
+                    .range(info.lovel..=127)
+                    .clamp_existing_to_range(false)
+                    .speed(0.5),
+            );
             push_edit(&mut out, &field.labelled_by(name.id), || {
                 RegionEdit::Vel(info.lovel, hi)
             });
@@ -175,6 +185,7 @@ pub fn region_section(ui: &mut Ui, st: &InstrumentState, region: usize) -> Vec<R
             let field = ui.add(
                 DragValue::new(&mut db)
                     .range(-144.0..=6.0)
+                    .clamp_existing_to_range(false)
                     .speed(0.1)
                     .max_decimals(2)
                     .suffix(" dB"),
@@ -283,13 +294,14 @@ pub fn not_heard(name: &str) -> bool {
         "eq",
         "cutoff",
         "resonance",
+        "pan",
+        "width",
+        "trigger",
     ]
     .iter()
     .any(|p| name.starts_with(p))
         || ["lorand", "hirand"].contains(&name)
-        || ["lfo", "pan", "width", "_oncc", "effect"]
-            .iter()
-            .any(|p| name.contains(p))
+        || ["lfo", "_oncc", "effect"].iter().any(|p| name.contains(p))
         || cc_digit
 }
 
@@ -375,6 +387,9 @@ mod tests {
             "cutoff",
             "resonance",
             "eq1_gain",
+            "trigger",
+            "pan_law",
+            "width_oncc4",
         ] {
             assert!(not_heard(name), "{name}");
         }
@@ -389,6 +404,8 @@ mod tests {
             "default_path",
             "accent1",
             "key_label",
+            "expand",
+            "span_x",
         ] {
             assert!(!not_heard(name), "{name}");
         }

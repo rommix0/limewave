@@ -317,14 +317,23 @@ pub fn play_map(st: &InstrumentState, files: &[FileEntry]) -> InstrumentPlay {
     }
 }
 
-/// Sets `region`'s key range as note names, writing only the ends that change.
+/// Sets `region`'s key range, writing only the ends that change. A key already written as a
+/// number stays a number; a note name, or a key the region had no text for, is a note name.
 pub fn set_keys(inst: &mut Instrument, region: usize, lo: u8, hi: u8) {
     let info = inst.region_info(region);
-    if info.lokey != lo {
-        inst.set(region, "lokey", &note_name(lo));
-    }
-    if info.hikey != hi {
-        inst.set(region, "hikey", &note_name(hi));
+    for (name, now, key) in [("lokey", info.lokey, lo), ("hikey", info.hikey, hi)] {
+        if now == key {
+            continue;
+        }
+        let numeric = inst
+            .get(region, name)
+            .is_some_and(|(text, _)| text.trim().starts_with(|c: char| c.is_ascii_digit()));
+        let text = if numeric {
+            key.to_string()
+        } else {
+            note_name(key)
+        };
+        inst.set(region, name, &text);
     }
 }
 
