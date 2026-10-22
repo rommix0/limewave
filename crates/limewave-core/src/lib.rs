@@ -11,6 +11,7 @@ pub mod notes;
 pub mod render;
 pub mod riff;
 pub mod save;
+pub mod sfz;
 pub mod smpl;
 pub mod spectrum_loop;
 pub mod tail;
