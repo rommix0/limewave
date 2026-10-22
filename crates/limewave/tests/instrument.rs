@@ -6,8 +6,11 @@ use std::time::Duration;
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
 use limewave::app::{FileEntry, LimewaveApp, PendingAction};
+use limewave::instrument::InstrumentState;
+use limewave::ui::regions::{RegionListAction, unassigned_wavs};
 use limewave_core::edit::EditState;
 use limewave_core::riff::Chunk;
+use limewave_core::sfz::Keycenter;
 use limewave_core::smpl::Smpl;
 use limewave_core::testwav::{sine, wav_bytes};
 use limewave_core::wav::SampleFormat;
@@ -136,7 +139,11 @@ fn missing_samples_show_as_failed() {
     let st = app.instrument.as_ref().unwrap();
     assert_eq!(st.region_file(1), None);
     assert_eq!(st.region_file(3), Some(1));
-    assert_eq!(h.query_all_by_label("failed").count(), 1);
+    assert_eq!(
+        h.query_all_by_label("missing").count(),
+        2,
+        "the two regions with no file say so"
+    );
 
     // A missing region can be selected, but leaves the editor empty.
     h.state_mut().select_region(1);
@@ -322,4 +329,336 @@ fn rsb_library_opens_if_present() {
         assert_eq!(app.files.len(), st.binding.samples.len(), "{name}");
         assert!(app.selected.is_some(), "{name}");
     }
+}
+
+/// Opens `sfz` (with `a.wav`, `b.wav` and `c.wav` beside it) in a harness.
+fn open_text(sfz: &str) -> (tempfile::TempDir, Harness<'static, LimewaveApp>) {
+    let (dir, path) = folder(sfz);
+    write_wav(dir.path(), "c.wav", Some(72));
+    let h = open(&path);
+    (dir, h)
+}
+
+fn st<'a>(h: &'a Harness<'static, LimewaveApp>) -> &'a InstrumentState {
+    h.state().instrument.as_ref().unwrap()
+}
+
+/// The name of the file the editor shows.
+fn shown(app: &LimewaveApp) -> String {
+    app.files[app.selected.expect("a file is selected")].file_name()
+}
+
+/// The invariant behind Review Focus 4: the selected region exists, and the editor shows its
+/// sample, or nothing when it has none loaded.
+fn assert_selection_valid(app: &LimewaveApp) {
+    let st = app.instrument.as_ref().unwrap();
+    let count = st.inst().regions().len();
+    match st.selected_region {
+        Some(r) => {
+            assert!(r < count, "region {r} of {count}");
+            assert_eq!(
+                app.selected,
+                st.region_file(r),
+                "the editor follows the region"
+            );
+        }
+        None => assert_eq!(app.selected, None, "no region, no sample"),
+    }
+    if let Some(i) = app.selected {
+        assert!(matches!(app.files[i], FileEntry::Loaded(_)));
+    }
+}
+
+#[test]
+fn rows_are_grouped_and_labelled() {
+    let (_dir, mut h) = open_text(
+        "<region> sample=b.wav pitch_keycenter=67 lokey=67 hikey=67\n\
+         <group> <region> sample=a.wav pitch_keycenter=60 lokey=54 hikey=69 loop_mode=loop_continuous\n\
+         <group> <region> sample=gone.wav pitch_keycenter=48 lokey=0 hikey=53\n\
+         <group> group_label=Soft lovel=1 hivel=64 <region> sample=a.wav pitch_keycenter=62 lokey=70 hikey=70\n\
+         <group> lovel=65 <region> sample=b.wav pitch_keycenter=65 lokey=71 hikey=80\n",
+    );
+    h.run();
+    h.get_by_label("No group");
+    h.get_by_label("Group 2");
+    h.get_by_label("Group 4 \u{b7} vel 65\u{2013}127");
+    h.get_by_label("Soft \u{b7} vel 1\u{2013}64");
+    h.get_by_label("C4");
+    h.get_by_label("F#3\u{2013}A4");
+    // The first a.wav region asks for a loop; the second follows the shared sample into it.
+    assert_eq!(h.query_all_by_label("\u{27f2}").count(), 2);
+    assert_eq!(h.query_all_by_label("missing").count(), 1);
+    assert_eq!(h.query_all_by_label("a.wav").count(), 2);
+    h.get_by_label("gone.wav");
+    h.get_by_label("5 regions \u{b7} 4 groups");
+    // A one-note range shows the note alone.
+    h.get_by_label("A#4");
+    h.get_by_label("Group 1");
+}
+
+#[test]
+fn group_one_is_titled_when_it_comes_first() {
+    let (_dir, mut h) = open_text("<group> <region> sample=a.wav\n<group> <region> sample=b.wav\n");
+    h.run();
+    h.get_by_label("Group 1");
+    h.get_by_label("Group 2");
+    assert!(h.query_by_label("No group").is_none());
+}
+
+#[test]
+fn clicking_a_row_selects_region_and_sample() {
+    let (_dir, mut h) = open_text(
+        "<group> <region> sample=a.wav pitch_keycenter=60 lokey=0 hikey=62\n\
+         <region> sample=b.wav pitch_keycenter=64 lokey=63 hikey=127\n",
+    );
+    assert_eq!(st(&h).selected_region, Some(0));
+    h.get_by_label("E4").click();
+    h.run();
+    assert_eq!(st(&h).selected_region, Some(1));
+    assert_eq!(h.state().selected, st(&h).region_file(1));
+    assert_eq!(shown(h.state()), "b.wav");
+    h.get_by_label("C4").click();
+    h.run();
+    assert_eq!(st(&h).selected_region, Some(0));
+    assert_eq!(shown(h.state()), "a.wav");
+    assert_selection_valid(h.state());
+}
+
+#[test]
+fn selecting_a_file_directly_keeps_the_region_consistent() {
+    let (_dir, mut h) = open_text("<group> <region> sample=a.wav\n<region> sample=b.wav\n");
+    let b = st(&h).region_file(1).unwrap();
+    h.state_mut().select(b);
+    assert_eq!(
+        st(&h).selected_region,
+        None,
+        "region 0 plays a.wav, not b.wav"
+    );
+    h.state_mut().select_region(1);
+    h.state_mut().select(b);
+    assert_eq!(st(&h).selected_region, Some(1));
+}
+
+#[test]
+fn delete_selected_region_keeps_selection_valid() {
+    let (_dir, mut h) = open_text(
+        "<group> <region> sample=a.wav lokey=0 hikey=40\n\
+         <region> sample=b.wav lokey=41 hikey=80\n\
+         <region> sample=a.wav lokey=81 hikey=127\n",
+    );
+    // The last region goes: the one before it is selected.
+    h.state_mut().select_region(2);
+    h.run();
+    h.get_by_label("Delete region").click();
+    h.run();
+    assert_eq!(st(&h).inst().regions().len(), 2);
+    assert_eq!(st(&h).selected_region, Some(1));
+    assert_selection_valid(h.state());
+    assert_eq!(shown(h.state()), "b.wav");
+
+    // The first region goes: the next one slides into its place and is selected.
+    h.state_mut().select_region(0);
+    h.state_mut()
+        .region_action(RegionListAction::DeleteRegion(0));
+    assert_eq!(st(&h).selected_region, Some(0));
+    assert_selection_valid(h.state());
+    assert_eq!(shown(h.state()), "b.wav");
+
+    // The last one goes: nothing is selected and the editor is empty.
+    h.state_mut()
+        .region_action(RegionListAction::DeleteRegion(0));
+    assert_eq!(st(&h).inst().regions().len(), 0);
+    assert_eq!(st(&h).selected_region, None);
+    assert_eq!(h.state().selected, None);
+    assert_selection_valid(h.state());
+    h.run();
+
+    // Each delete was one undo step.
+    h.state_mut().undo();
+    assert_eq!(st(&h).inst().regions().len(), 1);
+    assert_selection_valid(h.state());
+    h.state_mut().undo();
+    h.state_mut().undo();
+    assert_eq!(st(&h).inst().regions().len(), 3);
+    assert_selection_valid(h.state());
+    assert!(!st(&h).history.is_dirty());
+}
+
+#[test]
+fn deleting_a_region_before_the_selected_one_follows_it() {
+    let (_dir, mut h) = open_text(
+        "<group> <region> sample=a.wav lokey=0 hikey=40\n\
+         <region> sample=b.wav lokey=41 hikey=80\n\
+         <region> sample=c.wav lokey=81 hikey=127\n",
+    );
+    h.state_mut().select_region(2);
+    h.state_mut()
+        .region_action(RegionListAction::DeleteRegion(0));
+    assert_eq!(st(&h).selected_region, Some(1));
+    assert_eq!(shown(h.state()), "c.wav");
+    assert_selection_valid(h.state());
+}
+
+#[test]
+fn undo_add_unassigned_keeps_selection_valid() {
+    let (dir, mut h) = open_text(
+        "<group> <region> sample=a.wav lokey=0 hikey=60\n\
+         <region> sample=a.wav lokey=61 hikey=127\n",
+    );
+    h.state_mut().select_region(1);
+    let c = dir.path().join("c.wav");
+    h.state_mut()
+        .region_action(RegionListAction::AddUnassigned(c));
+    assert_eq!(st(&h).inst().regions().len(), 3);
+    assert_eq!(
+        st(&h).selected_region,
+        Some(2),
+        "the new region is selected"
+    );
+    assert_eq!(
+        st(&h).inst().get(2, "sample").map(|g| g.0).as_deref(),
+        Some("c.wav")
+    );
+    assert_eq!(
+        st(&h).inst().region_info(2).keycenter,
+        Keycenter::Note(72),
+        "the WAV's root"
+    );
+    assert_selection_valid(h.state());
+    assert_eq!(shown(h.state()), "c.wav");
+    assert!(st(&h).unsaved(&h.state().files));
+
+    // Undo takes the region away; the selection falls back to one that is still there.
+    h.state_mut().undo();
+    assert_eq!(st(&h).inst().regions().len(), 2);
+    assert_eq!(st(&h).selected_region, Some(1));
+    assert_selection_valid(h.state());
+    assert_eq!(shown(h.state()), "a.wav");
+    h.state_mut().redo();
+    assert_eq!(st(&h).inst().regions().len(), 3);
+    assert_selection_valid(h.state());
+    h.run();
+}
+
+#[test]
+fn undo_add_to_an_empty_instrument_leaves_nothing_selected() {
+    let (dir, mut h) = open_text("<group>\n");
+    assert_eq!(st(&h).selected_region, None);
+    h.state_mut()
+        .region_action(RegionListAction::AddUnassigned(dir.path().join("a.wav")));
+    assert_eq!(st(&h).inst().regions().len(), 1);
+    assert_eq!(st(&h).selected_region, Some(0));
+    assert_selection_valid(h.state());
+    h.state_mut().undo();
+    assert_eq!(st(&h).inst().regions().len(), 0);
+    assert_eq!(st(&h).selected_region, None);
+    assert_eq!(h.state().selected, None);
+    assert_selection_valid(h.state());
+    h.run();
+}
+
+#[test]
+fn undo_follows_the_most_recent_edit_across_histories() {
+    let (dir, mut h) = open_text("<group> <region> sample=a.wav\n");
+    fn sample_edit(h: &mut Harness<'static, LimewaveApp>, start: usize) {
+        let i = h.state().selected.unwrap();
+        let FileEntry::Loaded(s) = &mut h.state_mut().files[i] else {
+            panic!("not loaded");
+        };
+        let e = EditState {
+            start,
+            ..s.edit().clone()
+        };
+        s.apply(e, None);
+    }
+    sample_edit(&mut h, 10);
+    h.state_mut()
+        .region_action(RegionListAction::AddUnassigned(dir.path().join("b.wav")));
+    h.state_mut().select_region(0);
+    sample_edit(&mut h, 20);
+    // Newest first: the sample edit, then the added region, then the older sample edit.
+    h.state_mut().undo();
+    assert_eq!(st(&h).inst().regions().len(), 2);
+    h.state_mut().undo();
+    assert_eq!(st(&h).inst().regions().len(), 1);
+    assert_selection_valid(h.state());
+    h.state_mut().undo();
+    assert_eq!(st(&h).inst().regions().len(), 1);
+    let FileEntry::Loaded(s) = &h.state().files[h.state().selected.unwrap()] else {
+        panic!("not loaded");
+    };
+    assert_eq!(s.edit().start, 0, "all three are undone");
+    // Redo goes the other way round.
+    h.state_mut().redo();
+    h.state_mut().redo();
+    assert_eq!(st(&h).inst().regions().len(), 2);
+    assert_selection_valid(h.state());
+}
+
+#[test]
+fn add_group_appends_empty_section() {
+    let (_dir, mut h) = open_text("<group> <region> sample=a.wav\n");
+    assert_eq!(st(&h).inst().groups().len(), 1);
+    assert!(h.query_by_label("Group 2").is_none());
+    h.get_by_label("Add group").click();
+    h.run();
+    assert_eq!(st(&h).inst().groups().len(), 2);
+    assert_eq!(st(&h).inst().regions().len(), 1);
+    h.get_by_label("Group 2");
+    assert_eq!(st(&h).selected_region, Some(0), "the selection stays");
+    assert!(st(&h).history.is_dirty());
+    h.state_mut().undo();
+    h.run();
+    assert_eq!(st(&h).inst().groups().len(), 1);
+}
+
+#[test]
+fn unassigned_lists_unused_wavs() {
+    let (dir, mut h) = open_text("<group> <region> sample=a.wav\n");
+    write_wav(dir.path(), "D.WAV", None);
+    std::fs::write(dir.path().join("notes.txt"), "x").unwrap();
+    fn names(h: &Harness<'static, LimewaveApp>) -> Vec<String> {
+        unassigned_wavs(st(h), &h.state().files)
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect()
+    }
+    assert_eq!(names(&h), ["b.wav", "c.wav", "D.WAV"]);
+
+    // Using one takes it off the list; deleting that region puts it back.
+    h.state_mut()
+        .region_action(RegionListAction::AddUnassigned(dir.path().join("c.wav")));
+    assert_eq!(names(&h), ["b.wav", "D.WAV"]);
+    h.state_mut()
+        .region_action(RegionListAction::DeleteRegion(1));
+    assert_eq!(names(&h), ["b.wav", "c.wav", "D.WAV"]);
+
+    // The panel shows the count; opening the section lists the rows.
+    h.run();
+    h.get_by_label("Unassigned WAVs (3)").click();
+    h.run();
+    h.get_by_label("D.WAV");
+    assert_eq!(h.query_all_by_label("Add").count(), 3);
+}
+
+#[test]
+fn add_unassigned_names_the_wav_relative_to_the_instrument() {
+    let dir = tempfile::tempdir().unwrap();
+    let sub = dir.path().join("Samples");
+    std::fs::create_dir(&sub).unwrap();
+    write_wav(&sub, "a.wav", Some(60));
+    write_wav(&sub, "z.wav", Some(50));
+    let path = dir.path().join("inst.sfz");
+    std::fs::write(&path, "<group> <region> sample=Samples\\a.wav\n").unwrap();
+    let mut h = open(&path);
+    let found: Vec<PathBuf> = unassigned_wavs(st(&h), &h.state().files);
+    assert_eq!(found, [sub.join("z.wav")]);
+    h.state_mut()
+        .region_action(RegionListAction::AddUnassigned(sub.join("z.wav")));
+    assert_eq!(
+        st(&h).inst().get(1, "sample").map(|g| g.0).as_deref(),
+        Some("Samples/z.wav")
+    );
+    assert!(st(&h).region_file(1).is_some(), "the new region is bound");
+    assert_eq!(st(&h).region_file(1), h.state().selected);
 }

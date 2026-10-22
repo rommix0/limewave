@@ -93,7 +93,7 @@ fn relative_text(base: &Path, target: &Path) -> Option<String> {
 
 /// The `sample=` text that reaches `target` from a saved instrument in `target_dir` with this
 /// `default_path`: a path relative to the default folder, or the absolute path when none exists.
-fn moved_text(target_dir: &Path, default_path: &str, target: &Path) -> String {
+pub fn moved_text(target_dir: &Path, default_path: &str, target: &Path) -> String {
     let dp = default_path.replace('\\', "/");
     let base = if is_absolute_text(&dp) {
         PathBuf::from(&dp)

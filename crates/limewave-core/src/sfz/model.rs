@@ -483,6 +483,23 @@ impl Instrument {
         out
     }
 
+    /// What `<group>` number `group` itself sets for `name` (aliases understood, `#define`s
+    /// expanded); nothing is inherited from master or global.
+    pub fn group_get(&self, group: usize, name: &str) -> Option<String> {
+        let h = *self.groups().get(group)?;
+        let canon = canonical(name);
+        let defines = self.defines();
+        self.file.tokens[h + 1..self.span_end(h)]
+            .iter()
+            .rev()
+            .find_map(|t| match t {
+                Token::Opcode { name, value } if supplies(canon, name) => {
+                    Some(expand(value, &defines))
+                }
+                _ => None,
+            })
+    }
+
     /// The `<control>` `default_path`, expanded; empty when there is none.
     pub fn default_path(&self) -> String {
         let defines = self.defines();
@@ -515,6 +532,22 @@ mod tests {
             name: name.into(),
             value: value.into(),
         }
+    }
+
+    #[test]
+    fn group_get_reads_only_the_group_itself() {
+        let i = inst(
+            "<global> lovel=9 <group> group_label=Soft lovel=2 hivel=50 <region> sample=a.wav <group> <region> sample=b.wav",
+        );
+        assert_eq!(i.group_get(0, "group_label").as_deref(), Some("Soft"));
+        assert_eq!(i.group_get(0, "lovel").as_deref(), Some("2"));
+        assert_eq!(i.group_get(0, "hivel").as_deref(), Some("50"));
+        assert_eq!(
+            i.group_get(1, "lovel"),
+            None,
+            "global's lovel is not the group's"
+        );
+        assert_eq!(i.group_get(2, "lovel"), None);
     }
 
     #[test]

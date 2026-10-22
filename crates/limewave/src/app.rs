@@ -25,6 +25,7 @@ use limewave_core::sfz::bind;
 use limewave_core::sfz::model::Instrument;
 use limewave_core::sfz::parse::{decode_text, parse};
 use limewave_core::sfz::paths::{same_file_key, sample_path};
+use limewave_core::sfz::save::moved_text;
 use limewave_core::wav::SampleFormat;
 
 use crate::audio::engine::{AudioEngine, Command, Cursor};
@@ -45,6 +46,7 @@ use crate::ui::keyboard::{KeyEvent, keyboard_strip};
 use crate::ui::new_dialog::{BitDepth, NewDialogState, new_dialog};
 use crate::ui::overview::overview;
 use crate::ui::record_panel::{NO_INPUT, RecordPanelState, record_panel};
+use crate::ui::regions::{RegionListAction, region_list, unassigned_cached};
 use crate::ui::save_dialog::{
     SaveCommand, SaveDialogState, SaveRequest, SaveResult, other_file_in_the_way, perform_save,
     save_dialog, save_results_window,
@@ -912,7 +914,7 @@ impl LimewaveApp {
                 .map(|p| FileEntry::Failed(p, "missing".into())),
         );
         self.single_file = false;
-        self.selected = None;
+        self.select_entry(None);
         self.ui.message = None;
         self.instrument = Some(st);
         if paths.is_empty() {
@@ -934,7 +936,7 @@ impl LimewaveApp {
             Some(action) => self.perform(action),
             None => {
                 self.files.clear();
-                self.selected = None;
+                self.select_entry(None);
                 self.loader = None;
             }
         }
@@ -957,6 +959,142 @@ impl LimewaveApp {
         st.selected_region = Some(region);
         let file = st.region_file(region);
         self.select_entry(file);
+    }
+
+    /// Does what the user asked of the region list.
+    pub fn region_action(&mut self, action: RegionListAction) {
+        match action {
+            RegionListAction::Select(region) => self.select_region(region),
+            RegionListAction::AddGroup => {
+                if let Some(st) = &mut self.instrument {
+                    st.edit(|i| {
+                        i.add_group();
+                    });
+                }
+            }
+            RegionListAction::DeleteRegion(region) => self.delete_region(region),
+            RegionListAction::AddUnassigned(path) => self.add_unassigned(path),
+            RegionListAction::Close => self.request(PendingAction::CloseInstrument),
+        }
+    }
+
+    /// Removes `region` as one undo step. The selection moves to the region after it, else the
+    /// one before, else nothing.
+    fn delete_region(&mut self, region: usize) {
+        let Some(st) = &mut self.instrument else {
+            return;
+        };
+        if region >= st.inst().regions().len() {
+            return;
+        }
+        let selected = st.selected_region;
+        st.edit(|i| i.delete_region(region));
+        // The regions after the deleted one move up by one.
+        let keep = match selected {
+            Some(s) if s > region => Some(s - 1),
+            other => other,
+        };
+        st.rebind(&self.files);
+        self.settle_selection(keep);
+    }
+
+    /// Adds a region for the WAV at `path`, which no region plays: to the selected region's
+    /// group, else the last one, at the WAV's root key. One undo step, and the new region is
+    /// selected. A WAV that can't be read says why in the toolbar.
+    fn add_unassigned(&mut self, path: PathBuf) {
+        let Some(st) = &self.instrument else {
+            return;
+        };
+        let key = same_file_key(&path);
+        let found = self
+            .files
+            .iter()
+            .position(|f| same_file_key(f.path()) == key);
+        let index = match found {
+            Some(i) => i,
+            None => match load_wav(&path) {
+                Ok(doc) => {
+                    self.files
+                        .push(FileEntry::Loaded(Box::new(Session::new(doc))));
+                    self.files.len() - 1
+                }
+                Err(e) => {
+                    self.ui.message = Some(format!("Couldn't open {}: {e}", path.display()));
+                    return;
+                }
+            },
+        };
+        let FileEntry::Loaded(session) = &self.files[index] else {
+            self.ui.message = Some(format!("{} isn't ready yet", self.files[index].file_name()));
+            return;
+        };
+        let root = session.edit().root;
+        let dir = st.path.parent().unwrap_or(Path::new(""));
+        let text = moved_text(dir, &st.inst().default_path(), &path);
+        let group = st
+            .selected_region
+            .and_then(|r| st.inst().group_of(r))
+            .or_else(|| st.inst().groups().len().checked_sub(1));
+        let Some(st) = &mut self.instrument else {
+            return;
+        };
+        let mut added = 0;
+        st.edit(|i| added = i.add_region(group, &text, root));
+        st.rebind(&self.files);
+        self.settle_selection(Some(added));
+    }
+
+    /// Keeps the selected region valid after the regions changed: `wanted`, or the last region
+    /// when that is gone, or none. The editor then shows that region's sample, or nothing.
+    fn settle_selection(&mut self, wanted: Option<usize>) {
+        let Some(st) = &mut self.instrument else {
+            return;
+        };
+        let count = st.inst().regions().len();
+        let region = wanted
+            .zip(count.checked_sub(1))
+            .map(|(w, last)| w.min(last));
+        st.selected_region = region;
+        let file = region.and_then(|r| st.region_file(r));
+        // The editor keeps its view and selection when the sample stays the same.
+        if file != self.selected {
+            self.select_entry(file);
+        }
+    }
+
+    /// Whether Ctrl+Z / Ctrl+Shift+Z move the instrument's history rather than the selected
+    /// sample's: the more recent edit goes first when undoing, the older when redoing (spec 8).
+    fn instrument_goes_first(&self, redo: bool) -> bool {
+        let Some(st) = &self.instrument else {
+            return false;
+        };
+        let sample = self.selected_session().map(|s| &s.history);
+        if redo {
+            let Some(own) = st.history.redo_stamp() else {
+                return false;
+            };
+            sample
+                .and_then(|h| h.redo_stamp())
+                .is_none_or(|other| own <= other)
+        } else {
+            st.history.cursor() > 0
+                && sample.is_none_or(|h| h.cursor() == 0 || st.history.stamp() >= h.stamp())
+        }
+    }
+
+    /// Takes one step in the instrument's history and binds the result again.
+    fn step_instrument(&mut self, redo: bool) {
+        let Some(st) = &mut self.instrument else {
+            return;
+        };
+        if redo {
+            st.history.redo();
+        } else {
+            st.history.undo();
+        }
+        let keep = st.selected_region;
+        st.rebind(&self.files);
+        self.settle_selection(keep);
     }
 
     /// The instrument's samples have all loaded (or failed): bind with each WAV's own state
@@ -1314,6 +1452,12 @@ impl LimewaveApp {
             self.end_preview();
         }
         self.selected = i;
+        // The selected region plays the selected file, or there is none.
+        if let Some(st) = &mut self.instrument
+            && st.selected_region.is_some_and(|r| st.region_file(r) != i)
+        {
+            st.selected_region = None;
+        }
         self.ui.marker_entry = None;
         self.ui.selection = None;
         self.ui.play_from = None;
@@ -1669,6 +1813,10 @@ impl LimewaveApp {
 
     pub fn undo(&mut self) {
         self.ui.message = None;
+        if self.instrument_goes_first(false) {
+            self.step_instrument(false);
+            return;
+        }
         let engine = self.engine.as_ref();
         if let Some(FileEntry::Loaded(s)) = self.selected.and_then(|i| self.files.get_mut(i)) {
             s.undo(engine);
@@ -1678,6 +1826,10 @@ impl LimewaveApp {
 
     pub fn redo(&mut self) {
         self.ui.message = None;
+        if self.instrument_goes_first(true) {
+            self.step_instrument(true);
+            return;
+        }
         let engine = self.engine.as_ref();
         if let Some(FileEntry::Loaded(s)) = self.selected.and_then(|i| self.files.get_mut(i)) {
             s.redo(engine);
@@ -1980,19 +2132,17 @@ impl LimewaveApp {
         self.toolbar(ui);
         if !self.single_file {
             let mut clicked = None;
-            let mut close = false;
+            let mut region_action = None;
+            let mut fresh = None;
             egui::Panel::left("file_list")
                 .resizable(true)
                 .default_size(280.0)
                 .size_range(200.0..=480.0)
                 .show(ui, |ui| match &self.instrument {
                     Some(st) => {
-                        ui.horizontal(|ui| {
-                            let name = st.path.file_name().unwrap_or_default();
-                            ui.strong(name.to_string_lossy());
-                            close = ui.button("Close instrument").clicked();
-                        });
-                        clicked = filelist::file_list(ui, &self.files, &[], self.selected);
+                        let unassigned = unassigned_cached(st, &self.files);
+                        region_action = region_list(ui, st, &self.files, &unassigned.1);
+                        fresh = Some(unassigned);
                     }
                     None => {
                         clicked = filelist::file_list(
@@ -2003,6 +2153,11 @@ impl LimewaveApp {
                         );
                     }
                 });
+            if let (Some(st), Some(fresh)) = (&mut self.instrument, fresh)
+                && st.unassigned.as_ref().map(|u| &u.0) != Some(&fresh.0)
+            {
+                st.unassigned = Some(fresh);
+            }
             match clicked {
                 Some(FileListClick::File(i)) => self.select_file(i),
                 Some(FileListClick::Instrument(i)) => {
@@ -2011,8 +2166,8 @@ impl LimewaveApp {
                 }
                 None => {}
             }
-            if close {
-                self.request(PendingAction::CloseInstrument);
+            if let Some(action) = region_action {
+                self.region_action(action);
             }
         }
         self.inspector_panel(ui);

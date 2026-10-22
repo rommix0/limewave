@@ -31,6 +31,9 @@ pub struct InstrumentState {
     pub write_smpl: bool,
     /// Whether the key map shows key ranges only, without velocity.
     pub keys_only: bool,
+    /// The Unassigned WAVs list with what it was worked out from, so the folders are read again
+    /// only when that changes.
+    pub unassigned: Option<(Vec<String>, Vec<PathBuf>)>,
     /// Parallel to `binding.samples`: each loaded WAV's own `initial_edit`, `None` while it
     /// loads or if it failed. Lets [`InstrumentState::edit`] rebind without the file list.
     wavs: Vec<Option<EditState>>,
@@ -52,6 +55,7 @@ impl InstrumentState {
             destination: None,
             write_smpl: false,
             keys_only: false,
+            unassigned: None,
             wavs: vec![None; n],
         }
     }

@@ -154,7 +154,7 @@ fn row(ui: &mut Ui, entry: &FileEntry, selected: bool) -> bool {
 }
 
 /// The unsaved-changes marker: a small filled circle (drawn, as not every font has the glyph).
-fn dirty_dot(ui: &mut Ui) {
+pub(crate) fn dirty_dot(ui: &mut Ui) {
     let (rect, _) = ui.allocate_exact_size(vec2(8.0, 8.0), Sense::hover());
     ui.painter().circle_filled(rect.center(), 3.0, colors::LOOP);
 }
