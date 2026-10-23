@@ -1,5 +1,6 @@
 //! Panels and widgets.
 
+pub mod about_dialog;
 pub mod coords;
 pub mod dialog_kit;
 pub mod effects;

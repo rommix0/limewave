@@ -43,6 +43,7 @@ use crate::instrument::{
 };
 use crate::render_worker::{RenderKey, RenderSlot};
 use crate::theme::{self, colors};
+use crate::ui::about_dialog::about_dialog;
 use crate::ui::coords::ViewTransform;
 use crate::ui::effects::{EffectDialog, EffectParams, edit_menu, effect_dialog, effects_menu};
 use crate::ui::filelist::{self, FileListClick};
@@ -682,6 +683,8 @@ pub struct UiState {
     pub rate_dialog: Option<RateDialogState>,
     /// The Record panel, while it is open (and with it the input device).
     pub record_panel: Option<RecordPanelState>,
+    /// Whether the About window is open.
+    pub about_open: bool,
     /// How long the dialogs wait after the last settings change before they render again
     /// (v0.3 §7). Tests set it to zero.
     pub render_debounce: Duration,
@@ -719,6 +722,7 @@ impl Default for UiState {
             spectrum_dialog: None,
             rate_dialog: None,
             record_panel: None,
+            about_open: false,
             render_debounce: RENDER_DEBOUNCE,
         }
     }
@@ -1794,7 +1798,7 @@ impl LimewaveApp {
     }
 
     /// True while a modal (unsaved prompt, save dialog, save results, the New, effect, tail,
-    /// spectrum-loop or sample-rate dialog, the Record panel) is up.
+    /// spectrum-loop or sample-rate dialog, the Record panel, the About window) is up.
     fn modal_open(&self) -> bool {
         self.pending.is_some()
             || self.ui.save_dialog.open
@@ -1805,6 +1809,7 @@ impl LimewaveApp {
             || self.ui.spectrum_dialog.is_some()
             || self.ui.rate_dialog.is_some()
             || self.ui.record_panel.is_some()
+            || self.ui.about_open
     }
 
     fn perform(&mut self, action: PendingAction) {
@@ -2689,6 +2694,7 @@ impl LimewaveApp {
         tail_dialog(&ctx, self);
         spectrum_dialog(&ctx, self);
         rate_dialog(&ctx, self);
+        about_dialog(&ctx, self);
         self.refresh_sfz_conflicts();
         if let Some(req) = save_dialog(&ctx, &mut self.ui.save_dialog, &self.files) {
             let results = match req.instrument {
@@ -3120,6 +3126,11 @@ impl LimewaveApp {
                 });
                 ui.separator();
                 self.status(ui);
+                // Last, so it shares the status's row when the status wraps to a row of its own.
+                ui.separator();
+                if ui.button("About").clicked() {
+                    self.ui.about_open = true;
+                }
             });
         });
         if let Some(from_loop) = play {
@@ -4171,6 +4182,9 @@ mod tests {
         assert!(app.modal_open());
         app.ui.rate_dialog = None;
         app.ui.new_dialog = Some(NewDialogState::default());
+        assert!(app.modal_open());
+        app.ui.new_dialog = None;
+        app.ui.about_open = true;
         assert!(app.modal_open());
     }
 

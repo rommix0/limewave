@@ -203,6 +203,8 @@ Possible later: batch processing over a folder, a command-line tool, a CLAP plug
 
 ## Licence
 
+Copyright (c) 2026 Anthony C. Bartman (@rommix0).
+
 Licensed under either of
 
 - Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))

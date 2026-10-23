@@ -876,12 +876,14 @@ fn the_narrowest_window_costs_only_one_toolbar_row() {
 }
 
 #[test]
-fn the_toolbar_fits_one_row_in_a_1280_window() {
+fn the_toolbar_buttons_fit_one_row_in_a_1280_window() {
+    // The status and About come last and may take a second row; the buttons before them may not.
     let h = looped_harness_sized(eframe::egui::vec2(1280.0, 700.0), 0.25);
     let open = h.get_by_label("Open file…").rect();
     assert_eq!(h.get_by_label("✏ Draw").rect().top(), open.top());
     assert_eq!(h.get_by_label("Audition").rect().top(), open.top());
-    assert!(waveform_rect(&h).top() < 140.0 + SWITCH_ROW);
+    assert_eq!(h.get_by_label("MIDI").rect().top(), open.top());
+    assert!(waveform_rect(&h).top() < 140.0 + 2.0 * SWITCH_ROW);
 }
 
 #[test]
