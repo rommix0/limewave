@@ -11,3 +11,6 @@ samples/
 
 # build output
 /target/
+
+# packaged releases
+/dist/

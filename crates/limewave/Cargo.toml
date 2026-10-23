@@ -19,3 +19,6 @@ rtrb = "0.4"
 limewave-core = { path = "../limewave-core", features = ["testwav"] }
 egui_kittest = "0.37"
 tempfile = "3"
+
+[build-dependencies]
+embed-resource = "3.0"
