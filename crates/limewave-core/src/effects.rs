@@ -71,7 +71,7 @@ pub enum SpliceKind {
     SpectrumLoop,
     /// Audio removed with nothing in its place (Crop to selection).
     Cut,
-    /// Samples redrawn by hand with the pencil; the length is unchanged.
+    /// Samples rebuilt in place: the pencil or a click repair; the length is unchanged.
     Draw,
 }
 

@@ -3,6 +3,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::dsp::declick::{context_needed, rebuild};
 use crate::dsp::resample::{MAX_RATE, MIN_RATE, resample, resampled_len};
 use crate::effects::{
     AppliedEffect, Op, Resample, Splice, SpliceKind, frames_after, map_position, map_position_end,
@@ -325,6 +326,63 @@ pub fn redraw_samples(
     Some(r)
 }
 
+/// The longest stretch Repair click works on, in milliseconds.
+pub const MAX_REPAIR_MS: f64 = 50.0;
+
+/// [`MAX_REPAIR_MS`] in frames at `rate`, rounded to the nearest frame.
+pub fn max_repair_frames(rate: u32) -> usize {
+    (f64::from(rate) * MAX_REPAIR_MS / 1000.0).round() as usize
+}
+
+/// Rebuilds the selected stretch of `channels` from the audio on both sides, as one undoable
+/// effect step that keeps the file length. `sel` is in the frames of `processed` (either way
+/// round) and `rate` is the effective sample rate. The other channels are copied from
+/// `processed`, so they stay bit-identical, and the rebuilt frames are tinted as generated.
+/// Refuses, with a message to show, a selection longer than [`max_repair_frames`], one too
+/// close to the start or end of the audio, and an empty `channels`, an out-of-range channel or
+/// a selection past the end.
+pub fn repair_click(
+    e: &EditState,
+    processed: &[Vec<f32>],
+    sel: (usize, usize),
+    channels: &[usize],
+    rate: u32,
+) -> Result<EditState, String> {
+    let (first, last) = (sel.0.min(sel.1), sel.0.max(sel.1));
+    let frames = (last - first).saturating_add(1);
+    if frames > max_repair_frames(rate) {
+        return Err(format!(
+            "Repair click works on selections up to {MAX_REPAIR_MS:.0} ms; this one is {:.1} ms",
+            frames as f64 * 1000.0 / f64::from(rate)
+        ));
+    }
+    let len = processed.first().map_or(0, Vec::len);
+    let nothing = || "Nothing to repair".to_string();
+    if channels.is_empty() || channels.iter().any(|&c| c >= processed.len()) || last >= len {
+        return Err(nothing());
+    }
+    let need = context_needed(frames);
+    if first < need || len - 1 - last < need {
+        return Err("Repair click needs more audio on both sides; the selection is too close to the start or end".to_string());
+    }
+    let mut audio: Vec<Vec<f32>> = processed.iter().map(|c| c[first..=last].to_vec()).collect();
+    for &c in channels {
+        // The context was checked above, so a rebuild always comes back.
+        audio[c] = rebuild(&processed[c], first, last).ok_or_else(nothing)?;
+    }
+    let mut r = e.clone();
+    r.effects.push(AppliedEffect {
+        op: Op::Splice(Arc::new(Splice {
+            kind: SpliceKind::Draw,
+            audio,
+            generated: (0, last - first),
+        })),
+        first,
+        last,
+    });
+    Ok(r)
+}
+
 /// `e` with Start, End and the loop points moved through the steps in `steps` that move audio
 /// (conversions and splices, see [`map_position`]): Start and the loop start directly, End and
 /// the loop end as the position one past them. A start and its end can cross, at a tiny rate or
@@ -474,7 +532,7 @@ impl<T: Clone + PartialEq> History<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::effects::{Splice, SpliceKind, map_frame, map_range, process};
+    use crate::effects::{Splice, SpliceKind, generated_ranges, map_frame, map_range, process};
     use std::sync::Arc;
 
     fn looped(frames: usize, end: usize, ls: usize, le: usize) -> EditState {
@@ -1008,6 +1066,136 @@ mod tests {
         assert!(redraw_samples(&e, &audio, 1, 2, &[0.5]).is_none());
         assert!(redraw_samples(&e, &audio, 0, 9, &[0.5, 0.5]).is_none());
         assert!(redraw_samples(&e, &audio, 0, 2, &[f32::NAN]).is_none());
+    }
+
+    /// A stereo 440/660 Hz sine, `frames` long, at `rate`.
+    fn tones(rate: u32, frames: usize) -> Vec<Vec<f32>> {
+        vec![
+            crate::testwav::sine(440.0, rate, frames, 0.5),
+            crate::testwav::sine(660.0, rate, frames, 0.5),
+        ]
+    }
+
+    /// `audio` with a spike at `frame` in the channels `chans`.
+    fn spiked(audio: &[Vec<f32>], frame: usize, chans: &[usize]) -> Vec<Vec<f32>> {
+        let mut a = audio.to_vec();
+        for &c in chans {
+            a[c][frame] = 1.0;
+        }
+        a
+    }
+
+    #[test]
+    fn repair_keeps_the_length_and_every_marker() {
+        let clean = tones(44_100, 8_000);
+        let x = spiked(&clean, 4000, &[0]);
+        let e = EditState {
+            start: 100,
+            end: 7000,
+            loop_mode: LoopMode::Forward,
+            loop_start: 1000,
+            loop_end: 6000,
+            crossfade: 50,
+            ..EditState::default_for(8_000)
+        };
+        let r = repair_click(&e, &x, (4000, 4000), &[0], 44_100).unwrap();
+        assert_eq!(r.effects.len(), 1);
+        assert_eq!(frames_after(8_000, &r.effects), 8_000);
+        assert_eq!((r.start, r.end), (e.start, e.end));
+        assert_eq!((r.loop_start, r.loop_end), (e.loop_start, e.loop_end));
+        assert_eq!(r.crossfade, e.crossfade);
+        assert_eq!(r.loop_mode, e.loop_mode);
+        assert_eq!(r.clone().clamped(8_000), r);
+    }
+
+    #[test]
+    fn repair_left_only_leaves_the_right_channel_bit_identical() {
+        let clean = tones(44_100, 8_000);
+        let x = spiked(&clean, 4000, &[0]);
+        let e = EditState::default_for(8_000);
+        let r = repair_click(&e, &x, (4000, 4000), &[0], 44_100).unwrap();
+        let out = process(&x, &r.effects);
+        assert_eq!(out[1], x[1]);
+        let err = f64::from((out[0][4000] - clean[0][4000]).abs());
+        assert!(20.0 * (err / 0.5).log10() < -40.0, "error {err}");
+        // Every other left frame is untouched.
+        assert_eq!(out[0][..4000], x[0][..4000]);
+        assert_eq!(out[0][4001..], x[0][4001..]);
+    }
+
+    #[test]
+    fn repair_both_channels_rebuilds_both() {
+        let clean = tones(44_100, 8_000);
+        let x = spiked(&clean, 4000, &[0, 1]);
+        let e = EditState::default_for(8_000);
+        let r = repair_click(&e, &x, (4000, 4000), &[0, 1], 44_100).unwrap();
+        let out = process(&x, &r.effects);
+        for c in 0..2 {
+            let err = f64::from((out[c][4000] - clean[c][4000]).abs());
+            assert!(
+                20.0 * (err / 0.5).log10() < -40.0,
+                "channel {c}: error {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn repaired_audio_is_tinted() {
+        let x = spiked(&tones(44_100, 8_000), 4000, &[0]);
+        let e = EditState::default_for(8_000);
+        let r = repair_click(&e, &x, (4000, 4010), &[0], 44_100).unwrap();
+        assert_eq!(generated_ranges(&r.effects), vec![(4000, 4010)]);
+    }
+
+    #[test]
+    fn a_selection_of_exactly_fifty_ms_is_accepted_and_one_frame_more_is_refused() {
+        let x = tones(44_100, 12_000);
+        let e = EditState::default_for(12_000);
+        assert_eq!(max_repair_frames(44_100), 2205);
+        assert!(repair_click(&e, &x, (4000, 4000 + 2205 - 1), &[0], 44_100).is_ok());
+        let err = repair_click(&e, &x, (4000, 4000 + 2205), &[0], 44_100).unwrap_err();
+        assert_eq!(
+            err,
+            "Repair click works on selections up to 50 ms; this one is 50.0 ms"
+        );
+    }
+
+    #[test]
+    fn the_limit_uses_the_effective_rate() {
+        // Each side needs as many frames as the selection, so the file is made long enough.
+        let x = tones(31_250, 8_000);
+        let e = EditState::default_for(8_000);
+        assert_eq!(max_repair_frames(31_250), 1563);
+        assert!(repair_click(&e, &x, (2000, 2000 + 1563 - 1), &[0], 31_250).is_ok());
+        let err = repair_click(&e, &x, (2000, 2000 + 1564 - 1), &[0], 31_250).unwrap_err();
+        assert!(err.starts_with("Repair click works on selections up to 50 ms; this one is 50.0"));
+    }
+
+    #[test]
+    fn a_reversed_selection_and_a_one_frame_selection_work() {
+        let x = spiked(&tones(44_100, 8_000), 4000, &[0]);
+        let e = EditState::default_for(8_000);
+        let r = repair_click(&e, &x, (4010, 4000), &[0], 44_100).unwrap();
+        assert_eq!((r.effects[0].first, r.effects[0].last), (4000, 4010));
+        let r = repair_click(&e, &x, (4000, 4000), &[0], 44_100).unwrap();
+        assert_eq!((r.effects[0].first, r.effects[0].last), (4000, 4000));
+    }
+
+    #[test]
+    fn edge_and_empty_refusals() {
+        let x = tones(44_100, 8_000);
+        let e = EditState::default_for(8_000);
+        let context = "Repair click needs more audio on both sides; the selection is too close to the start or end";
+        let go = |sel, chans: &[usize]| repair_click(&e, &x, sel, chans, 44_100).unwrap_err();
+        assert_eq!(go((0, 0), &[0]), context);
+        assert_eq!(go((7_999, 7_999), &[0]), context);
+        assert_eq!(go((4000, 4000), &[]), "Nothing to repair");
+        assert_eq!(go((4000, 4000), &[2]), "Nothing to repair");
+        assert_eq!(go((8_000, 8_000), &[0]), "Nothing to repair");
+        assert_eq!(
+            repair_click(&e, &[], (4000, 4000), &[0], 44_100).unwrap_err(),
+            "Nothing to repair"
+        );
     }
 
     #[test]
