@@ -1,8 +1,9 @@
 //! Pure signal maths on `&[f32]`: peak pyramids for drawing, zero-crossing search for loop
 //! snapping, and the analysis building blocks shared by the tail and spectrum-loop effects
 //! (seeded randomness, FFT framing, level envelopes, pitch and least-squares fits). The
-//! band-limited sample-rate converter lives here too.
+//! band-limited sample-rate converter lives here too, and so does the click rebuilder.
 
+pub mod declick;
 pub mod envelope;
 pub mod lsq;
 pub mod peaks;
