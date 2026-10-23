@@ -81,7 +81,7 @@ fn session(app: &LimewaveApp) -> &Session {
 }
 
 fn waveform_rect(h: &Harness<'static, LimewaveApp>) -> Rect {
-    h.get_by_label("Waveform").rect()
+    h.get_by_label("Main view").rect()
 }
 
 /// Screen position of `frame` on the waveform's vertical middle.

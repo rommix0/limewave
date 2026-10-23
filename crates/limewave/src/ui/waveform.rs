@@ -289,7 +289,7 @@ pub fn waveform_view(
     cursors: &[Cursor],
 ) {
     let (rect, response) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
-    response.widget_info(|| WidgetInfo::labeled(Role::Canvas, true, "Waveform"));
+    response.widget_info(|| WidgetInfo::labeled(Role::Canvas, true, "Main view"));
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 2.0, BACKGROUND);
 

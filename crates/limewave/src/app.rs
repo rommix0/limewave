@@ -596,12 +596,42 @@ pub struct ConvertedUi {
     pub after: (Option<(usize, usize)>, Option<usize>),
 }
 
+/// What the main view shows: the waveform, or the spectrogram of the same frames.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ViewMode {
+    /// The waveform, which can be edited and drawn on.
+    #[default]
+    Waveform,
+    /// The spectrogram, a picture of the same frames and zoom.
+    Spectrogram,
+}
+
+impl ViewMode {
+    /// The value this mode is saved as in the app settings.
+    fn to_storage_string(self) -> &'static str {
+        match self {
+            ViewMode::Waveform => "waveform",
+            ViewMode::Spectrogram => "spectrogram",
+        }
+    }
+
+    /// The mode saved as `s`; anything unknown gives the waveform.
+    fn from_storage_string(s: &str) -> ViewMode {
+        match s {
+            "spectrogram" => ViewMode::Spectrogram,
+            _ => ViewMode::Waveform,
+        }
+    }
+}
+
 /// View and tool settings that outlive a single frame.
 pub struct UiState {
     pub snap: bool,
     pub lock_length: bool,
     /// Dragging on a channel draws its waveform at any zoom.
     pub draw: bool,
+    /// Whether the main view shows the waveform or the spectrogram; remembered between runs.
+    pub view_mode: ViewMode,
     pub audition: bool,
     pub octave_base: u8,
     pub held: BTreeSet<u8>,
@@ -655,6 +685,7 @@ impl Default for UiState {
             snap: true,
             lock_length: false,
             draw: false,
+            view_mode: ViewMode::default(),
             audition: true,
             octave_base: 48,
             held: BTreeSet::new(),
@@ -744,6 +775,8 @@ impl CursorWatch {
 const ENVELOPE_KEY: &str = "envelope";
 /// The key "Release plays after loop end" is saved under, as `"1"` or `"0"`.
 const RELEASE_AFTER_LOOP_KEY: &str = "release_after_loop";
+/// The key the main view's mode is saved under, as `"waveform"` or `"spectrogram"`.
+const VIEW_MODE_KEY: &str = "view_mode";
 
 /// Which numbered name [`LimewaveApp::next_name`] hands out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -866,8 +899,8 @@ impl LimewaveApp {
         app
     }
 
-    /// Reads the settings remembered between runs: the envelope and "Release plays after loop
-    /// end". A missing or unreadable value leaves the default.
+    /// Reads the settings remembered between runs: the envelope, "Release plays after loop
+    /// end" and the main view's mode. A missing or unreadable value leaves the default.
     fn load_settings(&mut self, storage: &dyn eframe::Storage) {
         if let Some(envelope) = storage
             .get_string(ENVELOPE_KEY)
@@ -877,6 +910,9 @@ impl LimewaveApp {
         }
         self.ui.release_after_loop =
             storage.get_string(RELEASE_AFTER_LOOP_KEY).as_deref() == Some("1");
+        self.ui.view_mode = storage
+            .get_string(VIEW_MODE_KEY)
+            .map_or_else(ViewMode::default, |s| ViewMode::from_storage_string(&s));
     }
 
     /// An app with no audio engine and no MIDI, for tests.
@@ -3186,6 +3222,7 @@ impl LimewaveApp {
                     .default_size(SEAM_PANEL_HEIGHT)
                     .size_range(120.0..=600.0)
                     .show(ui, |ui| seam_view(ui, s, ui_state, engine, cursors));
+                view_switch(ui, ui_state);
                 let size = ui.available_size();
                 ui.allocate_ui(size, |ui| waveform_view(ui, s, ui_state, engine, cursors));
             }
@@ -3258,6 +3295,25 @@ impl LimewaveApp {
     }
 }
 
+/// The Waveform | Spectrogram switch above the main view. Draw only works on the waveform, so
+/// Draw being on puts the view back there, and choosing the spectrogram turns Draw off.
+fn view_switch(ui: &mut egui::Ui, ui_state: &mut UiState) {
+    if ui_state.draw {
+        ui_state.view_mode = ViewMode::Waveform;
+    }
+    ui.horizontal(|ui| {
+        ui.selectable_value(&mut ui_state.view_mode, ViewMode::Waveform, "Waveform");
+        ui.selectable_value(
+            &mut ui_state.view_mode,
+            ViewMode::Spectrogram,
+            "Spectrogram",
+        );
+    });
+    if ui_state.view_mode == ViewMode::Spectrogram {
+        ui_state.draw = false;
+    }
+}
+
 impl eframe::App for LimewaveApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.show(ui);
@@ -3267,6 +3323,10 @@ impl eframe::App for LimewaveApp {
         storage.set_string(ENVELOPE_KEY, self.ui.envelope.clamped().to_storage_string());
         let past_loop = if self.ui.release_after_loop { "1" } else { "0" };
         storage.set_string(RELEASE_AFTER_LOOP_KEY, past_loop.to_string());
+        storage.set_string(
+            VIEW_MODE_KEY,
+            self.ui.view_mode.to_storage_string().to_string(),
+        );
     }
 }
 
@@ -3417,6 +3477,40 @@ mod tests {
         );
         restored.load_settings(&storage);
         assert!(!restored.ui.release_after_loop);
+    }
+
+    #[test]
+    fn the_view_mode_is_remembered() {
+        use eframe::Storage as _;
+        assert_eq!(UiState::default().view_mode, ViewMode::Waveform);
+        let mut app = LimewaveApp::for_test();
+        app.ui.view_mode = ViewMode::Spectrogram;
+        let mut storage = MemStorage::default();
+        eframe::App::save(&mut app, &mut storage);
+        assert_eq!(
+            storage.get_string("view_mode").as_deref(),
+            Some("spectrogram")
+        );
+
+        let mut restored = LimewaveApp::for_test();
+        restored.load_settings(&storage);
+        assert_eq!(restored.ui.view_mode, ViewMode::Spectrogram);
+
+        let mut fresh = LimewaveApp::for_test();
+        fresh.load_settings(&MemStorage::default());
+        assert_eq!(fresh.ui.view_mode, ViewMode::Waveform, "a missing key");
+
+        storage.set_string("view_mode", "nonsense".to_string());
+        restored.load_settings(&storage);
+        assert_eq!(
+            restored.ui.view_mode,
+            ViewMode::Waveform,
+            "an unknown value"
+        );
+
+        app.ui.view_mode = ViewMode::Waveform;
+        eframe::App::save(&mut app, &mut storage);
+        assert_eq!(storage.get_string("view_mode").as_deref(), Some("waveform"));
     }
 
     #[test]

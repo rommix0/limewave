@@ -10,7 +10,7 @@ use eframe::egui::{
 };
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
-use limewave::app::{FileEntry, LimewaveApp, Session};
+use limewave::app::{FileEntry, LimewaveApp, Session, ViewMode};
 use limewave::ui::waveform::{flag_hit_point, sample_point};
 use limewave_core::document::load_wav_bytes;
 use limewave_core::dsp::{Crossing, is_crossing, is_upward};
@@ -90,7 +90,7 @@ fn session<'a>(h: &'a Harness<'static, LimewaveApp>) -> &'a Session {
 }
 
 fn waveform_rect(h: &Harness<'static, LimewaveApp>) -> Rect {
-    h.get_by_label("Waveform").rect()
+    h.get_by_label("Main view").rect()
 }
 
 /// Screen position of `frame` on the waveform's vertical middle.
@@ -599,7 +599,7 @@ fn opening_a_long_stereo_file_renders_quickly() {
         "60 s 48 kHz stereo 24-bit: generate {generated:?}, load+peaks {loaded:?}, first frame {first_frame:?}"
     );
     assert_eq!(session_frames(&h), frames);
-    h.get_by_label("Waveform");
+    h.get_by_label("Main view");
     assert!(
         first_frame.as_secs_f64() < 2.0,
         "first frame took {first_frame:?}"
@@ -849,13 +849,19 @@ fn escape_turns_draw_off_first() {
     assert_eq!(h.state().ui.selection, None);
 }
 
+/// The room the Waveform | Spectrogram switch takes above the main view.
+const SWITCH_ROW: f32 = 26.0;
+
 #[test]
 fn a_wrapped_toolbar_costs_only_its_own_row() {
     // Before the Draw toggle the waveform was 170 points tall at this size. The toolbar may wrap
     // one row now, but its last widgets must not be squeezed into the leftover width of a row.
     let h = looped_harness();
     let height = waveform_rect(&h).height();
-    assert!(height >= 140.0, "the waveform is {height} points tall");
+    assert!(
+        height >= 140.0 - SWITCH_ROW,
+        "the waveform is {height} points tall"
+    );
     assert!(h.get_by_label("Audition").rect().height() < 30.0);
 }
 
@@ -865,7 +871,7 @@ fn the_narrowest_window_costs_only_one_toolbar_row() {
     let narrow = looped_harness_sized(eframe::egui::vec2(900.0, 700.0), 0.25);
     let wide = looped_harness();
     assert_eq!(waveform_rect(&narrow).top(), waveform_rect(&wide).top());
-    assert!(waveform_rect(&narrow).height() >= 140.0);
+    assert!(waveform_rect(&narrow).height() >= 140.0 - SWITCH_ROW);
 }
 
 #[test]
@@ -874,7 +880,7 @@ fn the_toolbar_fits_one_row_in_a_1280_window() {
     let open = h.get_by_label("Open file…").rect();
     assert_eq!(h.get_by_label("✏ Draw").rect().top(), open.top());
     assert_eq!(h.get_by_label("Audition").rect().top(), open.top());
-    assert!(waveform_rect(&h).top() < 140.0);
+    assert!(waveform_rect(&h).top() < 140.0 + SWITCH_ROW);
 }
 
 #[test]
@@ -904,4 +910,78 @@ fn the_folder_toolbar_fits_one_row_in_a_1280_window() {
     let open = h.get_by_label("Open file…").rect();
     assert_eq!(h.get_by_label("✏ Draw").rect().top(), open.top());
     assert_eq!(h.get_by_label("Audition").rect().top(), open.top());
+}
+
+#[test]
+fn the_view_switch_keeps_zoom_selection_and_markers() {
+    let mut h = looped_harness();
+    set_view(&mut h, 1000.0, 2000.0);
+    h.state_mut().ui.selection = Some((1500, 2500));
+    {
+        let FileEntry::Loaded(s) = &mut h.state_mut().files[0] else {
+            unreachable!()
+        };
+        let e = limewave_core::edit::EditState {
+            loop_start: 1200,
+            loop_end: 4800,
+            ..s.edit().clone()
+        };
+        s.apply(e, None);
+    }
+    h.run();
+    let view = session(&h).view;
+    let loop_of = |h: &Harness<'static, LimewaveApp>| {
+        let e = session(h).edit();
+        (e.loop_start, e.loop_end)
+    };
+
+    h.get_by_label("Spectrogram").click();
+    h.run();
+    assert_eq!(h.state().ui.view_mode, ViewMode::Spectrogram);
+    h.get_by_label("Waveform").click();
+    h.run();
+    assert_eq!(h.state().ui.view_mode, ViewMode::Waveform);
+
+    assert_eq!(session(&h).view, view, "the zoom is kept");
+    assert_eq!(h.state().ui.selection, Some((1500, 2500)));
+    assert_eq!(loop_of(&h), (1200, 4800));
+}
+
+#[test]
+fn draw_switches_back_to_the_waveform() {
+    let mut h = looped_harness();
+    h.get_by_label("Spectrogram").click();
+    h.run();
+    assert_eq!(h.state().ui.view_mode, ViewMode::Spectrogram);
+
+    h.get_by_label("✏ Draw").click();
+    h.run();
+    assert!(h.state().ui.draw);
+    assert_eq!(h.state().ui.view_mode, ViewMode::Waveform);
+
+    h.get_by_label("Spectrogram").click();
+    h.run();
+    assert_eq!(h.state().ui.view_mode, ViewMode::Spectrogram);
+    assert!(!h.state().ui.draw, "the spectrogram cannot be drawn on");
+}
+
+#[test]
+fn new_sample_turns_on_draw_in_the_waveform() {
+    let mut app = LimewaveApp::for_test();
+    app.ui.view_mode = ViewMode::Spectrogram;
+    app.create_new(
+        441,
+        48_000,
+        1,
+        limewave::ui::new_dialog::BitDepth::Int16,
+        60,
+        true,
+    );
+    let mut h = Harness::builder()
+        .with_size(eframe::egui::vec2(1100.0, 700.0))
+        .allow_missing_glyphs()
+        .build_ui_state(|ui, app: &mut LimewaveApp| app.show(ui), app);
+    h.run();
+    assert!(h.state().ui.draw);
+    assert_eq!(h.state().ui.view_mode, ViewMode::Waveform);
 }
