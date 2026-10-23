@@ -22,6 +22,7 @@ const LABELLED_CS: [u8; 9] = [24, 36, 48, 60, 72, 84, 96, 108, 120];
 /// A spectrogram coloured into tiles on the worker, ready to upload.
 struct Tiles {
     frames: usize,
+    rate: u32,
     hop: usize,
     columns: usize,
     /// Per channel, the images of its tiles from left to right.
@@ -38,6 +39,8 @@ pub struct Picture {
     pub hop: usize,
     /// The number of columns across all of a channel's tiles.
     pub columns: usize,
+    /// The sample rate it was made at.
+    rate: u32,
     /// Per channel, its tiles from left to right, each up to `TILE_COLUMNS` wide and `ROWS`
     /// tall.
     tiles: Vec<Vec<TextureHandle>>,
@@ -56,6 +59,8 @@ impl Picture {
                     .enumerate()
                     .map(|(i, image)| {
                         let name = format!("spectrogram-{channel}-{i}");
+                        // No mipmaps: the wgpu renderer ignores them, so a lane much
+                        // shorter than the tile's rows skips some of them.
                         ctx.load_texture(name, image, TextureOptions::LINEAR)
                     })
                     .collect()
@@ -66,8 +71,14 @@ impl Picture {
             frames: tiles.frames,
             hop: tiles.hop,
             columns: tiles.columns,
+            rate: tiles.rate,
             tiles: textures,
         }
+    }
+
+    /// The sample rate the spectrogram was made at, in Hz.
+    pub fn rate(&self) -> u32 {
+        self.rate
     }
 }
 
@@ -174,10 +185,31 @@ fn color_tiles(sg: &Spectrogram) -> Tiles {
         .collect();
     Tiles {
         frames: sg.frames,
+        rate: sg.rate,
         hop: sg.hop,
         columns: sg.columns,
         images,
     }
+}
+
+/// The least height, in points, each octave of a lane needs for every C to be labelled.
+const MIN_LABELLED_OCTAVE: f32 = 14.0;
+
+/// The Cs to label in a lane `lane_height` points tall at `rate`: all of those below the
+/// Nyquist frequency, or only every other one (C1, C3, C5, ...) when an octave gets under
+/// `MIN_LABELLED_OCTAVE` points. The lines of the skipped Cs are still drawn.
+fn labelled_cs(lane_height: f32, rate: u32) -> Vec<u8> {
+    let nyquist = f64::from(rate) / 2.0;
+    let shown: Vec<u8> = LABELLED_CS
+        .into_iter()
+        .filter(|&note| note_hz(note) < nyquist)
+        .collect();
+    let step = if lane_height / (shown.len().max(1) as f32) < MIN_LABELLED_OCTAVE {
+        2
+    } else {
+        1
+    };
+    shown.into_iter().step_by(step).collect()
 }
 
 /// Draws `picture` in the lanes of the main view `rect`, one per channel of `channels`: the
@@ -219,6 +251,7 @@ pub fn draw_lanes(
         if i > 0 {
             painter.hline(lane.x_range(), lane.top(), Stroke::new(1.0, colors::PANEL));
         }
+        let labelled = labelled_cs(lane.height(), rate);
         for note in LABELLED_CS {
             let hz = note_hz(note);
             if hz >= nyquist {
@@ -226,13 +259,15 @@ pub fn draw_lanes(
             }
             let y = lane.top() + hz_y_fraction(hz, rate) * lane.height();
             painter.hline(lane.x_range(), y, line);
-            painter.text(
-                pos2(lane.left() + 3.0, y - 1.0),
-                Align2::LEFT_BOTTOM,
-                note_name(note),
-                FontId::proportional(9.0),
-                label,
-            );
+            if labelled.contains(&note) {
+                painter.text(
+                    pos2(lane.left() + 3.0, y - 1.0),
+                    Align2::LEFT_BOTTOM,
+                    note_name(note),
+                    FontId::proportional(9.0),
+                    label,
+                );
+            }
         }
     }
 }
@@ -255,6 +290,7 @@ mod tests {
                 frames: 1000,
                 hop: 64,
                 columns: 16,
+                rate: 44100,
                 tiles: vec![Vec::new()],
             }),
             ..SpectrogramCache::default()
@@ -299,6 +335,25 @@ mod tests {
         assert!(cache.picture.is_none(), "the stale result is dropped");
         block_until_ready(&mut cache, &ctx);
         assert_eq!(picture_for(&cache, 1000, 1).map(|p| p.version), Some(2));
+    }
+
+    #[test]
+    fn crowded_lanes_label_every_other_c() {
+        let names = |height: f32, rate: u32| -> Vec<String> {
+            labelled_cs(height, rate)
+                .into_iter()
+                .map(note_name)
+                .collect()
+        };
+        // At 44.1 kHz the Nyquist frequency is above C9: nine Cs, C1 to C9.
+        assert_eq!(names(9.0 * 14.0, 44100).len(), 9, "just roomy enough: all");
+        assert_eq!(
+            names(9.0 * 14.0 - 1.0, 44100),
+            ["C1", "C3", "C5", "C7", "C9"]
+        );
+        // At 8 kHz only C1 to C7 are below the Nyquist frequency.
+        assert_eq!(names(100.0, 8000).len(), 7);
+        assert_eq!(names(60.0, 8000), ["C1", "C3", "C5", "C7"]);
     }
 
     #[test]

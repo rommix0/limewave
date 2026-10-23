@@ -5,6 +5,7 @@ use eframe::egui::{Key, vec2};
 use egui_kittest::Harness;
 use egui_kittest::kittest::{NodeT, Queryable};
 use limewave::app::{FileEntry, LimewaveApp, Session};
+use limewave::ui::spectrogram::{block_until_ready, picture_for};
 use limewave_core::testwav::{sine, wav_bytes};
 use limewave_core::wav::SampleFormat;
 
@@ -93,6 +94,35 @@ fn rate_dialog_converts_a_file() {
     assert_eq!(s.history.cursor(), cursor + 1, "one undo step");
     h.state_mut().undo();
     assert_eq!(session(h.state()).rate(), 44_100);
+}
+
+#[test]
+fn a_converted_file_has_its_spectrogram_made_at_the_new_rate() {
+    let mut h = harness();
+    h.get_by_label("Spectrogram").click();
+    h.run();
+    open_dialog(&mut h);
+    type_rate(&mut h, "22050");
+    h.get_by_label("Convert").click();
+    h.run();
+    h.state_mut().wait_for_renders();
+    h.run();
+    assert_eq!(session(h.state()).rate(), 22_050);
+
+    // The job for the 44.1 kHz audio may still run; the one for the converted audio follows it.
+    let ctx = h.ctx.clone();
+    for _ in 0..2 {
+        h.run();
+        let FileEntry::Loaded(s) = &mut h.state_mut().files[0] else {
+            panic!("file not loaded");
+        };
+        block_until_ready(&mut s.spectrogram, &ctx);
+    }
+    h.run();
+    let s = session(h.state());
+    let picture = picture_for(&s.spectrogram, s.frames(), s.processed.len()).expect("a picture");
+    assert_eq!(picture.rate(), 22_050);
+    assert_eq!(picture.version, s.audio_version);
 }
 
 #[test]

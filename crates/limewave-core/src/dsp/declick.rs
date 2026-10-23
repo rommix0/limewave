@@ -183,6 +183,8 @@ mod tests {
     fn rebuilding_is_deterministic() {
         let mut x = sine(330.0, 44_100, 6_000, 0.4);
         x[3000..3040].fill(0.9);
-        assert_eq!(rebuild(&x, 3000, 3039), rebuild(&x, 3000, 3039));
+        let a = rebuild(&x, 3000, 3039);
+        assert!(a.is_some());
+        assert_eq!(a, rebuild(&x, 3000, 3039));
     }
 }

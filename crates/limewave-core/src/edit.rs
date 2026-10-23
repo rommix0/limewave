@@ -339,8 +339,8 @@ pub fn max_repair_frames(rate: u32) -> usize {
 /// round) and `rate` is the effective sample rate. The other channels are copied from
 /// `processed`, so they stay bit-identical, and the rebuilt frames are tinted as generated.
 /// Refuses, with a message to show, a selection longer than [`max_repair_frames`], one too
-/// close to the start or end of the audio, and an empty `channels`, an out-of-range channel or
-/// a selection past the end.
+/// close to the start or end of the audio, one whose surroundings are not finite numbers, and
+/// an empty `channels`, an out-of-range channel or a selection past the end.
 pub fn repair_click(
     e: &EditState,
     processed: &[Vec<f32>],
@@ -353,7 +353,8 @@ pub fn repair_click(
     if frames > max_repair_frames(rate) {
         return Err(format!(
             "Repair click works on selections up to {MAX_REPAIR_MS:.0} ms; this one is {:.1} ms",
-            frames as f64 * 1000.0 / f64::from(rate)
+            // Rounded up, so a selection just over the limit never reads as the limit.
+            (frames as f64 * 1000.0 / f64::from(rate) * 10.0).ceil() / 10.0
         ));
     }
     let len = processed.first().map_or(0, Vec::len);
@@ -368,7 +369,14 @@ pub fn repair_click(
     let mut audio: Vec<Vec<f32>> = processed.iter().map(|c| c[first..=last].to_vec()).collect();
     for &c in channels {
         // The context was checked above, so a rebuild always comes back.
-        audio[c] = rebuild(&processed[c], first, last).ok_or_else(nothing)?;
+        let rebuilt = rebuild(&processed[c], first, last).ok_or_else(nothing)?;
+        if rebuilt.iter().any(|v| !v.is_finite()) {
+            return Err(
+                "The audio around the selection is damaged; Repair click cannot rebuild it"
+                    .to_string(),
+            );
+        }
+        audio[c] = rebuilt;
     }
     let mut r = e.clone();
     r.effects.push(AppliedEffect {
@@ -1156,7 +1164,19 @@ mod tests {
         let err = repair_click(&e, &x, (4000, 4000 + 2205), &[0], 44_100).unwrap_err();
         assert_eq!(
             err,
-            "Repair click works on selections up to 50 ms; this one is 50.0 ms"
+            "Repair click works on selections up to 50 ms; this one is 50.1 ms"
+        );
+    }
+
+    #[test]
+    fn a_non_finite_context_is_refused() {
+        let mut x = spiked(&tones(44_100, 8_000), 4000, &[0]);
+        x[0][3990] = f32::NAN;
+        let e = EditState::default_for(8_000);
+        let err = repair_click(&e, &x, (4000, 4000), &[0], 44_100).unwrap_err();
+        assert_eq!(
+            err,
+            "The audio around the selection is damaged; Repair click cannot rebuild it"
         );
     }
 
@@ -1168,7 +1188,7 @@ mod tests {
         assert_eq!(max_repair_frames(31_250), 1563);
         assert!(repair_click(&e, &x, (2000, 2000 + 1563 - 1), &[0], 31_250).is_ok());
         let err = repair_click(&e, &x, (2000, 2000 + 1564 - 1), &[0], 31_250).unwrap_err();
-        assert!(err.starts_with("Repair click works on selections up to 50 ms; this one is 50.0"));
+        assert!(err.starts_with("Repair click works on selections up to 50 ms; this one is 50.1"));
     }
 
     #[test]

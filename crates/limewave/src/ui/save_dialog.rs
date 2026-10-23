@@ -597,6 +597,11 @@ pub(crate) fn save_session(
             if rebased.doc.frames == frames {
                 rebased.view = s.view;
             }
+            if rebased.frames() == frames && rebased.processed.len() == channels {
+                // Keep the picture up until the new one lands, as after any same-shape edit.
+                rebased.audio_version = s.audio_version + 1;
+                rebased.spectrogram = std::mem::take(&mut s.spectrogram);
+            }
             if unmoved {
                 rebased.source = s.source;
             }

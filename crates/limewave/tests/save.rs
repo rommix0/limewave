@@ -7,6 +7,7 @@ use eframe::egui::{Key, Modifiers, vec2};
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
 use limewave::app::{FileEntry, LimewaveApp, PendingAction, Session};
+use limewave::ui::spectrogram::{block_until_ready, picture_for};
 use limewave_core::document::load_wav;
 use limewave_core::edit::{EditState, LoopMode};
 use limewave_core::save::Destination;
@@ -174,6 +175,40 @@ fn save_as_dialog_saves_and_rebases() {
         names,
         vec!["tone.wav"],
         "its own saved file is replaced, no .bak"
+    );
+}
+
+#[test]
+fn saving_keeps_the_spectrogram_picture_up() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = write_wav(dir.path(), "tone.wav");
+    let mut h = harness(edited_app(source));
+    h.get_by_label("Spectrogram").click();
+    h.run();
+    let ctx = h.ctx.clone();
+    block_until_ready(&mut session(h.state_mut()).spectrogram, &ctx);
+    h.run();
+    let shown = |h: &mut Harness<'static, LimewaveApp>| {
+        let s = session(h.state_mut());
+        picture_for(&s.spectrogram, s.frames(), s.processed.len()).is_some()
+    };
+    assert!(shown(&mut h), "the picture is up before the save");
+
+    h.key_press_modifiers(Modifiers::COMMAND | Modifiers::SHIFT, Key::S);
+    h.run();
+    h.get_by_label("Save 1 file(s)").click();
+    h.step();
+    assert!(!h.state().ui.save_dialog.open, "saved");
+    assert!(
+        session(h.state_mut())
+            .doc
+            .path
+            .starts_with(dir.path().join("limewave")),
+        "the session was rebased on the saved file"
+    );
+    assert!(
+        shown(&mut h),
+        "the old picture stays up until the new one lands"
     );
 }
 
