@@ -17,11 +17,13 @@ use limewave_core::dsp::{
 use limewave_core::edit::{EditState, LoopMode, Marker, move_marker};
 
 use super::coords::{ViewTransform, flag_rect, hit_marker, pick_marker};
-use crate::app::{Session, UiState};
+use super::spectrogram::{self, Picture, draw_lanes, picture_for};
+use crate::app::{Session, UiState, ViewMode};
 use crate::audio::engine::{AudioEngine, Cursor};
 use crate::theme::colors;
 
-const BACKGROUND: Color32 = Color32::from_rgb(0x15, 0x17, 0x1d);
+/// The main view's background, behind the lanes.
+pub(super) const BACKGROUND: Color32 = Color32::from_rgb(0x15, 0x17, 0x1d);
 const RULER_HEIGHT: f32 = 22.0;
 /// How close (in pixels) a press must be to grab a marker.
 const GRAB_TOLERANCE: f32 = 6.0;
@@ -120,7 +122,7 @@ impl PencilStroke {
 }
 
 /// The lane of channel `i` of `channels` in the waveform `rect`.
-fn lane_rect(rect: Rect, channels: usize, i: usize) -> Rect {
+pub(super) fn lane_rect(rect: Rect, channels: usize, i: usize) -> Rect {
     let top = rect.top() + RULER_HEIGHT;
     let height = (rect.bottom() - top) / channels.max(1) as f32;
     Rect::from_min_size(
@@ -482,6 +484,22 @@ pub fn waveform_view(
         ui.ctx().set_cursor_icon(CursorIcon::ResizeVertical);
     }
 
+    // The spectrogram follows the audio while it is shown; until a picture of the right
+    // length is ready, the waveform stands in.
+    let picture = if ui_state.view_mode == ViewMode::Spectrogram {
+        let rate = s.rate();
+        spectrogram::update(
+            &mut s.spectrogram,
+            ui.ctx(),
+            &s.processed,
+            rate,
+            s.audio_version,
+        );
+        picture_for(&s.spectrogram, s.frames())
+    } else {
+        None
+    };
+
     let ruler_color = ui.visuals().weak_text_color();
     let hover = Hover {
         marker: hovered,
@@ -494,6 +512,7 @@ pub fn waveform_view(
         &view,
         hover,
         stroke.as_ref(),
+        picture,
         ruler_color,
         &flags,
     );
@@ -693,6 +712,7 @@ fn draw(
     view: &ViewTransform,
     hover: Hover,
     pencil: Option<&PencilStroke>,
+    picture: Option<&Picture>,
     ruler_color: Color32,
     flags: &[Flag],
 ) {
@@ -704,22 +724,27 @@ fn draw(
     let x_of = |f: usize| view.frame_to_x(f as f64, left);
     let visible_x = |f: usize| x_of(f).clamp(left, rect.right());
 
-    // Lanes, one per channel, with the pencil stroke in place of the samples it covers.
+    // Lanes, one per channel: the spectrogram picture, or the waveform with the pencil stroke
+    // in place of the samples it covers.
     let channels = s.processed.len();
-    for (i, (channel, peaks)) in s.processed.iter().zip(&s.peaks).enumerate() {
-        let lane = lane_rect(rect, channels, i);
-        if i > 0 {
-            painter.hline(lane.x_range(), lane.top(), Stroke::new(1.0, colors::PANEL));
+    if let Some(picture) = picture {
+        draw_lanes(painter, rect, view, picture, channels, s.rate());
+    } else {
+        for (i, (channel, peaks)) in s.processed.iter().zip(&s.peaks).enumerate() {
+            let lane = lane_rect(rect, channels, i);
+            if i > 0 {
+                painter.hline(lane.x_range(), lane.top(), Stroke::new(1.0, colors::PANEL));
+            }
+            painter.hline(
+                lane.x_range(),
+                lane.center().y,
+                Stroke::new(1.0, with_alpha(Color32::WHITE, 16)),
+            );
+            let stroke = pencil
+                .filter(|p| p.channel == i)
+                .map(|p| (p.first, &p.values[..]));
+            draw_lane(painter, lane, view, channel, peaks, stroke);
         }
-        painter.hline(
-            lane.x_range(),
-            lane.center().y,
-            Stroke::new(1.0, with_alpha(Color32::WHITE, 16)),
-        );
-        let stroke = pencil
-            .filter(|p| p.channel == i)
-            .map(|p| (p.first, &p.values[..]));
-        draw_lane(painter, lane, view, channel, peaks, stroke);
     }
 
     // Generated audio, then outside the trim and the loop region.

@@ -62,6 +62,7 @@ use crate::ui::save_dialog::{
     export_wavs, other_file_in_the_way, perform_save, save_dialog, save_results_window,
 };
 use crate::ui::seam::{DEFAULT_HALF, SeamChannel, seam_view};
+use crate::ui::spectrogram::SpectrogramCache;
 use crate::ui::spectrum_dialog::{SpectrumDialogState, spectrum_dialog};
 use crate::ui::tail_dialog::{TailDialogState, tail_dialog};
 use crate::ui::waveform::waveform_view;
@@ -132,6 +133,11 @@ pub struct Session {
     pub source: u64,
     /// The dialog preview the engine holds instead of this session's buffer, if any.
     pub dialog_preview: Option<DialogPreview>,
+    /// Counts the changes to `processed` (an effect, an undo or a redo; not a marker move), so
+    /// pictures made from the audio can tell they are out of date.
+    pub audio_version: u64,
+    /// The spectrogram of `processed`, computed while the main view shows it.
+    pub spectrogram: SpectrogramCache,
 }
 
 /// A dialog's result being previewed (v0.3 §7.1, §7.2): the processed audio with the dialog's
@@ -184,6 +190,8 @@ impl Session {
             preview_held: false,
             source: next_source(),
             dialog_preview: None,
+            audio_version: 0,
+            spectrogram: SpectrogramCache::default(),
         }
     }
 
@@ -434,9 +442,10 @@ impl Session {
         }
     }
 
-    /// Brings `processed`, `peaks` and `mono` up to date with the current edit's effects:
-    /// only the new effects are applied when they extend the ones already applied, else the
-    /// audio is processed afresh. Does nothing when the effects are unchanged.
+    /// Brings `processed`, `peaks` and `mono` up to date with the current edit's effects,
+    /// counting the change in `audio_version`: only the new effects are applied when they
+    /// extend the ones already applied, else the audio is processed afresh. Does nothing when
+    /// the effects are unchanged.
     fn sync_processed(&mut self) {
         let effects = &self.history.current().effects;
         if *effects == self.processed_for {
@@ -450,6 +459,7 @@ impl Session {
             self.processed = process(&self.doc.audio, effects);
         }
         self.processed_for.clone_from(effects);
+        self.audio_version += 1;
         self.peaks = self
             .processed
             .iter()

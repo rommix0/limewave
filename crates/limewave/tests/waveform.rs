@@ -11,6 +11,7 @@ use eframe::egui::{
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
 use limewave::app::{FileEntry, LimewaveApp, Session, ViewMode};
+use limewave::ui::spectrogram::{block_until_ready, picture_for};
 use limewave::ui::waveform::{flag_hit_point, sample_point};
 use limewave_core::document::load_wav_bytes;
 use limewave_core::dsp::{Crossing, is_crossing, is_upward};
@@ -984,4 +985,139 @@ fn new_sample_turns_on_draw_in_the_waveform() {
     h.run();
     assert!(h.state().ui.draw);
     assert_eq!(h.state().ui.view_mode, ViewMode::Waveform);
+}
+
+/// Waits for the spectrogram being computed for the shown file and takes it in.
+fn spectrogram_ready(h: &mut Harness<'static, LimewaveApp>) {
+    let ctx = h.ctx.clone();
+    let FileEntry::Loaded(s) = &mut h.state_mut().files[0] else {
+        unreachable!()
+    };
+    block_until_ready(&mut s.spectrogram, &ctx);
+}
+
+/// The version of the spectrogram picture the main view would show now, if any.
+fn shown_picture_version(h: &Harness<'static, LimewaveApp>) -> Option<u64> {
+    let s = session(h);
+    picture_for(&s.spectrogram, s.frames()).map(|p| p.version)
+}
+
+/// The looped harness switched to the spectrogram, with its picture computed and shown.
+fn spectrogram_harness() -> Harness<'static, LimewaveApp> {
+    let mut h = looped_harness();
+    h.get_by_label("Spectrogram").click();
+    h.run();
+    spectrogram_ready(&mut h);
+    h.run();
+    h
+}
+
+#[test]
+fn the_spectrogram_is_computed_for_the_shown_audio() {
+    let h = spectrogram_harness();
+    let s = session(&h);
+    let picture = picture_for(&s.spectrogram, s.frames()).expect("a picture");
+    assert_eq!(picture.version, s.audio_version);
+    assert_eq!(picture.frames, s.frames());
+    assert!(picture.columns * picture.hop >= picture.frames);
+}
+
+#[test]
+fn a_same_length_edit_keeps_the_old_picture_until_the_new_one_lands() {
+    let mut h = spectrogram_harness();
+    let old = session(&h).audio_version;
+    assert_eq!(shown_picture_version(&h), Some(old));
+
+    assert!(h.state_mut().apply_effect(Effect::Gain { db: -6.0 }));
+    // One frame starts the new job; the old picture stays up meanwhile.
+    h.step();
+    let new = session(&h).audio_version;
+    assert_ne!(new, old, "the gain changed the audio");
+    assert_eq!(shown_picture_version(&h), Some(old));
+    spectrogram_ready(&mut h);
+    assert_eq!(shown_picture_version(&h), Some(new));
+
+    // A crop changes the length: the old picture no longer fits, so the waveform shows.
+    h.state_mut().ui.selection = Some((2000, 6999));
+    h.state_mut().crop_to_selection();
+    assert_eq!(session(&h).frames(), 5000);
+    assert_eq!(shown_picture_version(&h), None);
+    h.step();
+    assert_eq!(shown_picture_version(&h), None, "not until it is ready");
+    spectrogram_ready(&mut h);
+    assert_eq!(
+        shown_picture_version(&h),
+        Some(session(&h).audio_version),
+        "the cropped audio's picture"
+    );
+}
+
+#[test]
+fn a_stale_result_is_not_shown() {
+    let mut h = looped_harness();
+    assert!(h.state_mut().apply_effect(Effect::Gain { db: -6.0 }));
+    h.run();
+    h.get_by_label("Spectrogram").click();
+    // The frame that switches the view starts a job for the gained audio.
+    h.step();
+    let gained = session(&h).audio_version;
+    h.state_mut().undo();
+    assert_ne!(
+        session(&h).audio_version,
+        gained,
+        "the undo changed the audio"
+    );
+    h.run();
+    spectrogram_ready(&mut h);
+    h.run();
+    assert_eq!(shown_picture_version(&h), Some(session(&h).audio_version));
+}
+
+#[test]
+fn marker_only_edits_keep_the_audio_version() {
+    let mut h = looped_harness();
+    let version = session(&h).audio_version;
+    let FileEntry::Loaded(s) = &mut h.state_mut().files[0] else {
+        unreachable!()
+    };
+    let e = limewave_core::edit::EditState {
+        loop_start: 1200,
+        ..s.edit().clone()
+    };
+    s.apply(e, None);
+    s.undo(None);
+    assert_eq!(s.audio_version, version);
+}
+
+/// The selection dragged over a fixed pixel span, then the Start marker after a fixed drag of
+/// its flag, in the looped harness shown in `mode`.
+fn drags_in(mode: ViewMode) -> (Option<(usize, usize)>, usize) {
+    let mut h = looped_harness();
+    h.state_mut().ui.view_mode = mode;
+    h.run();
+    if mode == ViewMode::Spectrogram {
+        spectrogram_ready(&mut h);
+        h.run();
+        assert!(shown_picture_version(&h).is_some(), "the picture is drawn");
+    }
+    let rect = waveform_rect(&h);
+    let y = rect.center().y;
+    drag(
+        &mut h,
+        pos2(rect.left() + 200.0, y),
+        pos2(rect.left() + 420.0, y),
+    );
+    let selection = h.state().ui.selection;
+    let from = flag_pos(&h, Marker::Start);
+    drag(&mut h, from, from + eframe::egui::vec2(150.0, 0.0));
+    (selection, session(&h).edit().start)
+}
+
+#[test]
+fn selections_and_marker_drags_land_on_the_same_frames_in_both_views() {
+    let waveform = drags_in(ViewMode::Waveform);
+    let spectrogram = drags_in(ViewMode::Spectrogram);
+    assert!(waveform.0.is_some(), "a selection was dragged");
+    assert_ne!(waveform.1, 0, "Start moved");
+    assert_eq!(spectrogram, waveform);
 }

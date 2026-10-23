@@ -32,6 +32,11 @@ impl<T> RenderJob<T> {
     pub fn poll(&self) -> Option<T> {
         self.rx.try_recv().ok()
     }
+
+    /// Waits for the result; `None` when the worker died without one.
+    pub fn wait(&self) -> Option<T> {
+        self.rx.recv().ok()
+    }
 }
 
 /// Asks its context for a repaint when dropped, however the worker ends.

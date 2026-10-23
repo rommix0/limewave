@@ -15,6 +15,7 @@ pub mod region_inspector;
 pub mod regions;
 pub mod save_dialog;
 pub mod seam;
+pub mod spectrogram;
 pub mod spectrum_dialog;
 pub mod tail_dialog;
 pub mod waveform;
