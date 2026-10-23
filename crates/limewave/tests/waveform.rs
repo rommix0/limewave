@@ -999,7 +999,7 @@ fn spectrogram_ready(h: &mut Harness<'static, LimewaveApp>) {
 /// The version of the spectrogram picture the main view would show now, if any.
 fn shown_picture_version(h: &Harness<'static, LimewaveApp>) -> Option<u64> {
     let s = session(h);
-    picture_for(&s.spectrogram, s.frames()).map(|p| p.version)
+    picture_for(&s.spectrogram, s.frames(), s.processed.len()).map(|p| p.version)
 }
 
 /// The looped harness switched to the spectrogram, with its picture computed and shown.
@@ -1016,7 +1016,7 @@ fn spectrogram_harness() -> Harness<'static, LimewaveApp> {
 fn the_spectrogram_is_computed_for_the_shown_audio() {
     let h = spectrogram_harness();
     let s = session(&h);
-    let picture = picture_for(&s.spectrogram, s.frames()).expect("a picture");
+    let picture = picture_for(&s.spectrogram, s.frames(), s.processed.len()).expect("a picture");
     assert_eq!(picture.version, s.audio_version);
     assert_eq!(picture.frames, s.frames());
     assert!(picture.columns * picture.hop >= picture.frames);
@@ -1067,8 +1067,12 @@ fn a_stale_result_is_not_shown() {
         gained,
         "the undo changed the audio"
     );
-    h.run();
-    spectrogram_ready(&mut h);
+    // Only one job runs at a time: the stale one may still be running after these frames,
+    // and the one for the current audio starts in the frame after it ends.
+    for _ in 0..2 {
+        h.run();
+        spectrogram_ready(&mut h);
+    }
     h.run();
     assert_eq!(shown_picture_version(&h), Some(session(&h).audio_version));
 }
@@ -1120,4 +1124,20 @@ fn selections_and_marker_drags_land_on_the_same_frames_in_both_views() {
     assert!(waveform.0.is_some(), "a selection was dragged");
     assert_ne!(waveform.1, 0, "Start moved");
     assert_eq!(spectrogram, waveform);
+}
+
+#[test]
+fn the_spectrogram_has_no_sample_dots_to_grab() {
+    let mut h = looped_harness();
+    h.state_mut().ui.view_mode = ViewMode::Spectrogram;
+    h.run();
+    zoom_in_on(&mut h, 2000);
+    assert!(session(&h).view.unwrap().frames_per_px < 1.0);
+    let version = session(&h).audio_version;
+    let from = dot(&h, 2000);
+    drag(&mut h, from, from + eframe::egui::vec2(40.0, -30.0));
+    assert!(h.state().ui.selection.is_some(), "the press selects");
+    assert!(changed_frames(&h).is_empty(), "no sample moved");
+    assert_eq!(session(&h).audio_version, version);
+    assert!(!session(&h).history.is_dirty());
 }

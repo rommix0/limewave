@@ -301,6 +301,8 @@ pub fn waveform_view(
     if total == 0 || width < 1.0 || rect.height() <= RULER_HEIGHT {
         return;
     }
+    // Sample dots are grabbed only where they are drawn: the spectrogram has none.
+    let dots = ui_state.view_mode == ViewMode::Waveform;
     let mut view = s
         .view
         .unwrap_or_else(|| ViewTransform::fit(total, width))
@@ -355,19 +357,29 @@ pub fn waveform_view(
                 ui.data_mut(|d| d.insert_temp(pencil_id, stroke));
                 Gesture::Pencil
             }),
-            None => Some(match sample_at(rect, &view, &s.processed, press) {
-                Some((channel, frame)) => {
-                    let value = s.processed[channel][frame];
-                    let lane = lane_rect(rect, channels, channel);
-                    let stroke =
-                        PencilStroke::new(channel, frame, value, sample_y(lane, value), press.y);
-                    ui.data_mut(|d| d.insert_temp(pencil_id, stroke));
-                    Gesture::Pencil
-                }
-                None => Gesture::Select {
-                    anchor: view.x_to_frame(press.x, left),
+            None => Some(
+                match dots
+                    .then(|| sample_at(rect, &view, &s.processed, press))
+                    .flatten()
+                {
+                    Some((channel, frame)) => {
+                        let value = s.processed[channel][frame];
+                        let lane = lane_rect(rect, channels, channel);
+                        let stroke = PencilStroke::new(
+                            channel,
+                            frame,
+                            value,
+                            sample_y(lane, value),
+                            press.y,
+                        );
+                        ui.data_mut(|d| d.insert_temp(pencil_id, stroke));
+                        Gesture::Pencil
+                    }
+                    None => Gesture::Select {
+                        anchor: view.x_to_frame(press.x, left),
+                    },
                 },
-            }),
+            ),
         };
         ui.data_mut(|d| d.insert_temp(drag_id, gesture));
     }
@@ -464,7 +476,7 @@ pub fn waveform_view(
     // The sample the pencil is on, or the one a press would grab.
     let stroke = ui.data(|d| d.get_temp::<PencilStroke>(pencil_id));
     let dot = match gesture {
-        _ if ui_state.draw => None,
+        _ if ui_state.draw || !dots => None,
         Some(Gesture::Pencil) => stroke.as_ref().map(|st| (st.channel, st.at)),
         Some(_) => None,
         None if hovered.is_some() => None,
@@ -495,7 +507,7 @@ pub fn waveform_view(
             rate,
             s.audio_version,
         );
-        picture_for(&s.spectrogram, s.frames())
+        picture_for(&s.spectrogram, s.frames(), s.processed.len())
     } else {
         None
     };

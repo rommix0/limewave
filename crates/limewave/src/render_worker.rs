@@ -33,7 +33,18 @@ impl<T> RenderJob<T> {
         self.rx.try_recv().ok()
     }
 
-    /// Waits for the result; `None` when the worker died without one.
+    /// Whether the render has ended, and with what: `None` while it runs, `Some(None)` when
+    /// the worker died without a result. A result is handed out once.
+    pub fn ended(&self) -> Option<Option<T>> {
+        match self.rx.try_recv() {
+            Ok(v) => Some(Some(v)),
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => Some(None),
+        }
+    }
+
+    /// Waits for the result; `None` when the worker died without one. It blocks until the
+    /// render ends, so it is not for the UI thread.
     pub fn wait(&self) -> Option<T> {
         self.rx.recv().ok()
     }

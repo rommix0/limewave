@@ -74,9 +74,12 @@ impl Picture {
 /// One file's spectrogram: the job computing it for an audio version, and the picture shown.
 #[derive(Default)]
 pub struct SpectrogramCache {
-    /// The running job; its key's `settings_hash` is the audio version it computes.
+    /// The running job; its key's `settings_hash` is the audio version it computes. Only one
+    /// runs at a time, so a stale job is waited out before the next starts.
     job: Option<RenderJob<Tiles>>,
     picture: Option<Picture>,
+    /// The audio version whose worker died without a result; it is not started again.
+    failed: Option<u64>,
 }
 
 /// The key of the job for audio version `version`. The cache belongs to one file, so only the
@@ -90,9 +93,10 @@ fn job_key(version: u64) -> RenderKey {
     }
 }
 
-/// Keeps `cache` on audio version `version` of `processed`: a finished job for it becomes the
-/// picture, a job for an older version is dropped unseen, and a job is started when nothing
-/// for `version` is running or shown.
+/// Keeps `cache` on audio version `version` of `processed`. A finished job becomes the
+/// picture if it was made for `version`, else it is dropped unseen. A job is started when none
+/// is running and nothing for `version` is shown or has failed, so at most one runs at a time:
+/// a stale job is waited out first.
 pub fn update(
     cache: &mut SpectrogramCache,
     ctx: &egui::Context,
@@ -100,16 +104,21 @@ pub fn update(
     rate: u32,
     version: u64,
 ) {
-    if let Some(job) = &cache.job {
-        if job.key.settings_hash != version {
-            cache.job = None;
-        } else if let Some(tiles) = job.poll() {
-            cache.job = None;
-            cache.picture = Some(Picture::upload(ctx, tiles, version));
+    if let Some(job) = &cache.job
+        && let Some(result) = job.ended()
+    {
+        let made_for = job.key.settings_hash;
+        cache.job = None;
+        match result {
+            Some(tiles) if made_for == version => {
+                cache.picture = Some(Picture::upload(ctx, tiles, made_for));
+            }
+            None if made_for == version => cache.failed = Some(version),
+            _ => {}
         }
     }
     let shown = cache.picture.as_ref().is_some_and(|p| p.version == version);
-    if cache.job.is_none() && !shown {
+    if cache.job.is_none() && !shown && cache.failed != Some(version) {
         let audio = processed.to_vec();
         cache.job = Some(spawn_render(job_key(version), ctx.clone(), move || {
             color_tiles(&spectrogram(&audio, rate))
@@ -126,11 +135,14 @@ pub fn block_until_ready(cache: &mut SpectrogramCache, ctx: &egui::Context) {
     }
 }
 
-/// The picture to show for audio of `frames` frames: the one shown last if it is that long,
-/// even when it is from an older version, so it stays up after a same-length edit until the
-/// new one lands. `None` means the waveform is drawn instead.
-pub fn picture_for(cache: &SpectrogramCache, frames: usize) -> Option<&Picture> {
-    cache.picture.as_ref().filter(|p| p.frames == frames)
+/// The picture to show for audio of `frames` frames and `channels` channels: the one shown
+/// last if it has that shape, even when it is from an older version, so it stays up after a
+/// same-shape edit until the new one lands. `None` means the waveform is drawn instead.
+pub fn picture_for(cache: &SpectrogramCache, frames: usize, channels: usize) -> Option<&Picture> {
+    cache
+        .picture
+        .as_ref()
+        .filter(|p| p.frames == frames && p.tiles.len() == channels)
 }
 
 /// The colour of spectrogram level `v`: from the view's background at 0 to lime at 255, on a
@@ -185,9 +197,6 @@ pub fn draw_lanes(
     let nyquist = f64::from(rate) / 2.0;
     for i in 0..channels {
         let lane = lane_rect(rect, channels, i);
-        if i > 0 {
-            painter.hline(lane.x_range(), lane.top(), Stroke::new(1.0, colors::PANEL));
-        }
         for (t, tile) in picture.tiles.get(i).into_iter().flatten().enumerate() {
             // The tile's columns start at frame `first`; its last column may run past the end
             // of the audio, so it is clipped there.
@@ -206,6 +215,9 @@ pub fn draw_lanes(
                 Rect::from_min_max(pos2(u(x0), 0.0), pos2(u(x1), 1.0)),
                 Color32::WHITE,
             );
+        }
+        if i > 0 {
+            painter.hline(lane.x_range(), lane.top(), Stroke::new(1.0, colors::PANEL));
         }
         for note in LABELLED_CS {
             let hz = note_hz(note);
@@ -236,19 +248,57 @@ mod tests {
     }
 
     #[test]
-    fn a_picture_of_another_length_is_not_shown() {
+    fn a_picture_of_another_length_or_channel_count_is_not_shown() {
         let cache = SpectrogramCache {
-            job: None,
             picture: Some(Picture {
                 version: 3,
                 frames: 1000,
                 hop: 64,
                 columns: 16,
-                tiles: Vec::new(),
+                tiles: vec![Vec::new()],
             }),
+            ..SpectrogramCache::default()
         };
-        assert_eq!(picture_for(&cache, 1000).map(|p| p.version), Some(3));
-        assert!(picture_for(&cache, 999).is_none());
+        assert_eq!(picture_for(&cache, 1000, 1).map(|p| p.version), Some(3));
+        assert!(picture_for(&cache, 999, 1).is_none());
+        assert!(
+            picture_for(&cache, 1000, 2).is_none(),
+            "another channel count"
+        );
+    }
+
+    #[test]
+    fn a_stale_job_is_waited_out_and_its_result_dropped() {
+        let ctx = egui::Context::default();
+        let audio = vec![vec![0.0f32; 1000]];
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        let stale = audio.clone();
+        let mut cache = SpectrogramCache {
+            job: Some(spawn_render(job_key(1), ctx.clone(), move || {
+                wait.recv().unwrap();
+                color_tiles(&spectrogram(&stale, 44100))
+            })),
+            ..SpectrogramCache::default()
+        };
+        let running = |cache: &SpectrogramCache| cache.job.as_ref().map(|j| j.key.settings_hash);
+
+        update(&mut cache, &ctx, &audio, 44100, 2);
+        assert_eq!(
+            running(&cache),
+            Some(1),
+            "no second job while the stale one runs"
+        );
+
+        go.send(()).unwrap();
+        let start = std::time::Instant::now();
+        while running(&cache) != Some(2) {
+            assert!(start.elapsed().as_secs() < 10, "the next job never started");
+            update(&mut cache, &ctx, &audio, 44100, 2);
+            std::thread::yield_now();
+        }
+        assert!(cache.picture.is_none(), "the stale result is dropped");
+        block_until_ready(&mut cache, &ctx);
+        assert_eq!(picture_for(&cache, 1000, 1).map(|p| p.version), Some(2));
     }
 
     #[test]
