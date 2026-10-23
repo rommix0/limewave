@@ -2,7 +2,7 @@
 
 use eframe::egui::vec2;
 use egui_kittest::Harness;
-use egui_kittest::kittest::Queryable;
+use egui_kittest::kittest::{NodeT, Queryable};
 use limewave::app::{FileEntry, LimewaveApp, Session};
 use limewave_core::effects::{AppliedEffect, Effect, FadeCurve, MonoSource, Op, peak};
 use limewave_core::riff::Chunk;
@@ -315,4 +315,98 @@ fn auto_trim_dialog_uses_the_threshold() {
     assert!(e.start.abs_diff(1000) <= 1, "start {}", e.start);
     assert!(e.end.abs_diff(4999) <= 1, "end {}", e.end);
     assert_eq!(h.state().ui.effect_dialog, None);
+}
+
+/// A 440 Hz sine of 8000 frames with a one-frame spike at 4000, one copy per channel.
+fn spiked(channels: usize) -> Vec<u8> {
+    let mut audio = sine(440.0, 44100, 8000, 0.5);
+    audio[4000] = 0.95;
+    wav_bytes(
+        &vec![audio; channels],
+        44100,
+        SampleFormat::Int { bits: 16 },
+        Vec::new(),
+    )
+}
+
+/// The history entries after the one the file opened with.
+fn steps(app: &LimewaveApp) -> usize {
+    session(app).history.cursor()
+}
+
+#[test]
+fn repair_click_fixes_the_selection_in_one_undo_step() {
+    let mut h = harness_for(app_with(&spiked(1)));
+    let before = session(h.state()).processed.clone();
+    assert!(before[0][4000] > 0.9, "the spike is there");
+    h.state_mut().ui.selection = Some((3995, 4005));
+    h.state_mut().ui.play_from = Some(4002);
+    menu_click(&mut h, "Repair click");
+
+    let app = h.state();
+    let s = session(app);
+    assert!(s.processed[0][4000].abs() < 0.6, "{}", s.processed[0][4000]);
+    assert_eq!(
+        s.processed[0][3994], before[0][3994],
+        "outside is untouched"
+    );
+    assert_eq!(s.processed[0][4006], before[0][4006]);
+    assert_eq!(steps(app), 1, "one history step");
+    assert_eq!(app.ui.selection, Some((3995, 4005)), "the selection stays");
+    assert_eq!(app.ui.play_from, Some(4002), "so does the play-from point");
+
+    h.state_mut().undo();
+    let s = session(h.state());
+    assert_eq!(s.processed, before, "undo restores bit for bit");
+    assert_eq!(steps(h.state()), 0);
+}
+
+#[test]
+fn repair_click_offers_channels_for_stereo() {
+    let mut h = harness_for(app_with(&spiked(2)));
+    let before = session(h.state()).processed.clone();
+    h.state_mut().ui.selection = Some((3995, 4005));
+    h.get_by_label("Effects").click();
+    h.run();
+    h.get_by_label("Repair click").click();
+    h.run();
+    for choice in ["Both channels", "Left only", "Right only"] {
+        h.get_by_label(choice);
+    }
+    h.get_by_label("Left only").click();
+    h.run();
+
+    let s = session(h.state());
+    assert!(s.processed[0][4000].abs() < 0.6, "the left is repaired");
+    assert_eq!(s.processed[1], before[1], "the right is unchanged");
+    assert_eq!(steps(h.state()), 1);
+}
+
+#[test]
+fn repair_click_says_why_it_refused() {
+    let mut h = harness_for(app_with(&spiked(1)));
+    h.state_mut().ui.selection = Some((2500, 5499));
+    menu_click(&mut h, "Repair click");
+
+    let app = h.state();
+    let message = app.ui.message.as_deref().expect("a reason is shown");
+    assert!(
+        message.starts_with("Repair click works on selections up to 50 ms"),
+        "{message}"
+    );
+    assert_eq!(steps(app), 0, "the history is unchanged");
+}
+
+#[test]
+fn repair_click_is_disabled_without_a_selection() {
+    let mut h = harness_for(app_with(&spiked(1)));
+    h.get_by_label("Effects").click();
+    h.run();
+    assert!(
+        h.get_by_label("Repair click")
+            .accesskit_node()
+            .is_disabled(),
+        "no selection"
+    );
+    assert_eq!(steps(h.state()), 0);
 }

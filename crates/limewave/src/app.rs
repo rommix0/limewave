@@ -12,7 +12,7 @@ use limewave_core::document::{WavDocument, load_wav, new_document};
 use limewave_core::dsp::resample::resampled_len;
 use limewave_core::dsp::{PeakPyramid, mono_sum};
 use limewave_core::edit::{
-    EditState, History, Marker, crop_to_loop, crop_to_selection, redraw_samples,
+    EditState, History, Marker, crop_to_loop, crop_to_selection, redraw_samples, repair_click,
     set_loop_to_selection, set_trim_to_selection, trim_after_loop,
 };
 use limewave_core::effects::{
@@ -1998,6 +1998,13 @@ impl LimewaveApp {
             self.ui.selection = None;
             self.ui.play_from = None;
         }
+    }
+
+    /// Rebuilds the selection (up to 50 ms) of `channels` from the audio on either side, as one
+    /// undoable step. The selection and play-from point stay; a refusal is shown as a message.
+    pub fn repair_click(&mut self, channels: &[usize]) {
+        let Some(sel) = self.ui.selection else { return };
+        self.edit_selected(|s| repair_click(s.edit(), &s.processed, sel, channels, s.rate()));
     }
 
     /// Moves Start and End in to the first and last frame at or above `threshold_db` (kept

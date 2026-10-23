@@ -117,7 +117,8 @@ pub enum EffectDialog {
 
 /// The toolbar's Effects menu. Gain, Normalize, the fades, Stereo to mono, Auto-trim,
 /// Generate tail, Make loop from spectrum and Change sample rate open a dialog; the rest apply
-/// at once. A channel tool that does not fit the file is greyed out.
+/// at once (Repair click offers a channel choice for stereo). A channel tool that does not fit
+/// the file is greyed out.
 pub fn effects_menu(ui: &mut egui::Ui, app: &mut LimewaveApp) {
     let loaded = app.selected_session().is_some();
     ui.menu_button("Effects", |ui| {
@@ -165,6 +166,8 @@ pub fn effects_menu(ui: &mut egui::Ui, app: &mut LimewaveApp) {
             app.ui.effect_dialog = Some(EffectDialog::AutoTrim);
         }
         ui.separator();
+        repair_click_items(ui, app);
+        ui.separator();
         if ui
             .add_enabled(loaded, Button::new("Generate tail…"))
             .on_hover_text("Replace everything after End with new audio made from the sound")
@@ -191,6 +194,38 @@ pub fn effects_menu(ui: &mut egui::Ui, app: &mut LimewaveApp) {
             app.ui.rate_dialog = Some(RateDialogState::default());
         }
     });
+}
+
+/// The Repair click entry: a button, or for a stereo file a submenu choosing the channels.
+/// It needs a loaded sample and a selection.
+fn repair_click_items(ui: &mut egui::Ui, app: &mut LimewaveApp) {
+    let channels = app.selected_session().map_or(0, |s| s.processed.len());
+    let enabled = channels > 0 && app.ui.selection.is_some();
+    let hover = "Rebuild the selection (up to 50 ms) from the audio on either side";
+    if channels == 2 {
+        ui.add_enabled_ui(enabled, |ui| {
+            ui.menu_button("Repair click", |ui| {
+                for (label, picked) in [
+                    ("Both channels", &[0, 1][..]),
+                    ("Left only", &[0]),
+                    ("Right only", &[1]),
+                ] {
+                    if ui.button(label).clicked() {
+                        app.repair_click(picked);
+                    }
+                }
+            })
+            .response
+            .on_hover_text(hover);
+        });
+    } else if ui
+        .add_enabled(enabled, Button::new("Repair click"))
+        .on_hover_text(hover)
+        .clicked()
+    {
+        let all: Vec<usize> = (0..channels).collect();
+        app.repair_click(&all);
+    }
 }
 
 /// The effect the open dialog applies with the remembered values; `None` for Auto-trim,
