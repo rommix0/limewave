@@ -124,9 +124,10 @@ fn row_sources(n: usize, rate: u32) -> Vec<RowSource> {
 ///
 /// The Hann window of [`fft_size_for`] points is centred on the middle of each column's
 /// `hop` frames and treats anything outside the audio as silence. A bin's level is
-/// `20·log10(|X| · 4 / n)`, so a full-scale sine reads 0 dBFS. A row takes the loudest bin
-/// between the centre frequencies of its neighbours, or blends the two nearest bins when
-/// that stretch is narrower than one bin.
+/// `20·log10(|X| · 4 / n)`, so a full-scale sine reads 0 dBFS. A row covers the band from the
+/// geometric midpoint with the row above to the one with the row below, so the bands tile the
+/// axis. It takes the loudest bin in that band, or blends the two nearest bins when the band
+/// is narrower than one bin.
 pub fn spectrogram(audio: &[Vec<f32>], rate: u32) -> Spectrogram {
     let frames = audio.iter().map(Vec::len).max().unwrap_or(0);
     let hop = hop_for(frames);
@@ -241,6 +242,34 @@ mod tests {
         let loud = spectrogram(&[sine(1000.0, 1.0, 44_100, 44_100)], 44_100);
         let peak = loud.channels[0].iter().copied().max().unwrap();
         assert!(peak >= 240, "peak is {peak}");
+        // Half the amplitude is 6.02 dB down: 255 · (1 − 6.02 / 90) ≈ 238. The window's
+        // scalloping loss between bins is at most 1.42 dB (4 bytes), so allow that much below.
+        let half = spectrogram(&[sine(1000.0, 0.5, 44_100, 44_100)], 44_100);
+        let peak = half.channels[0].iter().copied().max().unwrap();
+        assert!((233..=239).contains(&peak), "peak is {peak}");
+    }
+
+    #[test]
+    fn a_column_is_centred_on_the_middle_of_its_hop() {
+        // The 2048-point window is far wider than a 64-frame hop, so neighbouring columns
+        // barely differ near the impulse. Further out the window's slope is steep: columns
+        // the same distance either side of the centre only match if it is exactly centred.
+        let mut x = vec![0.0f32; 20_000];
+        let hop = hop_for(x.len());
+        assert_eq!(hop, 64);
+        let c = 100;
+        x[c * hop + hop / 2] = 1.0;
+        let s = spectrogram(&[x], 44_100);
+        let level = |col: usize| (0..ROWS).map(|r| s.channels[0][r * s.columns + col]).max();
+        let at_c = level(c);
+        assert!((0..s.columns).all(|col| level(col) <= at_c));
+        // Twelve columns out the window is down by about 17 dB, and a half-hop shift would
+        // make one side about 7 bytes louder than the other.
+        let (before, after) = (level(c - 12).unwrap(), level(c + 12).unwrap());
+        assert!(
+            before > 30 && before.abs_diff(after) <= 1,
+            "{before} vs {after}"
+        );
     }
 
     #[test]
