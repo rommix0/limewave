@@ -1,4 +1,8 @@
-# Limewave
+![](limewave_preview.png)
+
+![](logo_banner.png)
+
+this is an early release, and made with the assistance of Claude. If you notice anything that needs fixing or features you want me to add, please raise an issue. Pull requests are also welcome.
 
 Limewave is an open-source loop and one-shot WAV sample editor, written in Rust. Open a WAV file or a folder of them, set the loop points, root key and fine tune by hand, listen to the result while you edit, and save files that samplers read correctly. It runs on Windows, macOS and Linux.
 
@@ -103,26 +107,26 @@ The **Tuning** and **Loop** sections edit the region's sample. Their values come
 
 Notes play when the **Audition** toggle is on and no text field has focus.
 
-| Keys | Action |
-| --- | --- |
-| Z S X D C V G B H N J M , | Lower row of notes (white keys on the bottom row, black keys on the row above). Starts at C3 by default. |
-| Q 2 W 3 E R 5 T 6 Y 7 U I | Upper row of notes, one octave higher than the lower row. |
-| - and = | Move both rows down or up one octave. |
-| Ctrl/Cmd+Z | Undo. With an instrument open, this undoes the most recent edit, whether it was to the instrument (a key range, a region) or to the selected sample. |
-| Ctrl/Cmd+Shift+Z or Ctrl/Cmd+Y | Redo, in the same order |
-| Ctrl/Cmd+A | Select Start…End |
-| Escape | Cancel "Set from MIDI"; otherwise turn Draw off; otherwise clear the selection and the play-from point. With a menu open, Escape only closes the menu. |
-| Ctrl/Cmd+S | Save |
-| Ctrl/Cmd+Shift+S | Save as… |
-| Hold Shift while dragging a marker | Turn zero-crossing snap off for that drag |
-| Shift-click on the waveform | Extend an existing selection, or make one from the play-from point |
-| Mouse wheel over the waveform | Zoom around the cursor |
-| Drag the overview box | Scroll |
-| Drag either edge of the overview box | Zoom, keeping the other edge in place |
-| Drag a sample dot (zoomed in until samples show as dots, with Draw off) | Move that sample up or down; drag sideways to draw over the samples you pass, like a pencil. Each stroke is one undo step. |
-| Draw (toolbar) | Drag on a channel to draw its waveform at any zoom; each stroke is one undo step. Escape turns it off. |
-| Hold Shift while drawing samples (with Draw off) | Fine control: the sample moves a tenth as far as the pointer |
-| Right-drag across the key map's keyboard (instrument open) | Set the selected region's key range to the keys you drag over. Right-click without dragging still sets the root key. |
+| Keys                                                                    | Action                                                                                                                                                 |
+| ----------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Z S X D C V G B H N J M ,                                               | Lower row of notes (white keys on the bottom row, black keys on the row above). Starts at C3 by default.                                               |
+| Q 2 W 3 E R 5 T 6 Y 7 U I                                               | Upper row of notes, one octave higher than the lower row.                                                                                              |
+| - and =                                                                 | Move both rows down or up one octave.                                                                                                                  |
+| Ctrl/Cmd+Z                                                              | Undo. With an instrument open, this undoes the most recent edit, whether it was to the instrument (a key range, a region) or to the selected sample.   |
+| Ctrl/Cmd+Shift+Z or Ctrl/Cmd+Y                                          | Redo, in the same order                                                                                                                                |
+| Ctrl/Cmd+A                                                              | Select Start…End                                                                                                                                       |
+| Escape                                                                  | Cancel "Set from MIDI"; otherwise turn Draw off; otherwise clear the selection and the play-from point. With a menu open, Escape only closes the menu. |
+| Ctrl/Cmd+S                                                              | Save                                                                                                                                                   |
+| Ctrl/Cmd+Shift+S                                                        | Save as…                                                                                                                                               |
+| Hold Shift while dragging a marker                                      | Turn zero-crossing snap off for that drag                                                                                                              |
+| Shift-click on the waveform                                             | Extend an existing selection, or make one from the play-from point                                                                                     |
+| Mouse wheel over the waveform                                           | Zoom around the cursor                                                                                                                                 |
+| Drag the overview box                                                   | Scroll                                                                                                                                                 |
+| Drag either edge of the overview box                                    | Zoom, keeping the other edge in place                                                                                                                  |
+| Drag a sample dot (zoomed in until samples show as dots, with Draw off) | Move that sample up or down; drag sideways to draw over the samples you pass, like a pencil. Each stroke is one undo step.                             |
+| Draw (toolbar)                                                          | Drag on a channel to draw its waveform at any zoom; each stroke is one undo step. Escape turns it off.                                                 |
+| Hold Shift while drawing samples (with Draw off)                        | Fine control: the sample moves a tenth as far as the pointer                                                                                           |
+| Right-drag across the key map's keyboard (instrument open)              | Set the selected region's key range to the keys you drag over. Right-click without dragging still sets the root key.                                   |
 
 Note names follow the convention that MIDI note 60 is C4.
 
