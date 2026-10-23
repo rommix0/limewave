@@ -8,8 +8,8 @@ use super::model::Instrument;
 use super::paths::{is_absolute_text, normalize, same_file_key, sample_path, stays_inside};
 use super::write::write;
 use crate::document::WavDocument;
-use crate::edit::{EditState, resample_markers};
-use crate::effects::Op;
+use crate::edit::{EditState, map_markers};
+use crate::effects::changes_length;
 use crate::error::SaveError;
 use crate::save::{
     Destination, SaveOutcome, backup_existing, build_wav_bytes_with_smpl, make_backup, smpl_state,
@@ -42,7 +42,8 @@ pub fn needs_rewrite(doc: &WavDocument, e: &EditState, smpl: &EditState) -> bool
 
 /// The root key, fine tune and loop the sample's WAV is to say in `smpl`: the sample's edit
 /// with `write_smpl` on, else those the WAV came with (they now live in the instrument), its loop
-/// moved through any conversion. The audio, trim and crossfade are always the edit's (spec 7.3).
+/// moved with the audio through any crop, tail, spectrum loop or conversion. The audio, trim and
+/// crossfade are always the edit's (spec 7.3).
 pub fn smpl_edit_for_save<'a>(
     doc: &WavDocument,
     edit: &'a EditState,
@@ -50,9 +51,9 @@ pub fn smpl_edit_for_save<'a>(
 ) -> std::borrow::Cow<'a, EditState> {
     if write_smpl {
         std::borrow::Cow::Borrowed(edit)
-    } else if edit.effects.iter().any(|a| matches!(a.op, Op::Resample(_))) {
-        // A converted sample's own loop moves with its audio, since the instrument may not set one.
-        std::borrow::Cow::Owned(resample_markers(&doc.initial_edit(), &edit.effects))
+    } else if changes_length(&edit.effects) {
+        // The WAV's own loop moves with its audio, since the instrument may not set one.
+        std::borrow::Cow::Owned(map_markers(&doc.initial_edit(), &edit.effects))
     } else {
         std::borrow::Cow::Owned(doc.initial_edit())
     }
@@ -955,6 +956,40 @@ mod tests {
             assert!(saved.contains("loop_end=800"), "{saved}");
             assert!(saved.contains("pitch_keycenter=49"), "{saved}");
         }
+    }
+
+    /// With `smpl` off, a cropped sample's WAV still says its own loop, moved with the audio,
+    /// since the instrument sets none of its own.
+    #[test]
+    fn smpl_off_moves_the_wavs_loop_with_a_crop() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut chunk = smpl_chunk(60);
+        let mut s = Smpl::parse(&chunk.data).unwrap();
+        s.loops.push(crate::smpl::SmplLoop {
+            cue_id: 0,
+            loop_type: 0,
+            start: 1000,
+            end: 1999,
+            fraction: 0,
+            play_count: 0,
+        });
+        chunk.data = s.to_bytes();
+        put(root, "inst/x.wav", &wav_with(220.0, vec![chunk]));
+        let sfz = put(
+            root,
+            "inst/a.sfz",
+            b"<region> sample=x.wav
+",
+        );
+        let mut o = open(&sfz);
+        // Keep 500..=3499: 500 frames go from each end.
+        o.edits[0] =
+            crate::edit::crop_to_selection(&o.initial[0], (500, FRAMES - 501), 1, FRAMES).unwrap();
+        let out = root.join("o");
+        o.save(&Destination::Folder(out.clone()), false).unwrap();
+        let l = smpl_of(&out.join("x.wav")).unwrap().loops[0];
+        assert_eq!((l.start, l.end), (500, 1499));
     }
 
     /// With `smpl` off, a converted sample's WAV still says its own loop, moved to the new

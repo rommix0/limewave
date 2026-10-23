@@ -400,6 +400,48 @@ pub fn resample_map_end(effects: &[AppliedEffect], f: usize) -> usize {
     resample_map(effects, f.saturating_add(1)).saturating_sub(1)
 }
 
+/// Where frame `f` lands through splice step `a`, whose `n` frames of kind `kind` replace
+/// `first..=last`: unchanged before the block and shifted by the change in length after it. A
+/// frame inside the block keeps its distance from the end of the block whose audio carries on in
+/// the replacement: from the end for a spectrum loop (its exit transition carries on from the
+/// range's end), else from the start (a tail carries on from the cut). Either way it is held
+/// inside the new audio, so a removed block (`n` = 0) sends it to the frame after the cut and a
+/// same-length redraw leaves it where it is.
+fn splice_through(a: &AppliedEffect, kind: SpliceKind, n: usize, f: usize) -> usize {
+    if a.first > a.last || f < a.first {
+        f
+    } else if f <= a.last {
+        let new_end = a.first + n;
+        if kind == SpliceKind::SpectrumLoop {
+            new_end.saturating_sub(a.last + 1 - f).max(a.first)
+        } else {
+            a.first + (f - a.first).min(n)
+        }
+    } else {
+        (f - a.last - 1).saturating_add(a.first).saturating_add(n)
+    }
+}
+
+/// Where position `f` (a start: Start, a loop start, an SFZ `offset`) lands through the steps of
+/// `effects` that move audio, in order: each conversion as in [`resample_map`], each splice as
+/// [`splice_through`] says. Unlike [`map_frame`], a position inside removed or replaced audio
+/// still lands somewhere: at the cut for removed audio, and at the same distance from the edge
+/// the replacement carries on from for replaced audio. Other steps leave it where it is.
+pub fn map_position(effects: &[AppliedEffect], f: usize) -> usize {
+    effects.iter().fold(f, |f, a| match &a.op {
+        Op::Resample(r) => scale_through(a, r, f),
+        Op::Splice(s) => splice_through(a, s.kind, frame_count(&s.audio), f),
+        _ => f,
+    })
+}
+
+/// [`map_position`] for an inclusive end (End, a loop end, an SFZ `end`): it maps as the
+/// position one past it, so an end inside removed audio lands just before the cut. Saturates,
+/// so 0 stays at 0.
+pub fn map_position_end(effects: &[AppliedEffect], f: usize) -> usize {
+    map_position(effects, f.saturating_add(1)).saturating_sub(1)
+}
+
 /// Replays `effects` in order on a copy of the original audio.
 pub fn process(original: &[Vec<f32>], effects: &[AppliedEffect]) -> Vec<Vec<f32>> {
     let mut audio = original.to_vec();
@@ -623,6 +665,79 @@ mod tests {
             end,
             ..EditState::default_for(frames)
         }
+    }
+
+    #[test]
+    fn positions_move_through_a_cut() {
+        let cut = [splice(SpliceKind::Cut, 200, 299, 0)];
+        assert_eq!(map_position(&cut, 100), 100);
+        assert_eq!(
+            map_position(&cut, 250),
+            200,
+            "inside: the frame after the cut"
+        );
+        assert_eq!(map_position(&cut, 999), 899);
+        assert_eq!(map_position(&cut, 1000), 900, "the end of the file");
+        assert_eq!(
+            map_position_end(&cut, 250),
+            199,
+            "an end inside: just before it"
+        );
+        assert_eq!(map_position_end(&cut, 299), 199);
+        assert_eq!(map_position_end(&cut, 999), 899);
+        // A cut at the very start sends an end inside it to 0, not below.
+        assert_eq!(
+            map_position_end(&[splice(SpliceKind::Cut, 0, 99, 0)], 50),
+            0
+        );
+        assert!(changes_length(&cut));
+    }
+
+    #[test]
+    fn positions_move_through_replaced_audio() {
+        // A redraw keeps the length: nothing moves.
+        let draw = [splice(SpliceKind::Draw, 200, 299, 100)];
+        assert_eq!(map_position(&draw, 250), 250);
+        assert_eq!(map_position_end(&draw, 299), 299);
+        // A tail puts 300 frames in place of 500..=999 of 1000: inside, a frame keeps its
+        // place in the block, held to the new audio.
+        let tail = [splice(SpliceKind::Tail, 500, 999, 300)];
+        assert_eq!(map_position(&tail, 600), 600);
+        assert_eq!(map_position(&tail, 900), 800);
+        assert_eq!(map_position(&tail, 1000), 800, "the end of the file");
+        assert_eq!(
+            map_position_end(&tail, 999),
+            799,
+            "the last frame stays the last"
+        );
+        let reverse = AppliedEffect {
+            op: Op::Reverse {
+                mirror_markers: true,
+            },
+            first: 0,
+            last: 999,
+        };
+        assert_eq!(map_position(std::slice::from_ref(&reverse), 10), 10);
+        assert!(!changes_length(&[reverse]));
+    }
+
+    #[test]
+    fn positions_inside_a_spectrum_loop_keep_their_distance_from_its_exit() {
+        // 44100..=92609 (a 44100-frame range plus a 4410-frame exit transition) becomes a
+        // 4410-frame entry, a 132300-frame loop and the 4410-frame exit: 141120 frames.
+        let lp = [splice(SpliceKind::SpectrumLoop, 44_100, 92_609, 141_120)];
+        // The exit carries on from the range's end, so audio there stays the same audio.
+        assert_eq!(map_position(&lp, 88_300), 180_910);
+        assert_eq!(
+            map_position_end(&lp, 92_609),
+            185_219,
+            "the block's last frame"
+        );
+        assert_eq!(map_position(&lp, 92_610), 185_220, "after the block");
+        assert_eq!(map_position(&lp, 1000), 1000, "before the block");
+        // Deep inside the range, a position is held to the start of the block.
+        let short = [splice(SpliceKind::SpectrumLoop, 100, 999, 300)];
+        assert_eq!(map_position(&short, 150), 100);
     }
 
     fn plan(

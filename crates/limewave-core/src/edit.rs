@@ -5,8 +5,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::dsp::resample::{MAX_RATE, MIN_RATE, resample, resampled_len};
 use crate::effects::{
-    AppliedEffect, Op, Resample, Splice, SpliceKind, frames_after, output_frames, rate_after,
-    resample_map, resample_map_end,
+    AppliedEffect, Op, Resample, Splice, SpliceKind, frames_after, map_position, map_position_end,
+    output_frames, rate_after,
 };
 
 /// How the sample loops on playback.
@@ -325,17 +325,17 @@ pub fn redraw_samples(
     Some(r)
 }
 
-/// `e` with Start, End and the loop points moved through the conversion steps in `steps`:
-/// Start and the loop start directly, End and the loop end as the position one past them (see
-/// [`resample_map`]). At a tiny rate a start and its end can cross; an end never lies before its
-/// start, and a loop that the scaling leaves under 2 frames cannot play, so it is turned off.
-/// Nothing else changes.
-pub fn resample_markers(e: &EditState, steps: &[AppliedEffect]) -> EditState {
+/// `e` with Start, End and the loop points moved through the steps in `steps` that move audio
+/// (conversions and splices, see [`map_position`]): Start and the loop start directly, End and
+/// the loop end as the position one past them. A start and its end can cross, at a tiny rate or
+/// inside removed audio; an end never lies before its start, and a loop left under 2 frames
+/// cannot play, so it is turned off. Nothing else changes.
+pub fn map_markers(e: &EditState, steps: &[AppliedEffect]) -> EditState {
     let mut r = e.clone();
-    (r.start, r.end) = (resample_map(steps, e.start), resample_map_end(steps, e.end));
+    (r.start, r.end) = (map_position(steps, e.start), map_position_end(steps, e.end));
     (r.loop_start, r.loop_end) = (
-        resample_map(steps, e.loop_start),
-        resample_map_end(steps, e.loop_end),
+        map_position(steps, e.loop_start),
+        map_position_end(steps, e.loop_end),
     );
     r.end = r.end.max(r.start);
     r.loop_end = r.loop_end.max(r.loop_start);
@@ -350,7 +350,7 @@ pub fn resample_markers(e: &EditState, steps: &[AppliedEffect]) -> EditState {
 /// The audio is rendered here, from `processed`.
 ///
 /// Start, End and the loop points move with the audio, scaled by `round(f * to / from)` (see
-/// [`resample_map`]): Start and the loop start directly, End and the loop end as the position
+/// [`map_position`]): Start and the loop start directly, End and the loop end as the position
 /// one past them, and the crossfade by the same ratio. An end never lies before its start,
 /// and a loop whose mapped points span fewer than 2 frames is turned off. Returns `None` when `to` is the current rate or outside
 /// `MIN_RATE..=MAX_RATE`, the current rate is 0, or `processed` holds no frames.
@@ -375,7 +375,7 @@ pub fn resample_edit(
         first: 0,
         last: frames - 1,
     };
-    let mut r = resample_markers(e, std::slice::from_ref(&step));
+    let mut r = map_markers(e, std::slice::from_ref(&step));
     r.crossfade = resampled_len(e.crossfade, from, to);
     r.effects.push(step);
     Some(r.clamped(original_frames))
@@ -1123,8 +1123,8 @@ mod tests {
         assert_eq!(map_range(&r.effects, 10, 21), Some((5, 11)));
         // The last frame is held inside the new audio; non-conversion steps are ignored.
         assert_eq!(map_frame(&r.effects, 999), Some(499));
-        assert_eq!(resample_map(&r.effects, 999), 499);
-        assert_eq!(resample_map(&[], 7), 7);
+        assert_eq!(crate::effects::resample_map(&r.effects, 999), 499);
+        assert_eq!(crate::effects::resample_map(&[], 7), 7);
     }
 
     #[test]

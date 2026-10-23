@@ -1882,6 +1882,25 @@ fn a_converted_sample_plays_from_the_scaled_offset_to_the_scaled_end() {
 }
 
 #[test]
+fn a_cropped_sample_plays_each_region_from_the_same_audio() {
+    let (_dir, mut h) = open_text(
+        "<region> sample=a.wav offset=1500 end=3500 lokey=0 hikey=60\n\
+         <region> sample=a.wav lokey=61\n",
+    );
+    h.state_mut().select_region(0);
+    // Keep 1000..=3999 of the 4410 frames.
+    h.state_mut().ui.selection = Some((1000, 3999));
+    h.state_mut().crop_to_selection();
+    h.run();
+    let map = play_map(st(&h), &h.state().files);
+    let (cut, whole) = (&map.regions[0].buffer, &map.regions[1].buffer);
+    assert_eq!(cut.audio[0].len(), 3000);
+    // 1000 frames went from the front: 1500 -> 500 and 3500 -> 2500.
+    assert_eq!((cut.start, cut.end), (500, 2500));
+    assert_eq!((whole.start, whole.end), (0, 2999));
+}
+
+#[test]
 fn a_converted_samples_non_follower_keeps_its_own_loop_on_the_same_audio() {
     let (_dir, mut h) = open_text(
         "<region> sample=a.wav pitch_keycenter=60 lokey=0 hikey=60\n\

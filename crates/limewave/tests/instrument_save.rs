@@ -13,7 +13,7 @@ use limewave::instrument::InstrumentState;
 use limewave::ui::region_inspector::RegionEdit;
 use limewave::ui::save_dialog::{InstrumentSaveRequest, SaveFormat};
 use limewave_core::document::{load_wav, new_document};
-use limewave_core::edit::{EditState, LoopMode, resample_edit};
+use limewave_core::edit::{EditState, LoopMode, crop_to_selection, resample_edit};
 use limewave_core::effects::{resample_map, resample_map_end};
 use limewave_core::riff::Chunk;
 use limewave_core::save::Destination;
@@ -236,6 +236,39 @@ fn save_instrument_to_new_folder_writes_sfz_and_wavs_and_reopens() {
         .as_ref()
         .expect("the dialog shows what it saved");
     assert!(results.iter().all(|(_, r)| r.is_ok()), "{results:?}");
+    let _ = dir;
+}
+
+#[test]
+fn a_cropped_sample_saves_with_its_regions_moved_to_the_same_audio() {
+    let (dir, path) = kit();
+    let kit_dir = path.parent().unwrap().to_path_buf();
+    let mut h = open(&path);
+    st_mut(&mut h).edit(|i| {
+        i.set(0, "offset", "1500");
+        i.set(0, "end", "3500");
+    });
+    // Keep 1000..=3999 of a.wav's 4410 frames.
+    edit_sample(&mut h, 0, |e| {
+        *e = crop_to_selection(e, (1000, 3999), 1, 4410).unwrap();
+    });
+    h.state_mut().select_region(0);
+    h.state_mut().save_as();
+    settle(&mut h);
+    h.get_by_label("Save instrument").click();
+    h.run();
+    wait_loaded(&mut h);
+
+    let s = st(&h);
+    assert_eq!(s.path, kit_dir.join("limewave").join("kit.sfz"));
+    // 1000 frames went from the front: 1500 -> 500 and 3500 -> 2500.
+    assert_eq!(s.inst().get(0, "offset").unwrap().0, "500");
+    assert_eq!(s.inst().get(0, "end").unwrap().0, "2500");
+    let i = s.region_file(0).expect("region 0 has a file");
+    let FileEntry::Loaded(session) = &h.state().files[i] else {
+        panic!("the saved sample did not load");
+    };
+    assert_eq!(session.doc.frames, 3000);
     let _ = dir;
 }
 

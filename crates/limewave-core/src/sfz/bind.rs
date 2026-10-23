@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 use super::model::{Instrument, Keycenter, LoopDir, RegionInfo, SfzLoopMode};
 use super::paths::{find_sample, same_file_key, sample_path};
 use super::write::format_number;
-use crate::edit::{EditState, LoopMode, resample_markers};
-use crate::effects::{AppliedEffect, Op, resample_map, resample_map_end};
+use crate::edit::{EditState, LoopMode, map_markers};
+use crate::effects::{AppliedEffect, changes_length, map_position, map_position_end};
 use crate::notes::{note_name, parse_note};
 
 /// One WAV and the regions that play it.
@@ -187,24 +187,31 @@ fn shift_for_trim(inst: &mut Instrument, region: usize, shift: i64, max: i64) {
     }
 }
 
-/// Scales the sample-relative opcodes a region has, own or inherited, through the conversion
-/// steps `steps`, so they keep pointing at the same audio: `offset` and `loop_start` directly,
-/// `end` and `loop_end` (inclusive last frames) as the position one past them. A scaled
-/// inherited value is written at region level.
-fn scale_for_resample(inst: &mut Instrument, region: usize, steps: &[AppliedEffect]) {
-    for name in ["offset", "end", "loop_start", "loop_end"] {
-        let Some((text, _)) = inst.get(region, name) else {
-            continue;
-        };
-        let Ok(v) = text.trim().parse::<usize>() else {
-            continue;
-        };
-        let new = if matches!(name, "end" | "loop_end") {
-            resample_map_end(steps, v)
-        } else {
-            resample_map(steps, v)
-        };
-        if new != v {
+/// Moves the sample-relative opcodes a region has, own or inherited, through the steps in
+/// `steps` that move audio (a crop's cuts, a tail or spectrum loop, a conversion; see
+/// [`map_position`]), so they keep pointing at the same audio: `offset` and `loop_start`
+/// directly, `end` and `loop_end` (inclusive last frames) as the position one past them. Each
+/// is held to `last`, the last frame kept, and an end never lies before its start, as in
+/// [`map_markers`]. A moved inherited value is written at region level.
+fn move_with_audio(inst: &mut Instrument, region: usize, steps: &[AppliedEffect], last: usize) {
+    let read = |name| {
+        inst.get(region, name)
+            .and_then(|(text, _)| text.trim().parse::<usize>().ok())
+    };
+    let pairs = [("offset", "end"), ("loop_start", "loop_end")];
+    let mut moved = Vec::new();
+    for (start_name, end_name) in pairs {
+        let (start, end) = (read(start_name), read(end_name));
+        let new_start = start.map(|v| map_position(steps, v).min(last));
+        let new_end = end
+            .map(|v| map_position_end(steps, v).min(last))
+            .map(|v| new_start.map_or(v, |s| v.max(s)));
+        moved.extend([(start_name, start, new_start), (end_name, end, new_end)]);
+    }
+    for (name, old, new) in moved {
+        if let (Some(old), Some(new)) = (old, new)
+            && new != old
+        {
             put(inst, region, name, new);
         }
     }
@@ -324,21 +331,27 @@ fn write_tuning_and_loop(
 
 /// Writes a sample edit into the instrument (spec 7.2). Trimming moves the
 /// sample-relative opcodes of every region using it; a change to root key,
-/// fine tune or loop sets explicit opcodes on the regions that follow it. A conversion
-/// to another rate (a step `after` has and `before` does not) scales every such region's
-/// frame opcodes, followers or not, and writes no tuning.
+/// fine tune or loop sets explicit opcodes on the regions that follow it. Steps `after` has
+/// and `before` does not that move audio (a crop's cuts, a tail or spectrum loop, a conversion)
+/// move every such region's frame opcodes with it, followers or not, and write no tuning.
 pub fn write_back(inst: &mut Instrument, b: &SampleBinding, before: &EditState, after: &EditState) {
     // `before` is the reference state, whose steps are a prefix of `after`'s.
     let new_steps = &after.effects[before.effects.len().min(after.effects.len())..];
-    // Scale first, and compare against `before` in the new frames, so a loop the user did
+    // Move first, and compare against `before` in the new frames, so a loop the user did
     // not touch is not written again and the trim below sees only the user's own change.
-    let scaled;
-    let before = if new_steps.iter().any(|a| matches!(a.op, Op::Resample(_))) {
+    let moved;
+    let before = if changes_length(new_steps) {
         for &region in &b.regions {
-            scale_for_resample(inst, region, new_steps);
+            move_with_audio(inst, region, new_steps, after.end);
         }
-        scaled = resample_markers(before, new_steps);
-        &scaled
+        // The loop keeps the on/off it was read with: one the steps squeezed out (a crop that
+        // cut it away, a tiny conversion) counts as turned off, so the regions that followed
+        // it stop looping and drop the points that were its loop.
+        moved = EditState {
+            loop_mode: before.loop_mode,
+            ..map_markers(before, new_steps)
+        };
+        &moved
     } else {
         before
     };
@@ -1150,6 +1163,76 @@ mod tests {
         (before.loop_mode, before.loop_start, before.loop_end) = (LoopMode::Forward, 4410, 8820);
         let after = resample_edit(&before, &[vec![0.0; 44_100]], 22_050, 44_100, 44_100).unwrap();
         (before, after)
+    }
+
+    #[test]
+    fn a_cropped_sample_moves_every_regions_frame_opcodes() {
+        let mut i = inst(
+            "<region> sample=a.wav offset=250 end=900 loop_start=300 loop_end=600 \
+             <region> sample=a.wav pitch_keycenter=70 loop_start=350 loop_end=500 \
+             <region> sample=a.wav offset=100",
+        );
+        let mut before = EditState::default_for(1000);
+        (before.loop_mode, before.loop_start, before.loop_end) = (LoopMode::Forward, 300, 600);
+        // Keep 200..=799: the 200 frames before it and the 200 after it go.
+        let after = crate::edit::crop_to_selection(&before, (200, 799), 1, 1000).unwrap();
+        let b = SampleBinding {
+            path: PathBuf::new(),
+            regions: vec![0, 1, 2],
+            follows: vec![true, false, true],
+        };
+        write_back(&mut i, &b, &before, &after);
+        let opcodes = |r| ["offset", "end", "loop_start", "loop_end"].map(|n| value(&i, r, n));
+        let some = |v: [&str; 4]| v.map(|s| Some(s.to_owned()));
+        assert_eq!(opcodes(0), some(["50", "599", "100", "400"]));
+        // A region that keeps its own loop moves with the audio too.
+        assert_eq!(
+            (value(&i, 1, "loop_start"), value(&i, 1, "loop_end")),
+            (Some("150".into()), Some("300".into()))
+        );
+        // An offset inside the removed audio lands on the new first frame.
+        assert_eq!(value(&i, 2, "offset").as_deref(), Some("0"));
+        // The follower's loop moved with the crop, so no loop setting is written for it.
+        assert_eq!(value(&i, 0, "loop_mode"), None);
+    }
+
+    #[test]
+    fn a_crop_that_cuts_the_loop_away_stops_its_followers_looping() {
+        let text = "<region> sample=a.wav loop_start=300 loop_end=600 \
+                    <region> sample=a.wav loop_mode=loop_continuous loop_start=300 loop_end=600 \
+                    <region> sample=a.wav offset=950";
+        let mut i = inst(text);
+        let mut before = EditState::default_for(1000);
+        (before.loop_mode, before.loop_start, before.loop_end) = (LoopMode::Forward, 300, 600);
+        // Keep 700..=900: the loop is cut away and the loop turns off.
+        let after = crate::edit::crop_to_selection(&before, (700, 900), 1, 1000).unwrap();
+        assert_eq!(after.loop_mode, LoopMode::Off);
+        write_back(&mut i, &all_follow(3), &before, &after);
+        for r in 0..2 {
+            assert_eq!(value(&i, r, "loop_mode").as_deref(), Some("no_loop"));
+            assert_eq!(
+                (value(&i, r, "loop_start"), value(&i, r, "loop_end")),
+                (None, None)
+            );
+        }
+        // An offset in audio cut from the end is held to the last frame kept.
+        assert_eq!(value(&i, 2, "offset").as_deref(), Some("200"));
+    }
+
+    #[test]
+    fn a_follower_whose_loop_a_tiny_conversion_squeezes_out_stops_looping() {
+        let mut i =
+            inst("<region> sample=a.wav loop_mode=loop_continuous loop_start=10 loop_end=60");
+        let mut before = EditState::default_for(96_000);
+        (before.loop_mode, before.loop_start, before.loop_end) = (LoopMode::Forward, 10, 60);
+        let after = resample_edit(&before, &[vec![0.0; 96_000]], 1_000, 96_000, 96_000).unwrap();
+        assert_eq!(after.loop_mode, LoopMode::Off);
+        write_back(&mut i, &all_follow(1), &before, &after);
+        assert_eq!(value(&i, 0, "loop_mode").as_deref(), Some("no_loop"));
+        assert_eq!(
+            (value(&i, 0, "loop_start"), value(&i, 0, "loop_end")),
+            (None, None)
+        );
     }
 
     #[test]

@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use limewave_core::edit::{EditState, History, LoopMode, resample_markers};
-use limewave_core::effects::{AppliedEffect, resample_map, resample_map_end};
+use limewave_core::edit::{EditState, History, LoopMode, map_markers};
+use limewave_core::effects::{AppliedEffect, map_position, map_position_end};
 use limewave_core::save::Destination;
 use limewave_core::sfz::bind::{self, Binding, SampleBinding, SampleStates};
 use limewave_core::sfz::format_number;
@@ -248,9 +248,10 @@ impl InstrumentState {
         let edit = if follows {
             session.published.clone()
         } else {
-            // The region's own loop is in the WAV's frames; a converted sample plays new ones.
+            // The region's own loop is in the WAV's frames; a cropped or converted sample plays
+            // new ones.
             let own = bind::region_edit(inst, region, &session.doc.initial_edit());
-            resample_markers(&own, conversion_steps(session))
+            map_markers(&own, steps_since_wav(session))
         };
         Some((session, edit))
     }
@@ -355,9 +356,10 @@ impl InstrumentState {
 }
 
 /// The steps `session`'s published edit adds over the WAV's own state. The frame values a
-/// region writes (`offset`, `end`, its own loop) are in the WAV's frames, so only the
-/// conversions among these move them, as [`bind::write_back`] does when the instrument is saved.
-fn conversion_steps(session: &Session) -> &[AppliedEffect] {
+/// region writes (`offset`, `end`, its own loop) are in the WAV's frames, so the steps among
+/// these that move audio (a crop's cuts, a tail or spectrum loop, a conversion) move them, as
+/// [`bind::write_back`] does when the instrument is saved.
+fn steps_since_wav(session: &Session) -> &[AppliedEffect] {
     let effects = &session.published.effects;
     let wav = session.doc.initial_edit().effects.len();
     &effects[wav.min(effects.len())..]
@@ -384,10 +386,10 @@ pub fn play_map(st: &InstrumentState, files: &[FileEntry]) -> InstrumentPlay {
         let current = &session.published;
         let last = buffer.audio.first().map_or(0, Vec::len).saturating_sub(1);
         // `offset` is a start and `end` an inclusive last frame; both are in the WAV's frames.
-        let steps = conversion_steps(session);
-        let end = info.end.map(|e| resample_map_end(steps, e));
+        let steps = steps_since_wav(session);
+        let end = info.end.map(|e| map_position_end(steps, e));
         buffer.end = end.unwrap_or(current.end).min(current.end);
-        buffer.start = resample_map(steps, info.offset)
+        buffer.start = map_position(steps, info.offset)
             .max(current.start)
             .min(buffer.end);
         // A `no_loop` region following a looped sample plays through it.
