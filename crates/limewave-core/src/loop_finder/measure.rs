@@ -11,8 +11,10 @@ use crate::dsp::spectrum::{Fft, hann};
 /// The smallest second-difference energy [`natural_change`] reports, so dividing by it is safe.
 const D2_FLOOR: f32 = 1e-20;
 
-/// The smallest band-level change [`natural_change`] reports, in dB.
-const FLUX_FLOOR: f32 = 1e-3;
+/// The smallest band-level change [`natural_change`] reports, in dB. A difference this small
+/// between band levels is treated as inaudible, so a steady pure tone, whose own change is
+/// nearly zero, is not ranked Rough for differences nobody could hear.
+pub const FLUX_FLOOR: f32 = 0.5;
 
 /// The lowest band level, in dB. Silent bands sit here.
 const LEVEL_FLOOR_DB: f32 = -120.0;
@@ -409,6 +411,21 @@ mod tests {
         assert!(m.tone < 1e-3, "{m:?}");
         assert!(m.matching > 0.9999, "{m:?}");
         assert_eq!(quality(&m), Quality::Seamless);
+    }
+
+    #[test]
+    fn a_steady_sine_looped_over_whole_periods_is_seamless() {
+        // 220 Hz at 22 kHz is exactly 100 samples a period.
+        // The phase is taken within the period, so every period is bit-identical.
+        let rate = 22_000;
+        let sine: Vec<f32> = (0..2 * rate)
+            .map(|i| (std::f32::consts::TAU * (i % 100) as f32 / 100.0).sin())
+            .collect();
+        let a = vec![sine];
+        let (s, e) = (2_205, 2_205 + 100 * 100 - 1);
+        let natural = natural_change(&a, s, e, rate);
+        let m = seam_measures(&a, s, e, rate, &natural);
+        assert_eq!(quality(&m), Quality::Seamless, "{m:?} {natural:?}");
     }
 
     #[test]
