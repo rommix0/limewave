@@ -14,6 +14,7 @@ use crate::app::{Session, UiState};
 use crate::audio::engine::AudioEngine;
 use crate::audio::voice::Adsr;
 use crate::theme::colors;
+use crate::ui::loop_finder;
 use crate::ui::region_inspector::{RegionContext, RegionEdit, region_note, region_section};
 use crate::ui::save_dialog::SaveCommand;
 
@@ -59,16 +60,41 @@ fn loop_mode_text(m: LoopMode) -> &'static str {
     }
 }
 
-/// Records the result of a widget the user changed. A drag is previewed and becomes one
-/// history entry on release; anything else (typing, a click) is its own entry.
+/// What a widget's change starts from.
+#[derive(Clone, Copy, PartialEq)]
+enum Base {
+    /// The current edit.
+    Current,
+    /// The loop the user sees: a previewed loop finder candidate, or the current edit
+    /// ([`loop_finder::edit_base`]). A drag keeps the base it started from.
+    Shown,
+}
+
+/// Records the result of a widget the user changed, made by `edit` from `base`. A drag is
+/// previewed and becomes one history entry on release; anything else (typing, a click) is its
+/// own entry.
 fn track(
     s: &mut Session,
     engine: Option<&AudioEngine>,
     response: &Response,
+    base: Base,
     edit: impl FnOnce(&EditState) -> EditState,
 ) {
+    let base_id = response.id.with("edit_base");
+    if base == Base::Shown && response.drag_started() {
+        let from = loop_finder::edit_base(s);
+        response.ctx.data_mut(|d| d.insert_temp(base_id, from));
+    }
     if response.changed() {
-        let e = edit(s.edit());
+        let from = match base {
+            Base::Current => s.edit().clone(),
+            Base::Shown => response
+                .dragged()
+                .then(|| response.ctx.data(|d| d.get_temp::<EditState>(base_id)))
+                .flatten()
+                .unwrap_or_else(|| loop_finder::edit_base(s)),
+        };
+        let e = edit(&from);
         if response.dragged() {
             s.set_preview(e, engine);
         } else {
@@ -76,6 +102,7 @@ fn track(
         }
     }
     if response.drag_stopped() {
+        response.ctx.data_mut(|d| d.remove::<EditState>(base_id));
         s.commit_preview(engine);
     }
 }
@@ -316,7 +343,10 @@ fn tuning_section(
                 .step_by(1.0),
         );
         let slider = slider.labelled_by(name.id);
-        track(s, engine, &slider, |e| EditState { cents, ..e.clone() });
+        track(s, engine, &slider, Base::Current, |e| EditState {
+            cents,
+            ..e.clone()
+        });
         let field = ui.add(
             DragValue::new(&mut cents)
                 .range(-50.0..=50.0)
@@ -325,7 +355,10 @@ fn tuning_section(
                 .suffix(" ¢"),
         );
         let field = field.labelled_by(name.id);
-        track(s, engine, &field, |e| EditState { cents, ..e.clone() });
+        track(s, engine, &field, Base::Current, |e| EditState {
+            cents,
+            ..e.clone()
+        });
     });
     toggled
 }
@@ -357,7 +390,7 @@ fn loop_section(
             {
                 let e = EditState {
                     loop_mode: mode,
-                    ..s.edit().clone()
+                    ..loop_finder::edit_base(s)
                 };
                 s.apply(e, engine);
             }
@@ -370,7 +403,7 @@ fn loop_section(
         let mut v = value;
         let r = ui.add(DragValue::new(&mut v).range(0..=last).speed(1.0));
         let r = r.labelled_by(name.id);
-        track(s, engine, &r, |e| {
+        track(s, engine, &r, Base::Shown, |e| {
             move_marker(e, marker, v, ui_state.lock_length, original_frames)
         });
         ui.end_row();
@@ -401,7 +434,7 @@ fn loop_section(
                         .show_value(false),
                 );
                 let slider = slider.labelled_by(name.id);
-                track(s, engine, &slider, |e| EditState {
+                track(s, engine, &slider, Base::Shown, |e| EditState {
                     crossfade: ms_to_frames(ms, rate, max),
                     ..e.clone()
                 });
@@ -413,7 +446,7 @@ fn loop_section(
                         .suffix(" ms"),
                 );
                 let field = field.labelled_by(name.id);
-                track(s, engine, &field, |e| EditState {
+                track(s, engine, &field, Base::Shown, |e| EditState {
                     crossfade: ms_to_frames(ms, rate, max),
                     ..e.clone()
                 });
@@ -432,7 +465,7 @@ fn loop_section(
                 {
                     let e = EditState {
                         fade_shape: shape,
-                        ..s.edit().clone()
+                        ..loop_finder::edit_base(s)
                     };
                     s.apply(e, engine);
                 }

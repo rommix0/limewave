@@ -336,6 +336,8 @@ pub fn waveform_view(
     }
     let drag_id = response.id.with("drag");
     let pencil_id = response.id.with("pencil");
+    // The edit a marker drag started from, kept for the whole drag.
+    let base_id = response.id.with("drag_base");
     if response.drag_started_by(PointerButton::Primary)
         && let Some(press) = ui.input(|i| i.pointer.press_origin())
     {
@@ -382,6 +384,11 @@ pub fn waveform_view(
                 },
             ),
         };
+        if matches!(gesture, Some(Gesture::Marker(_))) {
+            // The loop the user sees: a previewed loop finder candidate, or the current edit.
+            let base = loop_finder::edit_base(s);
+            ui.data_mut(|d| d.insert_temp(base_id, base));
+        }
         ui.data_mut(|d| d.insert_temp(drag_id, gesture));
     }
     let gesture: Option<Gesture> = ui
@@ -396,7 +403,11 @@ pub fn waveform_view(
         match (gesture, pointer) {
             (Gesture::Marker(drag), Some(pos)) => {
                 let target = view.x_to_frame(pos.x, left) + drag.grab_offset;
-                let moved = dragged_edit(s, ui_state, drag.marker, target, ui_state.snap && !shift);
+                let base = ui
+                    .data(|d| d.get_temp::<EditState>(base_id))
+                    .unwrap_or_else(|| s.edit().clone());
+                let snap = ui_state.snap && !shift;
+                let moved = dragged_edit(s, &base, ui_state, drag.marker, target, snap);
                 s.set_preview(moved, engine);
             }
             (Gesture::Select { anchor }, Some(pos)) => {
@@ -425,7 +436,10 @@ pub fn waveform_view(
             _ => {}
         }
         if response.drag_stopped() {
-            ui.data_mut(|d| d.insert_temp(drag_id, None::<Gesture>));
+            ui.data_mut(|d| {
+                d.insert_temp(drag_id, None::<Gesture>);
+                d.remove::<EditState>(base_id);
+            });
             match gesture {
                 Gesture::Marker(_) => s.commit_preview(engine),
                 Gesture::Pencil => {
@@ -618,8 +632,9 @@ fn marker_entry_field(
             && !escape
             && let Ok(frame) = text.trim().parse::<usize>()
         {
-            let e = move_marker(s.edit(), marker, frame, ui_state.lock_length, s.doc.frames);
-            if e != *s.edit() {
+            let base = loop_finder::edit_base(s);
+            let e = move_marker(&base, marker, frame, ui_state.lock_length, s.doc.frames);
+            if e != base {
                 s.apply(e, engine);
             }
         }
@@ -636,11 +651,12 @@ pub fn cursor_color(c: &Cursor) -> Color32 {
     )
 }
 
-/// The edit after dragging `marker` to the (fractional) frame `target`, snapped onto a zero
-/// crossing when `snap` is set and the marker is a loop marker: upward, or downward for a
-/// backward loop.
+/// The edit after dragging `marker` of `base`, the edit the drag started from, to the
+/// (fractional) frame `target`, snapped onto a zero crossing when `snap` is set and the marker
+/// is a loop marker: upward, or downward for a backward loop.
 fn dragged_edit(
     s: &Session,
+    base: &EditState,
     ui_state: &UiState,
     marker: Marker,
     target: f64,
@@ -649,14 +665,14 @@ fn dragged_edit(
     let mut to = target.round().max(0.0) as usize;
     let window = snap_window(s.rate());
     if snap {
-        let crossing = loop_crossing(s.edit().loop_mode);
+        let crossing = loop_crossing(base.loop_mode);
         match marker {
             Marker::LoopStart => to = snap_loop_start_with(&s.mono, to, window, crossing),
             Marker::LoopEnd => to = snap_loop_end_with(&s.mono, to, window, crossing),
             Marker::Start | Marker::End => {}
         }
     }
-    move_marker(s.edit(), marker, to, ui_state.lock_length, s.doc.frames)
+    move_marker(base, marker, to, ui_state.lock_length, s.doc.frames)
 }
 
 /// The frame under screen `x`, rounded and clamped to the file.

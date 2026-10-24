@@ -14,7 +14,7 @@ use limewave_core::loop_finder::measure::{FAIR, GOOD};
 use limewave_core::loop_finder::steady::{RangeKind, SearchRange, search_range};
 use limewave_core::loop_finder::{
     DEFAULT_MIN_SECONDS, Direction, FinderError, FinderSettings, LoopCandidate, MAX_CANDIDATES,
-    MAX_SEARCH_SECONDS, Quality, SeamMeasures, find_loops,
+    MAX_SEARCH_SECONDS, Quality, SeamMeasures, context_margin, find_loops,
 };
 
 use crate::app::{Session, UiState};
@@ -128,10 +128,23 @@ fn frames(seconds: f64, rate: u32) -> usize {
     ((seconds * f64::from(rate)).round() as usize).max(2)
 }
 
+/// The way loops play in `mode`: Off and Forward search for forward loops, Backward for
+/// backward ones, and Ping-pong for neither.
+fn direction_of(mode: LoopMode) -> Option<Direction> {
+    match mode {
+        LoopMode::Off | LoopMode::Forward => Some(Direction::Forward),
+        LoopMode::Backward => Some(Direction::Backward),
+        LoopMode::PingPong => None,
+    }
+}
+
 /// Starts a search of `s`'s processed audio with `prefs`, over `selection` or, without one,
 /// the steady part, cut to the current Start...End. A running search is cancelled first. When
 /// there is no range to search, `range_error` says why and nothing starts. `key` is only what
 /// the worker is filed under: a result is judged by its audio version.
+///
+/// Only the span the search reads is copied for the worker: the range and a kept end, with
+/// [`context_margin`] either side.
 ///
 /// A live candidate preview is left alone: the caller ends it first with [`end_preview`].
 pub fn start_search(
@@ -156,22 +169,31 @@ pub fn start_search(
         }
     };
     // Ping-pong never gets here: the panel disables the search for it.
-    let direction = if e.loop_mode == LoopMode::Backward {
-        Direction::Backward
-    } else {
-        Direction::Forward
-    };
+    let direction = direction_of(e.loop_mode).unwrap_or(Direction::Forward);
     let keep_end = (prefs.keep_end && e.loop_mode != LoopMode::Off).then_some(e.loop_end);
+    // Only the span the search reads, so the whole file is never copied on this thread.
+    let margin = context_margin(rate);
+    let len = s.processed.iter().map(Vec::len).min().unwrap_or(0);
+    let from = range
+        .first
+        .min(keep_end.unwrap_or(range.first))
+        .saturating_sub(margin);
+    let to = range
+        .last
+        .max(keep_end.unwrap_or(range.last))
+        .saturating_add(margin + 1)
+        .min(len)
+        .max(from);
+    let audio: Vec<Vec<f32>> = s.processed.iter().map(|ch| ch[from..to].to_vec()).collect();
     let settings = FinderSettings {
-        range: (range.first, range.last),
-        keep_end,
+        range: (range.first - from, range.last - from),
+        keep_end: keep_end.map(|end| end - from),
         min_len: frames(prefs.min_s, rate),
         max_len: prefs.max_s.map(|m| frames(m, rate)),
         preference: prefs.preference,
         direction,
         max_candidates: MAX_CANDIDATES,
     };
-    let audio = s.processed.clone();
     let audio_version = s.audio_version;
     let cancel = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&cancel);
@@ -179,7 +201,16 @@ pub fn start_search(
         audio_version,
         range,
         direction,
-        outcome: find_loops(&audio, rate, &settings, &flag),
+        outcome: find_loops(&audio, rate, &settings, &flag).map(|found| {
+            found
+                .into_iter()
+                .map(|c| LoopCandidate {
+                    loop_start: c.loop_start + from,
+                    loop_end: c.loop_end + from,
+                    ..c
+                })
+                .collect()
+        }),
     });
     s.loop_finder.job = Some((job, cancel));
 }
@@ -240,6 +271,17 @@ pub fn previewing(s: &Session) -> bool {
         .is_some_and(|e| s.preview.as_ref() == Some(&e.clamped(frames)))
 }
 
+/// The edit a gesture on the loop starts from: the previewed candidate's while a candidate
+/// preview is live, so the gesture acts on the loop the user sees, else the current edit. Any
+/// other preview, such as a marker drag, is never the base: a drag keeps the base it started
+/// from.
+pub fn edit_base(s: &Session) -> EditState {
+    match &s.preview {
+        Some(e) if previewing(s) => e.clone(),
+        _ => s.edit().clone(),
+    }
+}
+
 /// Whether a search is running.
 pub fn is_searching(s: &Session) -> bool {
     s.loop_finder.job.is_some()
@@ -254,11 +296,26 @@ pub fn is_stale(s: &Session) -> bool {
         .is_some_and(|r| r.audio_version != s.audio_version)
 }
 
+/// Whether the loop mode has changed since the search, so its loops would no longer play the
+/// way they were found: Off and Forward play forward loops, Backward backward ones, and no
+/// result suits Ping-pong.
+pub fn direction_changed(s: &Session) -> bool {
+    s.loop_finder
+        .result
+        .as_ref()
+        .is_some_and(|r| direction_of(s.edit().loop_mode) != Some(r.direction))
+}
+
+/// Whether the result can no longer be used: it is stale or the loop mode has changed.
+fn unusable(s: &Session) -> bool {
+    is_stale(s) || direction_changed(s)
+}
+
 /// The spans to bracket on the waveform: each candidate's `loop_start..=loop_end`, with whether
-/// it is the selected one. Empty without a result, with a stale one, or when the search found
-/// no loops.
+/// it is the selected one. Empty without a result, with a stale one or one made for another
+/// loop mode, or when the search found no loops.
 pub fn overlay_brackets(s: &Session) -> Vec<(usize, usize, bool)> {
-    if is_stale(s) {
+    if unusable(s) {
         return Vec::new();
     }
     let Some(Ok(candidates)) = s.loop_finder.result.as_ref().map(|r| &r.outcome) else {
@@ -322,9 +379,10 @@ pub fn draw_finder_overlay(
 
 /// The current edit with `c`'s loop points: a loop that was Off turns Forward, and the
 /// crossfade is cut to what the new loop allows. `None` when there is no current result, it
-/// is stale, or `c` lies outside the current Start...End.
+/// is stale, the loop mode has changed since the search ([`direction_changed`]), or `c` lies
+/// outside the current Start...End.
 pub fn candidate_edit(s: &Session, c: &LoopCandidate) -> Option<EditState> {
-    if s.loop_finder.result.is_none() || is_stale(s) {
+    if s.loop_finder.result.is_none() || unusable(s) {
         return None;
     }
     let e = s.edit();
@@ -396,6 +454,9 @@ const MIN_LONGEST: f64 = 0.01;
 
 /// What the list says when the result was made for audio that has since changed.
 const STALE_TEXT: &str = "The sound has changed. Search again.";
+
+/// What the list says when the loop mode no longer plays the way the result's loops were found.
+const MODE_TEXT: &str = "The loop mode has changed. Search again.";
 
 /// The id of the list row for candidate `index`.
 fn row_id(index: usize) -> egui::Id {
@@ -497,7 +558,7 @@ fn outside_trim(s: &Session, index: usize) -> bool {
         return false;
     };
     let e = s.edit();
-    !is_stale(s)
+    !unusable(s)
         && candidates
             .get(index)
             .is_some_and(|c| c.loop_start < e.start || c.loop_end > e.end)
@@ -603,6 +664,7 @@ pub fn finder_panel(
 
     let rate = s.rate();
     let stale = is_stale(s);
+    let unusable = unusable(s);
     let result = s.loop_finder.result.as_ref();
     if let Some(r) = result {
         ui.weak(range_text(&r.range, rate));
@@ -610,6 +672,7 @@ pub fn finder_panel(
     let message = match (s.loop_finder.range_error, result) {
         (Some(err), _) => error_text(err),
         (None, Some(_)) if stale => Some(STALE_TEXT),
+        (None, Some(_)) if unusable => Some(MODE_TEXT),
         (None, Some(r)) => match &r.outcome {
             Err(err) => error_text(*err),
             Ok(candidates) if candidates.is_empty() => Some("No loops found"),
@@ -628,8 +691,8 @@ pub fn finder_panel(
         return;
     }
 
-    // Up and down move the preview while a row has focus, and Enter applies it.
-    if let Some(i) = focused_row(ui.ctx()).filter(|&i| !stale && i < rows.len()) {
+    // Up and down move the preview while a row has focus, and Enter applies the selected row.
+    if let Some(i) = focused_row(ui.ctx()).filter(|&i| !unusable && i < rows.len()) {
         let filter = EventFilter {
             vertical_arrows: true,
             ..Default::default()
@@ -650,7 +713,9 @@ pub fn finder_panel(
             None
         };
         if enter {
-            use_candidate(s, i, engine);
+            if let Some(selected) = s.loop_finder.selected {
+                use_candidate(s, selected, engine);
+            }
         } else if let Some(to) = to {
             pick(s, to, engine);
             ui.memory_mut(|m| m.request_focus(row_id(to)));
@@ -658,7 +723,7 @@ pub fn finder_panel(
     }
 
     let selected = s.loop_finder.selected;
-    ui.add_enabled_ui(!stale, |ui| {
+    ui.add_enabled_ui(!unusable, |ui| {
         ScrollArea::vertical()
             .auto_shrink([false, true])
             .show(ui, |ui| {

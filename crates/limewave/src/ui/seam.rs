@@ -9,6 +9,7 @@ use limewave_core::edit::{EditState, LoopMode, Marker, move_marker};
 use limewave_core::render::{SeamData, seam_data};
 use limewave_core::wav::SampleFormat;
 
+use super::loop_finder;
 use super::waveform::cursor_color;
 use crate::app::{Session, UiState};
 use crate::audio::engine::{AudioEngine, Cursor};
@@ -142,9 +143,11 @@ enum Nudge {
     Crossing(bool),
 }
 
-/// The edit with `marker` nudged, or `None` when it cannot move that way.
+/// The edit with `marker` nudged, or `None` when it cannot move that way. It starts from the
+/// loop the user sees: a previewed loop finder candidate, or the current edit.
 fn nudged(s: &Session, ui_state: &UiState, marker: Marker, nudge: Nudge) -> Option<EditState> {
-    let e = s.edit();
+    let base = loop_finder::edit_base(s);
+    let e = &base;
     let current = match marker {
         Marker::LoopStart => e.loop_start,
         _ => e.loop_end,

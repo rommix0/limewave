@@ -1878,6 +1878,9 @@ impl LimewaveApp {
     /// Makes `i` the edited file, or leaves the editor empty for `None`; see
     /// [`LimewaveApp::select`].
     fn select_entry(&mut self, i: Option<usize>) {
+        // A loop finder preview belongs to the file it was shown on; otherwise coming back to
+        // that file would show the candidate while playing the current loop.
+        self.end_finder_preview();
         // The render dialogs belong to the file they were opened for.
         let tail = self.ui.tail_dialog.take().is_some();
         let spectrum = self.ui.spectrum_dialog.take().is_some();

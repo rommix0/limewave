@@ -3,18 +3,26 @@
 //! when the audio changes) and the panel beside the seam view. Driven through the whole app;
 //! the tests wait for the worker between frames.
 
-use eframe::egui::{Key, vec2};
+use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
+
+use eframe::egui::{Key, Pos2, vec2};
 use egui_kittest::Harness;
 use egui_kittest::kittest::{NodeT, Queryable};
 use limewave::app::{FileEntry, LimewaveApp, Session};
 use limewave::ui::loop_finder::{
-    FinderPrefs, candidate_edit, end_preview, is_searching, is_stale, overlay_brackets,
-    preview_candidate, start_search, use_candidate,
+    FinderPrefs, candidate_edit, direction_changed, end_preview, is_searching, is_stale,
+    overlay_brackets, preview_candidate, start_search, use_candidate,
 };
+use limewave::ui::waveform::flag_hit_point;
+use limewave_core::document::load_wav_bytes;
 use limewave_core::dsp::rng::SplitMix64;
-use limewave_core::edit::{EditState, LoopMode};
+use limewave_core::edit::{EditState, LoopMode, Marker};
 use limewave_core::effects::Effect;
-use limewave_core::loop_finder::LoopCandidate;
+use limewave_core::loop_finder::steady::search_range;
+use limewave_core::loop_finder::{
+    Direction, FinderSettings, LoopCandidate, MAX_CANDIDATES, find_loops as find_in,
+};
 use limewave_core::testwav::{sine, wav_bytes};
 use limewave_core::wav::SampleFormat;
 
@@ -397,6 +405,22 @@ fn arrow_down_moves_the_preview() {
 }
 
 #[test]
+fn enter_with_no_row_selected_does_nothing() {
+    let mut h = harness();
+    find_loops(&mut h);
+    let cursor = session(h.state()).history.cursor();
+    // The second click ends the preview; the row keeps the focus.
+    click_row(&mut h, 0);
+    click_row(&mut h, 0);
+    assert_eq!(session(h.state()).loop_finder.selected, None);
+    h.key_press(Key::Enter);
+    h.run();
+    let s = session(h.state());
+    assert_eq!(s.history.cursor(), cursor, "the history is unchanged");
+    assert_eq!(s.shown_edit(), s.edit());
+}
+
+#[test]
 fn enter_applies_the_selected_row() {
     let mut h = harness();
     find_loops(&mut h);
@@ -589,6 +613,267 @@ fn end_preview_leaves_a_marker_drag_alone() {
         Some(&dragged),
         "only a candidate preview ends"
     );
+}
+
+// Changing the loop mode after a search.
+
+/// Sets the loop mode of the current edit, as one history entry.
+fn set_mode(h: &mut Harness<'static, LimewaveApp>, mode: LoopMode) {
+    let s = session(h.state());
+    let e = EditState {
+        loop_mode: mode,
+        loop_start: 10_000,
+        loop_end: 100_000,
+        ..s.edit().clone()
+    };
+    session_mut(h.state_mut()).apply(e, None);
+    h.run();
+}
+
+#[test]
+fn a_result_is_unusable_once_the_loop_mode_plays_the_other_way() {
+    let mut h = harness();
+    find_loops(&mut h);
+    let c = candidate(session(h.state()), 0);
+    let label = row_label(1, &c);
+    const MODE_TEXT: &str = "The loop mode has changed. Search again.";
+
+    set_mode(&mut h, LoopMode::Backward);
+    let s = session(h.state());
+    assert!(direction_changed(s), "a forward result for a backward loop");
+    assert_eq!(candidate_edit(s, &c), None);
+    assert!(overlay_brackets(s).is_empty(), "no brackets");
+    h.get_by_label(MODE_TEXT);
+    assert!(
+        h.get_by_label(&label).accesskit_node().is_disabled(),
+        "the list is drawn disabled"
+    );
+    h.get_by_label(&label).click();
+    h.run();
+    let s = session(h.state());
+    assert_eq!(s.shown_edit(), s.edit(), "nothing previews");
+    assert!(use_loop_disabled(&h), "Use loop stays disabled");
+
+    set_mode(&mut h, LoopMode::Forward);
+    let s = session(h.state());
+    assert!(!direction_changed(s), "forward again");
+    assert!(candidate_edit(s, &c).is_some());
+    assert!(!overlay_brackets(s).is_empty());
+    assert!(h.query_by_label(MODE_TEXT).is_none());
+    click_row(&mut h, 0);
+    assert!(!use_loop_disabled(&h), "usable again");
+
+    set_mode(&mut h, LoopMode::PingPong);
+    let s = session(h.state());
+    assert!(direction_changed(s), "no result suits ping-pong");
+    assert_eq!(candidate_edit(s, &c), None);
+    assert!(overlay_brackets(s).is_empty());
+    h.get_by_label(MODE_TEXT);
+}
+
+#[test]
+fn the_stale_message_comes_before_the_mode_message() {
+    let mut h = harness();
+    find_loops(&mut h);
+    set_mode(&mut h, LoopMode::Backward);
+    assert!(session_mut(h.state_mut()).apply_effect(Effect::Gain { db: -6.0 }, None, None));
+    h.run();
+    h.get_by_label("The sound has changed. Search again.");
+    assert!(
+        h.query_by_label("The loop mode has changed. Search again.")
+            .is_none()
+    );
+}
+
+// Edits while a candidate is previewed start from the candidate.
+
+/// Presses at `from`, moves in steps to `to` and releases, as on the waveform.
+fn drag(h: &mut Harness<'static, LimewaveApp>, from: Pos2, to: Pos2) {
+    h.hover_at(from);
+    h.step();
+    h.drag_at(from);
+    h.step();
+    for i in 1..=4 {
+        h.hover_at(from + (to - from) * (i as f32 / 4.0));
+        h.step();
+    }
+    h.drop_at(to);
+    h.step();
+}
+
+/// Previews candidate 0 by clicking its row, checking that its loop end differs from the
+/// current one. Returns the candidate and the history cursor before.
+fn preview_first(h: &mut Harness<'static, LimewaveApp>) -> (LoopCandidate, usize) {
+    find_loops(h);
+    let s = session(h.state());
+    let c = candidate(s, 0);
+    let cursor = s.history.cursor();
+    assert_ne!(
+        s.edit().loop_end,
+        c.loop_end,
+        "the candidate moves the loop end"
+    );
+    assert_ne!(s.edit().loop_start, c.loop_start);
+    click_row(h, 0);
+    assert_eq!(session(h.state()).loop_finder.selected, Some(0));
+    (c, cursor)
+}
+
+/// Checks that one edit landed, keeping the candidate's loop end and ending the preview.
+fn kept_the_candidate_end(h: &Harness<'static, LimewaveApp>, c: &LoopCandidate, cursor: usize) {
+    let s = session(h.state());
+    assert_eq!(
+        s.edit().loop_end,
+        c.loop_end,
+        "the candidate's loop end is kept"
+    );
+    assert_ne!(s.edit().loop_start, c.loop_start, "the loop start moved");
+    assert_eq!(s.edit().loop_mode, LoopMode::Forward);
+    assert_eq!(s.history.cursor(), cursor + 1, "one history entry");
+    assert_eq!(s.preview, None);
+    assert_eq!(
+        s.loop_finder.selected, None,
+        "the row is no longer selected"
+    );
+}
+
+#[test]
+fn a_marker_drag_during_a_preview_starts_from_the_candidate() {
+    let mut h = harness();
+    let (c, cursor) = preview_first(&mut h);
+    let rect = h.get_by_label("Main view").rect();
+    let s = session(h.state());
+    let from = flag_hit_point(rect, &s.view.unwrap(), s.shown_edit(), Marker::LoopStart);
+    drag(&mut h, from, from + vec2(25.0, 0.0));
+    h.run();
+    kept_the_candidate_end(&h, &c, cursor);
+    assert!(
+        session(h.state()).edit().loop_start > c.loop_start,
+        "dragged later"
+    );
+}
+
+#[test]
+fn a_seam_nudge_during_a_preview_starts_from_the_candidate() {
+    let mut h = harness();
+    let (c, cursor) = preview_first(&mut h);
+    // The seam view lists the loop start buttons first.
+    h.get_all_by_label("+1").next().unwrap().click();
+    h.run();
+    kept_the_candidate_end(&h, &c, cursor);
+    assert_eq!(session(h.state()).edit().loop_start, c.loop_start + 1);
+}
+
+#[test]
+fn a_loop_mode_button_during_a_preview_keeps_the_candidate_loop() {
+    let mut h = harness();
+    let (c, cursor) = preview_first(&mut h);
+    h.get_by_label("Backward").click();
+    h.run();
+    let s = session(h.state());
+    assert_eq!(s.edit().loop_mode, LoopMode::Backward);
+    assert_eq!(
+        (s.edit().loop_start, s.edit().loop_end),
+        (c.loop_start, c.loop_end),
+        "the loop the user saw"
+    );
+    assert_eq!(s.history.cursor(), cursor + 1, "one history entry");
+    assert_eq!(s.preview, None);
+}
+
+// Switching files.
+
+#[test]
+fn switching_files_ends_the_preview() {
+    let mut app = LimewaveApp::for_test();
+    let session_for = |name: &str, seed: u64| {
+        let channels = [repeated_noise(seed), repeated_noise(seed + 1)];
+        let bytes = wav_bytes(&channels, RATE, SampleFormat::Int { bits: 16 }, Vec::new());
+        let doc = load_wav_bytes(PathBuf::from(name), &bytes).unwrap();
+        FileEntry::Loaded(Box::new(Session::new(doc)))
+    };
+    app.files = vec![session_for("a.wav", 1), session_for("b.wav", 3)];
+    app.select(0);
+    let mut h = Harness::builder()
+        .with_size(vec2(1100.0, 860.0))
+        .with_step_dt(0.25)
+        .allow_missing_glyphs()
+        .build_ui_state(|ui, app: &mut LimewaveApp| app.show(ui), app);
+    h.run();
+    search(&mut h);
+    preview_candidate(session_mut(h.state_mut()), 0, None);
+    h.run();
+    assert!(session(h.state()).preview.is_some());
+
+    h.state_mut().select(1);
+    h.run();
+    h.state_mut().select(0);
+    h.run();
+    let s = session(h.state());
+    assert_eq!(
+        s.preview, None,
+        "the preview stayed with the file it was shown on"
+    );
+    assert_eq!(s.shown_edit(), s.edit());
+    assert_eq!(s.loop_finder.selected, None);
+}
+
+// The copy the worker searches.
+
+#[test]
+fn searching_a_copy_of_the_span_finds_what_the_whole_file_does() {
+    let rate = 8_000;
+    let frames = 40 * rate as usize;
+    let mut r = SplitMix64::new(9);
+    let noise: Vec<f32> = (0..frames).map(|_| r.next_f32() - 0.5).collect();
+    let tone = sine(220.0, rate, frames, 0.3);
+    let mixed: Vec<f32> = noise.iter().zip(&tone).map(|(n, t)| n + t).collect();
+    let mut h = harness_for(&[mixed], rate);
+    let selection = (10 * rate as usize, 18 * rate as usize);
+    // Without a kept end, and with one past the selection.
+    for keep_end in [None, Some(25 * rate as usize)] {
+        if let Some(end) = keep_end {
+            let s = session(h.state());
+            let looped = EditState {
+                loop_mode: LoopMode::Forward,
+                loop_start: 1_000,
+                loop_end: end,
+                ..s.edit().clone()
+            };
+            session_mut(h.state_mut()).apply(looped, None);
+            h.run();
+        }
+        let prefs = FinderPrefs {
+            keep_end: keep_end.is_some(),
+            ..FinderPrefs::default()
+        };
+        let key = h.state().render_key(0).unwrap();
+        let ctx = h.ctx.clone();
+        start_search(
+            session_mut(h.state_mut()),
+            &prefs,
+            Some(selection),
+            key,
+            &ctx,
+        );
+        settle(&mut h);
+        let s = session(h.state());
+        let e = s.edit();
+        let range = search_range(&s.processed, rate, Some(selection), (e.start, e.end)).unwrap();
+        let settings = FinderSettings {
+            range: (range.first, range.last),
+            keep_end,
+            min_len: (prefs.min_s * f64::from(rate)).round() as usize,
+            max_len: None,
+            preference: prefs.preference,
+            direction: Direction::Forward,
+            max_candidates: MAX_CANDIDATES,
+        };
+        let whole = find_in(&s.processed, rate, &settings, &AtomicBool::new(false));
+        let result = s.loop_finder.result.as_ref().expect("a result");
+        assert!(whole.as_ref().is_ok_and(|c| !c.is_empty()), "{whole:?}");
+        assert_eq!(result.outcome, whole, "keep end {keep_end:?}");
+    }
 }
 
 // The overlay on the waveform and the overview.
