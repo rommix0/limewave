@@ -36,7 +36,7 @@ pub enum FinderError {
     RangeTooShort,
     /// The selection is longer than [`MAX_SEARCH_SECONDS`].
     RangeTooLong,
-    /// The settings are not usable (for example a minimum length longer than the range).
+    /// The settings are not usable (for example a minimum length longer than the maximum).
     BadSettings,
     /// The search was cancelled before it finished.
     Cancelled,
@@ -116,10 +116,11 @@ const PERIOD_THRESHOLD: f32 = 0.6;
 /// # Errors
 ///
 /// - [`FinderError::BadSettings`]: `min_len` is longer than `max_len`, there are no candidates
-///   to return, `preference` is not a number, or `keep_end` lies outside the audio.
+///   to return, `preference` is not a number, or `keep_end` lies outside audio that is not
+///   empty.
 /// - [`FinderError::RangeTooLong`]: the range is longer than [`MAX_SEARCH_SECONDS`].
-/// - [`FinderError::RangeTooShort`]: the range, or the span up to a kept end, is shorter than
-///   `min_len` or one tone frame.
+/// - [`FinderError::RangeTooShort`]: the audio is empty, or the range, or the span up to a kept
+///   end, is shorter than `min_len` or one tone frame.
 /// - [`FinderError::Silent`]: the range is silent.
 /// - [`FinderError::Cancelled`]: `cancel` was set.
 pub fn find_loops(
@@ -133,7 +134,7 @@ pub fn find_loops(
     if settings.min_len > max_len
         || settings.max_candidates == 0
         || !settings.preference.is_finite()
-        || settings.keep_end.is_some_and(|e| e >= len)
+        || (len > 0 && settings.keep_end.is_some_and(|e| e >= len))
     {
         return Err(FinderError::BadSettings);
     }
@@ -210,6 +211,14 @@ pub fn find_loops(
     ))
 }
 
+/// How far before the range, and after the range or a kept end, [`find_loops`] reads the audio,
+/// in frames: a tone frame and the correlation context, and at least 8,192. A copy of the audio
+/// from `range.0 − margin` to `max(range.1, keep_end) + margin`, with the frame positions
+/// shifted to match, gives the same candidates as the whole audio.
+pub fn context_margin(rate: u32) -> usize {
+    (2 * tone_frame(rate) + search::CONTEXT).max(8_192)
+}
+
 /// The most the length preference can change a score, at full preference and a loop as long as
 /// the range.
 const LENGTH_CREDIT: f32 = 0.15;
@@ -228,11 +237,14 @@ const SAME_START_S: f64 = 0.050;
 /// Ranks candidates best first and drops the redundant ones.
 ///
 /// - The score becomes `score − 0.15 · (preference − 0.5) · 2 · (len / range_len)`, so 0.5 is
-///   neutral, and candidates sort ascending by it. Ties go to the earlier start, then the
-///   shorter length.
+///   neutral.
+/// - Candidates sort by quality word first (Seamless, Good, Fair, Rough), then ascending by
+///   score, so the preference only orders seams of the same word. Ties go to the earlier
+///   start, then the shorter length.
 /// - A candidate whose length is a whole multiple (two or more) of a [`Quality::Seamless`] or
-///   [`Quality::Good`] candidate's moves to directly after it (whatever the preference), unless
-///   its quality word is strictly better. A Fair or Rough base pulls nothing below it.
+///   [`Quality::Good`] candidate's, ranked above that base with a word no better, moves to
+///   directly after it (whatever the preference). A multiple only ever moves down: one already
+///   below its base keeps its place, and a Fair or Rough base pulls nothing below it.
 /// - Of two candidates that are the same loop (lengths within 1 % and either starts within
 ///   50 ms or both [`Quality::Seamless`]) only the better is kept.
 /// - Then the list is cut to `keep`.
@@ -248,8 +260,9 @@ fn rank(
         c.score -= LENGTH_CREDIT * (preference - 0.5) * 2.0 * share;
     }
     found.sort_by(|a, b| {
-        a.score
-            .total_cmp(&b.score)
+        a.quality
+            .cmp(&b.quality)
+            .then(a.score.total_cmp(&b.score))
             .then(a.loop_start.cmp(&b.loop_start))
             .then(a.len().cmp(&b.len()))
     });
@@ -282,24 +295,28 @@ fn is_multiple(long: usize, short: usize) -> bool {
     k >= 2.0 && (long as f64 - k * short as f64).abs() <= MULTIPLE_TOLERANCE * long as f64
 }
 
-/// `sorted` with each whole multiple of another candidate moved to directly after its base:
-/// the first candidate, in order, it is a multiple of whose [`Quality`] word is no worse than its
-/// own and is [`Quality::Seamless`] or [`Quality::Good`].
+/// `sorted` with each whole multiple of another candidate that ranks above its base moved to
+/// directly after that base. The base is the first candidate, in order, it is a multiple of
+/// whose [`Quality`] word is no worse than its own and is [`Quality::Seamless`] or
+/// [`Quality::Good`]; a multiple already below that base keeps its place.
 ///
 /// - The words are compared, not the scores, so neither the preference nor unhearable
 ///   differences between two passes of the same repeat can separate them.
 /// - Only a genuine repeat is a base: a Fair or Rough loop is not one, so a multiple of its length
 ///   is a different loop that happens to be that long, and keeps its place.
+/// - A multiple only ever moves down, so it never passes a candidate it was below.
 /// - Several multiples of one base keep their order, each followed by its own multiples.
 fn after_their_bases(sorted: Vec<LoopCandidate>) -> Vec<LoopCandidate> {
     let base_of: Vec<Option<usize>> = (0..sorted.len())
         .map(|i| {
-            (0..sorted.len()).find(|&j| {
-                j != i
-                    && is_multiple(sorted[i].len(), sorted[j].len())
-                    && sorted[j].quality <= Quality::Good
-                    && sorted[i].quality >= sorted[j].quality
-            })
+            (0..sorted.len())
+                .find(|&j| {
+                    j != i
+                        && is_multiple(sorted[i].len(), sorted[j].len())
+                        && sorted[j].quality <= Quality::Good
+                        && sorted[i].quality >= sorted[j].quality
+                })
+                .filter(|&j| j > i)
         })
         .collect();
     let mut order = Vec::with_capacity(sorted.len());
@@ -517,6 +534,21 @@ mod tests {
     }
 
     #[test]
+    fn empty_audio_is_too_short() {
+        for audio in [Vec::new(), vec![Vec::new(), Vec::new()]] {
+            for keep_end in [None, Some(0), Some(1_000)] {
+                let s = settings((0, 1_000), keep_end);
+                assert_eq!(
+                    run(&audio, &s),
+                    Err(FinderError::RangeTooShort),
+                    "{} channels, {keep_end:?}",
+                    audio.len()
+                );
+            }
+        }
+    }
+
+    #[test]
     fn backward_keep_end() {
         let a = reversed(&faded_repeat());
         let len = a[0].len();
@@ -597,12 +629,62 @@ mod tests {
         for word in [Quality::Fair, Quality::Rough] {
             let weak_base = vec![
                 cand(0, 2 * t, 4.0, word),
-                cand(5_000, x, 5.0, Quality::Rough),
+                cand(5_000, x, 5.0, word),
                 cand(0, t, 6.0, word),
             ];
             let ranked = rank(weak_base, 0.5, 100_000, 8, RATE);
             assert_eq!(lens(&ranked), [2 * t, x, t], "{word:?}");
         }
+    }
+
+    #[test]
+    fn a_multiple_already_below_its_base_stays_put() {
+        let (t, x) = (10_000, 7_000);
+        // The doubled loop is Good like its base but scores worse than x, so it stays below x.
+        let found = vec![
+            cand(0, t, 0.1, Quality::Good),
+            cand(5_000, x, 0.2, Quality::Good),
+            cand(0, 2 * t, 0.3, Quality::Good),
+        ];
+        assert_eq!(lens(&rank(found, 0.5, 100_000, 8, RATE)), [t, x, 2 * t]);
+    }
+
+    #[test]
+    fn a_fair_candidate_never_ranks_above_a_good_one() {
+        // However much better its score, even with the preference crediting its length.
+        for preference in [0.0, 0.5, 1.0] {
+            let found = vec![
+                cand(0, 60_000, 0.01, Quality::Fair),
+                cand(20_000, 7_000, 0.9, Quality::Good),
+                cand(40_000, 9_000, 0.02, Quality::Rough),
+                cand(50_000, 8_000, 0.5, Quality::Seamless),
+            ];
+            let ranked = rank(found, preference, 100_000, 8, RATE);
+            let words: Vec<Quality> = ranked.iter().map(|c| c.quality).collect();
+            assert_eq!(
+                words,
+                [
+                    Quality::Seamless,
+                    Quality::Good,
+                    Quality::Fair,
+                    Quality::Rough
+                ],
+                "preference {preference}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rough_multiple_does_not_jump_above_good_candidates() {
+        let (t, y, z) = (10_000, 7_000, 13_000);
+        let found = vec![
+            cand(0, t, 0.3, Quality::Good),
+            cand(20_000, y, 0.4, Quality::Good),
+            cand(40_000, z, 0.1, Quality::Fair),
+            // Twice the first loop's length, with the best score of all.
+            cand(60_000, 2 * t, 0.05, Quality::Rough),
+        ];
+        assert_eq!(lens(&rank(found, 0.5, 100_000, 8, RATE)), [t, y, z, 2 * t]);
     }
 
     #[test]
@@ -656,7 +738,7 @@ mod tests {
     #[test]
     fn ties_go_to_the_earlier_start_then_the_shorter_loop() {
         let found = vec![
-            cand(9_000, 6_000, 0.2, Quality::Good),
+            cand(9_000, 6_000, 0.2, Quality::Fair),
             cand(1_000, 25_000, 0.2, Quality::Fair),
             cand(1_000, 8_000, 0.2, Quality::Fair),
         ];

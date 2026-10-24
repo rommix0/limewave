@@ -19,7 +19,7 @@ use super::measure::{
 use super::{FinderError, LoopCandidate, MAX_SEARCH_SECONDS};
 
 /// How many frames either side of the kept point the reference spans, at most.
-const CONTEXT: usize = 1_024;
+pub(super) const CONTEXT: usize = 1_024;
 
 /// The most positions [`starts_for_end`] and [`ends_for_start`] return.
 const MAX_PICKS: usize = 48;
