@@ -17,6 +17,7 @@ use limewave_core::dsp::{
 use limewave_core::edit::{EditState, LoopMode, Marker, move_marker};
 
 use super::coords::{ViewTransform, flag_rect, hit_marker, pick_marker};
+use super::loop_finder;
 use super::spectrogram::{self, Picture, draw_lanes, picture_for};
 use crate::app::{Session, UiState, ViewMode};
 use crate::audio::engine::{AudioEngine, Cursor};
@@ -777,6 +778,7 @@ fn draw(
         painter.rect_filled(region, 0.0, with_alpha(colors::LOOP, 26));
         draw_crossfade(painter, lanes, view, e);
     }
+    loop_finder::draw_finder_overlay(painter, lanes, x_of, s);
 
     draw_ruler(painter, rect, view, s.rate(), ruler_color);
 

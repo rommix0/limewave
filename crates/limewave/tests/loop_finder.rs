@@ -8,8 +8,8 @@ use egui_kittest::Harness;
 use egui_kittest::kittest::{NodeT, Queryable};
 use limewave::app::{FileEntry, LimewaveApp, Session};
 use limewave::ui::loop_finder::{
-    FinderPrefs, candidate_edit, end_preview, is_searching, is_stale, preview_candidate,
-    start_search, use_candidate,
+    FinderPrefs, candidate_edit, end_preview, is_searching, is_stale, overlay_brackets,
+    preview_candidate, start_search, use_candidate,
 };
 use limewave_core::dsp::rng::SplitMix64;
 use limewave_core::edit::{EditState, LoopMode};
@@ -588,5 +588,53 @@ fn end_preview_leaves_a_marker_drag_alone() {
         session(h.state()).preview.as_ref(),
         Some(&dragged),
         "only a candidate preview ends"
+    );
+}
+
+// The overlay on the waveform and the overview.
+
+#[test]
+fn brackets_follow_results() {
+    let mut h = harness();
+    assert!(
+        overlay_brackets(session(h.state())).is_empty(),
+        "none before a search"
+    );
+
+    search(&mut h);
+    let s = session(h.state());
+    let candidates = s
+        .loop_finder
+        .result
+        .as_ref()
+        .unwrap()
+        .outcome
+        .as_ref()
+        .unwrap()
+        .clone();
+    assert!(!candidates.is_empty());
+    let spans = overlay_brackets(s);
+    assert_eq!(spans.len(), candidates.len(), "one per candidate");
+    for (span, c) in spans.iter().zip(&candidates) {
+        assert_eq!((span.0, span.1), (c.loop_start, c.loop_end));
+    }
+    assert!(spans.iter().all(|span| !span.2), "none selected yet");
+
+    preview_candidate(session_mut(h.state_mut()), 1, None);
+    h.run();
+    let spans = overlay_brackets(session(h.state()));
+    let flagged: Vec<usize> = spans
+        .iter()
+        .enumerate()
+        .filter(|(_, span)| span.2)
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(flagged, vec![1], "the previewed candidate is flagged");
+
+    assert!(session_mut(h.state_mut()).apply_effect(Effect::Gain { db: -6.0 }, None, None));
+    h.run();
+    assert!(
+        overlay_brackets(session(h.state())).is_empty(),
+        "none once the result is stale"
     );
 }

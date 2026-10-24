@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use eframe::egui::text::CCursor;
 use eframe::egui::{
     self, Button, Checkbox, Color32, DragValue, EventFilter, Key, Modifiers, Rect, Role,
-    ScrollArea, Sense, Slider, StrokeKind, TextStyle, WidgetInfo, pos2, vec2,
+    ScrollArea, Sense, Slider, Stroke, StrokeKind, TextStyle, WidgetInfo, pos2, vec2,
 };
 use limewave_core::edit::{EditState, LoopMode};
 use limewave_core::loop_finder::measure::{FAIR, GOOD};
@@ -20,6 +20,7 @@ use limewave_core::loop_finder::{
 use crate::app::{Session, UiState};
 use crate::audio::engine::AudioEngine;
 use crate::render_worker::{RenderJob, RenderKey, spawn_render};
+use crate::theme::colors;
 
 /// The finder's settings: global, not per file, and remembered between runs.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -251,6 +252,72 @@ pub fn is_stale(s: &Session) -> bool {
         .result
         .as_ref()
         .is_some_and(|r| r.audio_version != s.audio_version)
+}
+
+/// The spans to bracket on the waveform: each candidate's `loop_start..=loop_end`, with whether
+/// it is the selected one. Empty without a result, with a stale one, or when the search found
+/// no loops.
+pub fn overlay_brackets(s: &Session) -> Vec<(usize, usize, bool)> {
+    if is_stale(s) {
+        return Vec::new();
+    }
+    let Some(Ok(candidates)) = s.loop_finder.result.as_ref().map(|r| &r.outcome) else {
+        return Vec::new();
+    };
+    candidates
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (c.loop_start, c.loop_end, s.loop_finder.selected == Some(i)))
+        .collect()
+}
+
+/// Paints the searched range as a faint band over `rect` and each candidate as a thin bracket
+/// in its top 6 px, the selected one brighter and thicker. `frame_to_x` maps a frame to the
+/// x of `painter`'s space. Draws nothing unless the result is current and found loops.
+pub fn draw_finder_overlay(
+    painter: &egui::Painter,
+    rect: Rect,
+    frame_to_x: impl Fn(usize) -> f32,
+    s: &Session,
+) {
+    let brackets = overlay_brackets(s);
+    let Some(result) = s
+        .loop_finder
+        .result
+        .as_ref()
+        .filter(|_| !brackets.is_empty())
+    else {
+        return;
+    };
+    let alpha = |a: u8| {
+        Color32::from_rgba_unmultiplied(colors::LOOP.r(), colors::LOOP.g(), colors::LOOP.b(), a)
+    };
+    let clamp_x = |f: usize| frame_to_x(f).clamp(rect.left(), rect.right());
+    let band = Rect::from_x_y_ranges(
+        clamp_x(result.range.first)..=clamp_x(result.range.last + 1),
+        rect.y_range(),
+    );
+    painter.rect_filled(band, 0.0, alpha(12));
+
+    const DEPTH: f32 = 6.0;
+    // Selected last, so it sits over the others.
+    for selected in [false, true] {
+        let stroke = if selected {
+            Stroke::new(2.0, alpha(220))
+        } else {
+            Stroke::new(1.0, alpha(70))
+        };
+        for &(first, last, _) in brackets.iter().filter(|b| b.2 == selected) {
+            let (x0, x1) = (frame_to_x(first), frame_to_x(last + 1));
+            if x1 < rect.left() || x0 > rect.right() {
+                continue;
+            }
+            let (top, foot) = (rect.top() + 1.0, rect.top() + DEPTH);
+            painter.line_segment([pos2(x0, top), pos2(x1, top)], stroke);
+            painter.line_segment([pos2(x0, top), pos2(x0, foot)], stroke);
+            painter.line_segment([pos2(x1, top), pos2(x1, foot)], stroke);
+        }
+    }
 }
 
 /// The current edit with `c`'s loop points: a loop that was Off turns Forward, and the

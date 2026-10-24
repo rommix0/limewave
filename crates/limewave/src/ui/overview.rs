@@ -177,6 +177,7 @@ pub fn overview(ui: &mut egui::Ui, s: &mut Session, cursors: &[Cursor]) {
         marker(e.loop_start, colors::LOOP);
         marker(e.loop_end, colors::LOOP);
     }
+    super::loop_finder::draw_finder_overlay(&painter, rect, x_of, s);
     marker(e.start, colors::START);
     marker(e.end, colors::END);
 
