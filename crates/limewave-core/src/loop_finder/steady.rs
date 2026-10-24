@@ -2,7 +2,7 @@
 //! part found from the level envelope.
 
 use super::{FinderError, MAX_SEARCH_SECONDS};
-use crate::dsp::envelope::{level_db, rms_db_frames};
+use crate::dsp::envelope::{SILENCE_DB, level_db, rms_db_frames};
 
 /// Length of the level steps, in seconds.
 const STEP_S: f64 = 0.050;
@@ -62,11 +62,13 @@ fn running_median(levels: &[f32], half: usize) -> Vec<f32> {
         .collect()
 }
 
-/// The middle 60 % of `len` (non-zero) frames, the fallback when nothing is steady.
-fn middle_range(len: usize) -> SearchRange {
+/// The middle 60 % of the first `len` (non-zero) frames, the fallback when nothing is steady.
+/// It never reaches past `audible_end`, so a quiet tail cannot push it into silence.
+fn middle_range(len: usize, audible_end: usize) -> SearchRange {
+    let last = (len * 4 / 5).min(len - 1).min(audible_end - 1);
     SearchRange {
-        first: len / 5,
-        last: (len * 4 / 5).min(len - 1),
+        first: (len / 5).min(last),
+        last,
         kind: RangeKind::NoSteadyPart,
     }
 }
@@ -77,7 +79,8 @@ fn range_is_silent(audio: &[Vec<f32>], rate: u32, first: usize, last: usize) -> 
     let hop = ((f64::from(rate) * STEP_S) as usize).max(1);
     let levels = rms_db_frames(audio, first, last, hop);
     let tail = first + levels.len() * hop;
-    levels.iter().all(|&d| d < SILENT_DB) && level_db(audio, tail, last) < SILENT_DB
+    levels.iter().all(|&d| d < SILENT_DB)
+        && (tail > last || level_db(audio, tail, last) < SILENT_DB)
 }
 
 /// The steady part of the sound: where the level has settled after the attack and before the
@@ -99,11 +102,22 @@ pub fn steady_range(audio: &[Vec<f32>], rate: u32) -> Option<SearchRange> {
     let levels = rms_db_frames(audio, 0, len - 1, hop);
     if levels.is_empty() {
         // Shorter than one step: nothing to measure, so only silence can be ruled out.
-        return (level_db(audio, 0, len - 1) >= SILENT_DB).then(|| middle_range(len));
+        return (level_db(audio, 0, len - 1) >= SILENT_DB).then(|| middle_range(len, len));
     }
     // Trailing silence is not part of the sound: it would drag the reference down and read as
     // steady itself. No audible step at all is silence.
     let audible = levels.iter().rposition(|&d| d >= SILENT_DB)? + 1;
+    // The fallback is based on the sound up to its last non-zero step, so a long decay below
+    // -120 dB still counts as sound, but exact silence after it does not.
+    let sounding = levels
+        .iter()
+        .rposition(|&d| d > SILENCE_DB)
+        .map_or(audible, |i| i + 1);
+    let sounding_len = if sounding == levels.len() {
+        len
+    } else {
+        sounding * hop
+    };
     let levels = &levels[..audible];
 
     let mut second_half = levels[levels.len() / 2..].to_vec();
@@ -132,7 +146,7 @@ pub fn steady_range(audio: &[Vec<f32>], rate: u32) -> Option<SearchRange> {
             last: (end + 1) * hop - 1,
             kind: RangeKind::Steady,
         },
-        None => middle_range(len),
+        None => middle_range(sounding_len, audible * hop),
     })
 }
 
@@ -236,6 +250,20 @@ mod tests {
     }
 
     #[test]
+    fn a_decay_followed_by_silence_still_has_a_range() {
+        let mut rng = SplitMix64::new(6);
+        let mut x = db_ramp(&mut rng, 2.0, 0.0, -120.0);
+        x.extend(vec![0.0; 8 * 44_100]);
+        let len = x.len();
+        let audio = [x];
+        let r = steady_range(&audio, RATE).expect("sound");
+        assert_eq!(r.kind, RangeKind::NoSteadyPart);
+        assert!(r.first <= r.last && r.last < 88_200, "{r:?}");
+        let r = search_range(&audio, RATE, None, (0, len - 1)).expect("audible");
+        assert_eq!(r.kind, RangeKind::NoSteadyPart);
+    }
+
+    #[test]
     fn a_silent_selection_is_refused() {
         let mut rng = SplitMix64::new(5);
         let mut x = db_ramp(&mut rng, 1.0, 0.0, 0.0);
@@ -244,6 +272,11 @@ mod tests {
         let trim = (0, 88_199);
         assert_eq!(
             search_range(&audio, RATE, Some((50_000, 80_000)), trim),
+            Err(FinderError::Silent)
+        );
+        // Exactly one step, and silent.
+        assert_eq!(
+            search_range(&audio, RATE, Some((50_000, 52_204)), trim),
             Err(FinderError::Silent)
         );
         // Shorter than one step, and silent.
