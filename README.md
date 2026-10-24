@@ -6,7 +6,7 @@ this is an early release, and made with the assistance of Claude. If you notice 
 
 Limewave is an open-source loop and one-shot WAV sample editor, written in Rust. Open a WAV file or a folder of them, set the loop points, root key and fine tune by hand, listen to the result while you edit, and save files that samplers read correctly. It runs on Windows, macOS and Linux.
 
-What it does in version 0.7:
+What it does in version 0.8:
 
 - Reads and writes PCM (8/16/24/32-bit) and 32/64-bit float WAV files, mono or stereo, at any sample rate.
 - **New…** (toolbar): creates a blank, silent sample to draw on. Choose the length (in milliseconds or frames, up to 600 seconds), the sample rate, mono or stereo, the bit depth (16-bit, 24-bit or 32-bit float) and the root key, and whether to loop the whole file. **One cycle of** a note (such as A4) sets the length to one cycle of that note, the root key to the note and the loop to the whole file, and shows how many cents off the whole-frame cycle is. Creating a sample turns **Draw** on. The new file is called Untitled 1, 2 and so on, and counts as unsaved until you save it.
@@ -14,6 +14,7 @@ What it does in version 0.7:
 - Reads the loop, root key and fine tune stored in the file's `smpl` chunk. Forward, ping-pong and backward loops are supported.
 - Waveform view with zoom, scroll and an overview strip; draggable Start, Loop start, Loop end and End markers with optional zero-crossing snap. Drag a marker by its label as well as its line, or double-click the label to type an exact frame.
 - **Waveform | Spectrogram** (switch above the main view): the spectrogram shows how the sound's frequencies change over time, in lime on a dark background, on a musical axis that runs from C1 up to half the sample rate (the highest frequency the file can hold), with a label at every C. Brightness is level in dB, down to a floor of -90 dB. It is computed in the background, and the waveform stays on screen until the picture is ready. Markers, selections, the play-from point, zoom and scroll work exactly as they do on the waveform. The overview and the seam view stay waveforms, and turning **Draw** on switches back to the waveform. Individual samples cannot be grabbed in the spectrogram when zoomed in, since that is a waveform edit. The choice is remembered between runs.
+- **Loop finder** (a panel beside the seam view): **Find loops** searches for places where the sound can loop without a seam. It searches the selection, or the steady part of the sound when nothing is selected, up to 60 s: a longer steady part is searched over its last 60 s, and a longer selection is refused with a message. **Keep loop end** holds the loop end where it is and looks only for a better start. **Shortest** and **Longest** (in seconds; Longest is "no limit" by default) bound the loop length, and **Tight ↔ Natural** trades the tightest join against a loop that follows the sound's own cycle. A range line says what was searched, and a faint band marks that range on the waveform and the overview. The search runs in the background, with **Cancel**. Up to 8 candidates are listed, each as rank, length in seconds and frames, start and end, and a quality word (Seamless, Good, Fair or Rough), with a hover that gives the measures in plain words; faint brackets on the waveform and the overview show where they sit. Click a row to preview that loop (click it again, or press Escape, to end the preview), then double-click it, press Enter or press **Use loop** to apply it as one undo step. Forward and backward loops are found; ping-pong is not. When the sound changes, the list greys out and asks you to search again. To try it from the command line, see `loop_lab` under Building and running.
 - A seam view that overlays the audio before the loop end on the audio after the loop start, so you can see a bad splice before you hear it, with nudge buttons and a "lock length" option.
 - Loop crossfade (equal-power or linear), previewed live and rendered into the audio on save. Crossfade is switched off for backward loops.
 - Selection and the **Edit** menu: drag on the waveform to select (Shift-click extends an existing selection, or makes one from the play-from point), then play the selection, set the loop to the selection, or set Start and End to the selection. **Crop to selection** removes the audio outside the selection right away (undoable); a loop crossing its edges is clipped to it. **Trim after loop end** and **Crop to loop** set the trims from the loop points, with an adjustable padding.
@@ -52,6 +53,14 @@ cargo run --release -p limewave-core --example tail_lab -- <file.wav> --cut <sec
 ```
 
 It also prints the join, level and wave-shape measurements for each tail, and the render time.
+
+To try the loop finder on a real sample from the command line, without the app, use the `loop_lab` bench:
+
+```
+cargo run --release -p limewave-core --example loop_lab -- <file.wav> [--keep-end <frame>] [--range <first> <last>] [--min <s>] [--max <s>] [--preference <0..1>] [--out <dir>]
+```
+
+It prints the candidates with their measures (and the file's stored loop, if it has one) and the search time, and writes `candidate_<n>.wav` (and `stored.wav`) listening files into `target/loop-lab/<name>/`. Each has one second of lead-in, then three passes of the loop.
 
 On Linux, install the development packages for audio, MIDI and the window system first. On Debian and Ubuntu:
 
@@ -196,8 +205,7 @@ This writes three 48 kHz, 16-bit mono files, each with root note 69 (A4): `sine_
 
 1. **Pitch detection:** detect the root key and fine tune, with octave fixes and root keys read from file names.
 2. **Classifier:** tell one-shots, truncated samples, sustained sounds and rhythmic material apart, and suggest sensible editor defaults.
-3. **Auto loop finder:** ranked loop candidates found from self-similarity and refined at sample level, shown beside the seam view.
-4. **Beat slicing:** cut rhythmic loops into hits at detected onsets, with a rendered tail for each slice.
+3. **Beat slicing:** cut rhythmic loops into hits at detected onsets, with a rendered tail for each slice.
 
 Possible later: batch processing over a folder, a command-line tool, a CLAP plugin.
 
