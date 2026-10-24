@@ -214,11 +214,6 @@ pub fn find_loops(
 /// the range.
 const LENGTH_CREDIT: f32 = 0.15;
 
-/// Seam scores closer than this count as tied when deciding whether a multiple of a loop is
-/// better than the loop. It is far below anything audible, and stops rounding noise in two equally
-/// exact repeats from putting the longer one first.
-const SCORE_TIE: f32 = 1e-3;
-
 /// How far a length may be from a whole multiple of another and still count as one.
 const MULTIPLE_TOLERANCE: f64 = 0.001;
 
@@ -235,8 +230,8 @@ const SAME_START_S: f64 = 0.050;
 /// - The score becomes `score − 0.15 · (preference − 0.5) · 2 · (len / range_len)`, so 0.5 is
 ///   neutral, and candidates sort ascending by it. Ties go to the earlier start, then the
 ///   shorter length.
-/// - A candidate whose length is a whole multiple (two or more) of another's, with a seam
-///   score no better than that one's (whatever the preference), moves to directly after it.
+/// - A candidate whose length is a whole multiple (two or more) of another's moves to directly
+///   after it (whatever the preference), unless its quality word is strictly better.
 /// - Of two candidates that are the same loop (lengths within 1 % and either starts within
 ///   50 ms or both [`Quality::Seamless`]) only the better is kept.
 /// - Then the list is cut to `keep`.
@@ -287,16 +282,17 @@ fn is_multiple(long: usize, short: usize) -> bool {
 }
 
 /// `sorted` with each whole multiple of another candidate moved to directly after its base:
-/// the first candidate, in order, it is a multiple of and whose seam it is no better than.
-/// The seam is compared, not the ranking score, so the preference cannot separate them. Several multiples
-/// of one base keep their order, each followed by its own multiples.
+/// the first candidate, in order, it is a multiple of and whose [`Quality`] word is no worse
+/// than its own. The words are compared, not the scores, so neither the preference nor
+/// unhearable differences between two passes of the same repeat can separate them. Several
+/// multiples of one base keep their order, each followed by its own multiples.
 fn after_their_bases(sorted: Vec<LoopCandidate>) -> Vec<LoopCandidate> {
     let base_of: Vec<Option<usize>> = (0..sorted.len())
         .map(|i| {
             (0..sorted.len()).find(|&j| {
                 j != i
                     && is_multiple(sorted[i].len(), sorted[j].len())
-                    && score(&sorted[i].measures) >= score(&sorted[j].measures) - SCORE_TIE
+                    && sorted[i].quality >= sorted[j].quality
             })
         })
         .collect();
@@ -560,13 +556,26 @@ mod tests {
         // The doubled loop and the tripled loop are no better than the single, so both follow it.
         let ranked = rank(worse, 0.5, 100_000, 8, RATE);
         assert_eq!(lens(&ranked), [t, 2 * t, 3 * t, x]);
+        // A strictly better word keeps the doubled loop ahead.
         let better = vec![
-            cand(0, 2 * t, 0.05, Quality::Good),
+            cand(0, 2 * t, 0.05, Quality::Seamless),
             cand(0, t, 0.1, Quality::Good),
             cand(5_000, x, 0.3, Quality::Fair),
         ];
         let ranked = rank(better, 0.5, 100_000, 8, RATE);
         assert_eq!(lens(&ranked), [2 * t, t, x]);
+        // The same word with a slightly lower seam score is no better: the doubled loop ranks
+        // directly below the single, neutral or with the preference crediting the longer loop.
+        for preference in [0.5, 1.0] {
+            let same_word = vec![
+                cand(0, 2 * t, 0.07, Quality::Good),
+                cand(0, t, 0.10, Quality::Good),
+                cand(5_000, x, 0.3, Quality::Fair),
+            ];
+            let ranked = rank(same_word, preference, 100_000, 8, RATE);
+            assert_eq!(lens(&ranked), [t, 2 * t, x], "preference {preference}");
+            assert!(ranked[1].score < ranked[0].score);
+        }
         // The preference credits the longer loop, putting its ranking score ahead of the
         // single's, but its seam is still no better, so it ranks directly below the single.
         let long_seam = vec![
