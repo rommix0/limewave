@@ -3,14 +3,19 @@
 //! A loop `s..=e` plays on from `x[e]` to `x[s]`, so it joins well where the audio around
 //! `e + 1` resembles the audio around `s`. With one point kept, the other is found by
 //! correlating the audio around the kept point with the audio around every possible position
-//! of the other, and measuring the best few.
+//! of the other, and measuring the best few. With neither kept, a coarse comparison of band
+//! levels finds the pairs of places that sound alike, and the same correlation refines each.
 
+use std::collections::BinaryHeap;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use realfft::RealFftPlanner;
 use realfft::num_complex::Complex64;
 
-use super::measure::{natural_change, quality, score, seam_measures, shortest};
+use super::measure::{
+    Bands, TONE_RANGE_DB, natural_change, quality, rms_diff_above, score, seam_measures, shortest,
+    tone_frame,
+};
 use super::{FinderError, LoopCandidate, MAX_SEARCH_SECONDS};
 
 /// How many frames either side of the kept point the reference spans, at most.
@@ -21,6 +26,16 @@ const MAX_PICKS: usize = 48;
 
 /// The closest two returned positions may be, in seconds.
 const MIN_GAP_S: f64 = 0.050;
+
+/// The coarse frames of [`whole_range`] step by a tone frame over this.
+const HOPS_PER_FRAME: usize = 4;
+
+/// How many coarse frames either side of the seam [`whole_range`] compares as well.
+const SEAM_FRAMES: usize = 4;
+
+/// Two coarse pairs within this many frames of each other in start and in lag are the same
+/// pair.
+const DISTINCT_FRAMES: usize = 8;
 
 /// The longest loop a search proposes, in frames: [`MAX_SEARCH_SECONDS`] at `rate`.
 fn max_span(rate: u32) -> usize {
@@ -87,6 +102,198 @@ pub(super) fn kept_start(
         Vec::new()
     };
     measure_all(audio, job, ends.into_iter().map(|e| (start, e)))
+}
+
+/// Candidate loops of `audio` with both points inside the range, measured as forward loops and
+/// unsorted. Their scores are the plain seam scores.
+///
+/// 1. The range becomes coarse frames, a tone frame long and a quarter of one apart, each
+///    described by its band levels.
+/// 2. Every pair of frames `(i, i + L)` with `L` hops within the length limits is compared: the
+///    RMS band-level difference, averaged over the frames up to 4 either side of the seam. The
+///    walk goes one lag diagonal at a time, so memory grows with the frame count.
+/// 3. The best 48 pairs, each more than 8 frames from the others in start or in lag, are
+///    refined: the end is kept at `(i + L)·hop − 1` and the start is the best match within a
+///    hop of `i·hop`, by the same correlation as [`starts_for_end`].
+///
+/// # Errors
+///
+/// [`FinderError::Cancelled`] when `cancel` is set; it is checked once per lag diagonal.
+pub(super) fn whole_range(
+    audio: &[Vec<f32>],
+    job: &Job,
+) -> Result<Vec<LoopCandidate>, FinderError> {
+    let (first, last) = job.range;
+    let len = shortest(audio);
+    let n = tone_frame(job.rate);
+    let hop = (n / HOPS_PER_FRAME).max(1);
+    let range_len = last + 1 - first;
+    // Frame j starts at `first + j·hop`. It must fit in the audio, and the loop ending just
+    // before it, at `first + j·hop − 1`, must end inside the range.
+    let frames = (0..)
+        .take_while(|&j| j * hop <= range_len && first + j * hop + n <= len)
+        .count();
+    let bands = Bands::new(n, job.rate);
+    let levels: Vec<Vec<f32>> = (0..frames)
+        .map(|j| bands.levels(audio, first + j * hop..first + j * hop + n, false))
+        .collect();
+    let peaks: Vec<f32> = levels
+        .iter()
+        .map(|l| l.iter().copied().fold(f32::MIN, f32::max))
+        .collect();
+    let longest = job
+        .max_len
+        .unwrap_or(usize::MAX)
+        .min(max_span(job.rate))
+        .min(range_len);
+    let shortest_lag = job.min_len.div_ceil(hop).max(1);
+    let longest_lag = (longest / hop).min(frames.saturating_sub(1));
+    let mut best = BestPairs::new();
+    let mut diffs = Vec::with_capacity(frames);
+    let mut sums = Vec::with_capacity(frames + 1);
+    for lag in shortest_lag..=longest_lag {
+        if job.cancel.load(Ordering::Relaxed) {
+            return Err(FinderError::Cancelled);
+        }
+        let cells = frames - lag;
+        diffs.clear();
+        diffs.extend((0..cells).map(|i| {
+            let floor = peaks[i].max(peaks[i + lag]) - TONE_RANGE_DB;
+            rms_diff_above(&levels[i], &levels[i + lag], floor)
+        }));
+        // A running sum along the diagonal, so each average over the seam's frames is O(1).
+        sums.clear();
+        sums.push(0.0f64);
+        for (k, &d) in diffs.iter().enumerate() {
+            sums.push(sums[k] + f64::from(d));
+        }
+        for i in 0..cells {
+            let lo = i.saturating_sub(SEAM_FRAMES);
+            let hi = (i + SEAM_FRAMES).min(cells - 1);
+            let distance = (sums[hi + 1] - sums[lo]) / (hi + 1 - lo) as f64;
+            best.offer(Pair {
+                distance: distance as f32,
+                start: i,
+                lag,
+            });
+        }
+    }
+    let mut pairs: Vec<(usize, usize)> = best
+        .distinct()
+        .into_iter()
+        .filter_map(|p| {
+            let end = first + (p.start + p.lag) * hop - 1;
+            let around = first + p.start * hop;
+            let lo = around
+                .saturating_sub(hop)
+                .max(first)
+                .max((end + 1).saturating_sub(longest));
+            let hi = (around + hop).min((end + 1).saturating_sub(job.min_len));
+            (lo <= hi).then(|| (best_start(audio, end, (lo, hi)), end))
+        })
+        .collect();
+    pairs.sort_unstable();
+    pairs.dedup();
+    measure_all(audio, job, pairs.into_iter())
+}
+
+/// The start in `span` (inclusive) whose surroundings best match those of the join after
+/// `end`; ties go to the earlier start.
+fn best_start(audio: &[Vec<f32>], end: usize, span: (usize, usize)) -> usize {
+    let corr = correlation(audio, end + 1, span);
+    let best = (0..corr.len()).fold(0, |b, i| if corr[i] > corr[b] { i } else { b });
+    span.0 + best
+}
+
+/// A coarse pair of frames: the loop starts at frame `start`, and the frame after its end is
+/// `start + lag`.
+#[derive(Clone, Copy, Debug)]
+struct Pair {
+    /// The averaged band-level difference across the seam, in dB. Lower is better.
+    distance: f32,
+    /// The start frame.
+    start: usize,
+    /// The loop length in frames.
+    lag: usize,
+}
+
+impl Pair {
+    /// Whether `self` and `other` are too close in both start and lag to count as distinct.
+    fn near(&self, other: &Pair) -> bool {
+        self.start.abs_diff(other.start) <= DISTINCT_FRAMES
+            && self.lag.abs_diff(other.lag) <= DISTINCT_FRAMES
+    }
+}
+
+// Pairs order by distance, then the earlier start, then the shorter lag: the finder's
+// tie-break, so the result never depends on the order the pairs were seen in.
+impl Ord for Pair {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.distance
+            .total_cmp(&other.distance)
+            .then(self.start.cmp(&other.start))
+            .then(self.lag.cmp(&other.lag))
+    }
+}
+
+impl PartialOrd for Pair {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for Pair {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+
+impl Eq for Pair {}
+
+/// How many pairs [`BestPairs`] keeps: enough for [`MAX_PICKS`] distinct ones.
+const POOL: usize = MAX_PICKS * (2 * DISTINCT_FRAMES + 1) * (2 * DISTINCT_FRAMES + 1);
+
+/// The best coarse pairs seen so far, in a fixed amount of memory.
+///
+/// Picking distinct pairs greedily from the best down, each pick rules out at most the 17 by 17
+/// pairs near it. So the 48 picks all lie among the best 48 times 17² pairs, and keeping only
+/// those gives exactly the picks that a list of every pair would.
+struct BestPairs {
+    /// The kept pairs, the worst on top.
+    heap: BinaryHeap<Pair>,
+}
+
+impl BestPairs {
+    /// An empty pool.
+    fn new() -> BestPairs {
+        BestPairs {
+            heap: BinaryHeap::with_capacity(POOL + 1),
+        }
+    }
+
+    /// Keeps `p` if it is among the best [`POOL`] pairs so far.
+    fn offer(&mut self, p: Pair) {
+        if self.heap.len() < POOL {
+            self.heap.push(p);
+        } else if self.heap.peek().is_some_and(|worst| p < *worst) {
+            self.heap.pop();
+            self.heap.push(p);
+        }
+    }
+
+    /// Up to [`MAX_PICKS`] pairs, best first, none near a better one already picked.
+    fn distinct(self) -> Vec<Pair> {
+        let mut picked: Vec<Pair> = Vec::new();
+        for p in self.heap.into_sorted_vec() {
+            if picked.len() == MAX_PICKS {
+                break;
+            }
+            if !picked.iter().any(|q| q.near(&p)) {
+                picked.push(p);
+            }
+        }
+        picked
+    }
 }
 
 /// Measures each `(start, end)` pair, checking `cancel` before each one.

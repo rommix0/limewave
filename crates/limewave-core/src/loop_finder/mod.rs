@@ -107,8 +107,8 @@ const PERIOD_THRESHOLD: f32 = 0.6;
 
 /// Finds loop candidates for `settings`, best first.
 ///
-/// - A `keep_end` fixes the loop end and searches for the start. Without one the result is
-///   empty for now.
+/// - A `keep_end` fixes the loop end and searches for the start. Without one both points are
+///   searched for inside the range.
 /// - `cancel` is checked between stages and between candidates; once set the result is
 ///   [`FinderError::Cancelled`].
 ///
@@ -170,12 +170,14 @@ pub fn find_loops(
         period,
         cancel,
     };
-    let found = match (settings.keep_end, settings.direction) {
-        (None, _) => Vec::new(),
-        (Some(end), Direction::Forward) => search::kept_end(audio, &job, end)?,
-        (Some(end), Direction::Backward) => {
+    let found = match settings.direction {
+        Direction::Forward => match settings.keep_end {
+            None => search::whole_range(audio, &job)?,
+            Some(end) => search::kept_end(audio, &job, end)?,
+        },
+        Direction::Backward => {
             // A backward loop is a forward loop of the reversed audio: index `i` becomes
-            // `len − 1 − i`, so the kept end is a kept start.
+            // `len − 1 − i`, so a kept end is a kept start.
             let flip = |i: usize| len - 1 - i;
             let reversed: Vec<Vec<f32>> = audio
                 .iter()
@@ -185,7 +187,10 @@ pub fn find_loops(
                 range: (flip(last), flip(first)),
                 ..job
             };
-            let mut found = search::kept_start(&reversed, &mirror, flip(end))?;
+            let mut found = match settings.keep_end {
+                None => search::whole_range(&reversed, &mirror)?,
+                Some(end) => search::kept_start(&reversed, &mirror, flip(end))?,
+            };
             for c in &mut found {
                 (c.loop_start, c.loop_end) = (flip(c.loop_end), flip(c.loop_start));
             }
@@ -434,19 +439,26 @@ mod tests {
         assert!(!found.is_empty());
     }
 
+    /// The kept ends the shared tests run with: one near the end of the sound, and none.
+    fn kept_ends(len: usize) -> [Option<usize>; 2] {
+        [Some(len - 11), None]
+    }
+
     #[test]
     fn limits_are_obeyed() {
         let a = faded_repeat();
         let len = a[0].len();
         let range = (1_000, len - 1);
-        let mut s = settings(range, Some(len - 11));
-        s.min_len = 40_000;
-        s.max_len = Some(70_000);
-        let found = run(&a, &s).unwrap();
-        assert!(!found.is_empty());
-        for c in &found {
-            assert!(c.loop_start >= range.0 && c.loop_end <= range.1, "{c:?}");
-            assert!((40_000..=70_000).contains(&c.len()), "{c:?}");
+        for keep_end in kept_ends(len) {
+            let mut s = settings(range, keep_end);
+            s.min_len = 40_000;
+            s.max_len = Some(70_000);
+            let found = run(&a, &s).unwrap();
+            assert!(!found.is_empty(), "{keep_end:?}");
+            for c in &found {
+                assert!(c.loop_start >= range.0 && c.loop_end <= range.1, "{c:?}");
+                assert!((40_000..=70_000).contains(&c.len()), "{c:?}");
+            }
         }
     }
 
@@ -454,10 +466,13 @@ mod tests {
     fn no_duplicates() {
         let a = faded_repeat();
         let len = a[0].len();
-        let found = run(&a, &settings((0, len - 1), Some(len - 11))).unwrap();
-        for (i, x) in found.iter().enumerate() {
-            for y in &found[i + 1..] {
-                assert!(!same_loop(x, y), "{x:?} {y:?}");
+        for keep_end in kept_ends(len) {
+            let found = run(&a, &settings((0, len - 1), keep_end)).unwrap();
+            assert!(!found.is_empty(), "{keep_end:?}");
+            for (i, x) in found.iter().enumerate() {
+                for y in &found[i + 1..] {
+                    assert!(!same_loop(x, y), "{x:?} {y:?}");
+                }
             }
         }
     }
@@ -644,7 +659,103 @@ mod tests {
     fn deterministic() {
         let a = faded_repeat();
         let len = a[0].len();
-        let s = settings((0, len - 1), Some(len - 11));
-        assert_eq!(run(&a, &s), run(&a, &s));
+        for keep_end in kept_ends(len) {
+            let s = settings((0, len - 1), keep_end);
+            assert_eq!(run(&a, &s), run(&a, &s));
+        }
+    }
+
+    /// The steady part of `audio`, as the panel would search it.
+    fn steady(audio: &[Vec<f32>]) -> (usize, usize) {
+        let len = audio[0].len();
+        let r = steady::search_range(audio, RATE, None, (0, len - 1)).unwrap();
+        (r.first, r.last)
+    }
+
+    /// The largest difference between the 256 frames from the loop start and the 256 after the
+    /// loop end, over channels.
+    fn splice_error(audio: &[Vec<f32>], c: &LoopCandidate) -> f32 {
+        let (s, e) = (c.loop_start, c.loop_end);
+        audio
+            .iter()
+            .flat_map(|ch| (0..256).map(move |k| (ch[s + k] - ch[e + 1 + k]).abs()))
+            .fold(0.0, f32::max)
+    }
+
+    #[test]
+    fn whole_range_finds_the_tile() {
+        let a = faded_repeat();
+        let found = run(&a, &settings(steady(&a), None)).unwrap();
+        let best = &found[0];
+        assert_eq!(best.len() % TILE, 0, "{best:?}");
+        assert!(splice_error(&a, best) < 1e-3, "{best:?}");
+        assert_eq!(best.quality, Quality::Seamless, "{best:?}");
+    }
+
+    /// 3 s of a 220 Hz tone with 8 equal harmonics and a 2 Hz vibrato of ±5 cents.
+    fn vibrato_tone() -> Vec<Vec<f32>> {
+        let rate = f64::from(RATE);
+        let mut phase = 0.0f64;
+        let tone = (0..3 * RATE as usize)
+            .map(|i| {
+                let t = i as f64 / rate;
+                let cents = 5.0 * (std::f64::consts::TAU * 2.0 * t).sin();
+                let v = (1..=8).map(|k| (k as f64 * phase).sin()).sum::<f64>() / 8.0;
+                phase += std::f64::consts::TAU * 220.0 * 2f64.powf(cents / 1_200.0) / rate;
+                v as f32
+            })
+            .collect();
+        vec![tone]
+    }
+
+    #[test]
+    fn a_tone_with_vibrato_loops_cleanly() {
+        let a = vibrato_tone();
+        let found = run(&a, &settings(steady(&a), None)).unwrap();
+        let best = &found[0];
+        assert!(best.measures.click <= 1.0, "{best:?}");
+        let c = best.cycles().expect("a tonal range");
+        assert!((c - c.round()).abs() <= 0.1, "{c} {best:?}");
+    }
+
+    #[test]
+    fn white_noise_is_at_best_fair() {
+        let a = vec![super::fixtures::noise(11, 3 * RATE as usize)];
+        let len = a[0].len();
+        let found = run(&a, &settings((0, len - 1), None)).unwrap();
+        assert!(!found.is_empty());
+        for c in &found {
+            assert!(c.quality >= Quality::Fair, "{c:?}");
+        }
+    }
+
+    #[test]
+    fn backward_whole_range() {
+        let a = reversed(&faded_repeat());
+        let mut s = settings(steady(&a), None);
+        s.direction = Direction::Backward;
+        let found = run(&a, &s).unwrap();
+        let best = &found[0];
+        assert_eq!(best.len() % TILE, 0, "{best:?}");
+        assert_eq!(best.quality, Quality::Seamless, "{best:?}");
+    }
+
+    /// How long a whole-range search of `seconds` of stereo noise takes. Run with
+    /// `cargo test --release -p limewave-core -- --ignored --nocapture whole_range_speed`.
+    #[test]
+    #[ignore = "a timing measurement, for release builds"]
+    fn whole_range_speed() {
+        for seconds in [12, 60] {
+            let n = seconds * RATE as usize;
+            let a = vec![super::fixtures::noise(3, n), super::fixtures::noise(4, n)];
+            let s = settings((0, n - 1), None);
+            let begun = std::time::Instant::now();
+            let found = run(&a, &s).unwrap();
+            eprintln!(
+                "{seconds} s: {:?}, {} candidates",
+                begun.elapsed(),
+                found.len()
+            );
+        }
     }
 }

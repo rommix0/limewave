@@ -303,11 +303,17 @@ fn matching(audio: &[Vec<f32>], s: usize, e: usize, len: usize, rate: u32) -> f3
 /// is first floored at [`TONE_RANGE_DB`] below the loudest band of the two lists, so near-silent
 /// bands (leakage, rounding noise) do not dominate.
 fn rms_diff(a: &[f32], b: &[f32]) -> f32 {
+    let peak = a.iter().chain(b).copied().fold(f32::MIN, f32::max);
+    rms_diff_above(a, b, peak - TONE_RANGE_DB)
+}
+
+/// The RMS of the band-by-band differences of two equal-length level lists, in dB, with every
+/// band first raised to `floor`. [`rms_diff`] with the floor worked out by the caller, for
+/// callers that compare the same frames many times.
+pub(super) fn rms_diff_above(a: &[f32], b: &[f32], floor: f32) -> f32 {
     if a.is_empty() {
         return 0.0;
     }
-    let peak = a.iter().chain(b).copied().fold(f32::MIN, f32::max);
-    let floor = peak - TONE_RANGE_DB;
     let sum: f32 = a
         .iter()
         .zip(b)
@@ -317,7 +323,7 @@ fn rms_diff(a: &[f32], b: &[f32]) -> f32 {
 }
 
 /// Third-octave band levels of a frame, from [`LOWEST_BAND_HZ`] up to Nyquist.
-struct Bands {
+pub(super) struct Bands {
     /// Frame length.
     n: usize,
     fft: Fft,
@@ -329,7 +335,8 @@ struct Bands {
 }
 
 impl Bands {
-    fn new(n: usize, rate: u32) -> Bands {
+    /// The bands of an `n`-sample frame at `rate`.
+    pub(super) fn new(n: usize, rate: u32) -> Bands {
         let bin_hz = f64::from(rate) / n as f64;
         let band_of_bin: Vec<Option<usize>> = (0..=n / 2)
             .map(|k| {
@@ -352,7 +359,12 @@ impl Bands {
 
     /// The level in dB of each used band for `audio[range]` (at most one frame), energy summed
     /// over channels. A short range is zero-padded after, or before when `pad_front`.
-    fn levels(&self, audio: &[Vec<f32>], range: Range<usize>, pad_front: bool) -> Vec<f32> {
+    pub(super) fn levels(
+        &self,
+        audio: &[Vec<f32>],
+        range: Range<usize>,
+        pad_front: bool,
+    ) -> Vec<f32> {
         let mut energy = vec![0.0f64; self.used.last().map_or(0, |&b| b + 1)];
         // A unit sine on a bin gives |X| = n / 4, so this makes it 0 dB.
         let scale = (4.0 / self.n as f64).powi(2);
