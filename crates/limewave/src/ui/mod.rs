@@ -8,6 +8,7 @@ pub mod filelist;
 pub mod inspector;
 pub mod keyboard;
 pub mod keymap;
+pub mod loop_finder;
 pub mod new_dialog;
 pub mod overview;
 pub mod rate_dialog;

@@ -50,6 +50,7 @@ use crate::ui::filelist::{self, FileListClick};
 use crate::ui::inspector::{InspectorAction, inspector};
 use crate::ui::keyboard::{KeyEvent, keyboard_strip};
 use crate::ui::keymap::{KeyMapAction, key_map};
+use crate::ui::loop_finder::{self, FinderPrefs, FinderState};
 use crate::ui::new_dialog::{BitDepth, NewDialogState, new_dialog};
 use crate::ui::overview::overview;
 use crate::ui::rate_dialog::{RateDialogState, rate_dialog};
@@ -139,6 +140,8 @@ pub struct Session {
     pub audio_version: u64,
     /// The spectrogram of `processed`, computed while the main view shows it.
     pub spectrogram: SpectrogramCache,
+    /// The loop finder's search, its result and the candidate being previewed.
+    pub loop_finder: FinderState,
 }
 
 /// A dialog's result being previewed (v0.3 §7.1, §7.2): the processed audio with the dialog's
@@ -193,6 +196,7 @@ impl Session {
             dialog_preview: None,
             audio_version: 0,
             spectrogram: SpectrogramCache::default(),
+            loop_finder: FinderState::default(),
         }
     }
 
@@ -387,6 +391,15 @@ impl Session {
         self.last_preview_push = Some(Instant::now());
         self.preview_held = false;
         None
+    }
+
+    /// Drops the preview without recording it: the rendered audio and the engine buffer go
+    /// back to the current edit, and the history is untouched.
+    pub fn cancel_preview(&mut self, engine: Option<&AudioEngine>) {
+        self.preview = None;
+        self.preview_held = false;
+        self.last_preview_push = None;
+        self.refresh(engine);
     }
 
     /// Ends a drag: the preview becomes one history entry (if it changed anything) and the
@@ -690,6 +703,8 @@ pub struct UiState {
     pub render_debounce: Duration,
     /// Why the last action did nothing, shown in the toolbar until the next action.
     pub message: Option<String>,
+    /// The loop finder's settings, shared by every file and remembered between runs.
+    pub finder: FinderPrefs,
 }
 
 impl Default for UiState {
@@ -724,6 +739,7 @@ impl Default for UiState {
             record_panel: None,
             about_open: false,
             render_debounce: RENDER_DEBOUNCE,
+            finder: FinderPrefs::default(),
         }
     }
 }
@@ -791,6 +807,8 @@ const ENVELOPE_KEY: &str = "envelope";
 const RELEASE_AFTER_LOOP_KEY: &str = "release_after_loop";
 /// The key the main view's mode is saved under, as `"waveform"` or `"spectrogram"`.
 const VIEW_MODE_KEY: &str = "view_mode";
+/// The key the loop finder's settings are saved under; see [`FinderPrefs::to_storage_string`].
+const LOOP_FINDER_KEY: &str = "loop_finder";
 
 /// Which numbered name [`LimewaveApp::next_name`] hands out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -914,7 +932,8 @@ impl LimewaveApp {
     }
 
     /// Reads the settings remembered between runs: the envelope, "Release plays after loop
-    /// end" and the main view's mode. A missing or unreadable value leaves the default.
+    /// end", the main view's mode and the loop finder's settings. A missing or unreadable
+    /// value leaves the default.
     fn load_settings(&mut self, storage: &dyn eframe::Storage) {
         if let Some(envelope) = storage
             .get_string(ENVELOPE_KEY)
@@ -927,6 +946,12 @@ impl LimewaveApp {
         self.ui.view_mode = storage
             .get_string(VIEW_MODE_KEY)
             .map_or_else(ViewMode::default, |s| ViewMode::from_storage_string(&s));
+        if let Some(prefs) = storage
+            .get_string(LOOP_FINDER_KEY)
+            .and_then(|s| FinderPrefs::from_storage_string(&s))
+        {
+            self.ui.finder = prefs;
+        }
     }
 
     /// An app with no audio engine and no MIDI, for tests.
@@ -2363,9 +2388,13 @@ impl LimewaveApp {
         })
     }
 
-    /// Takes the open dialogs' finished renders, waiting for running ones when `block`. A
-    /// render made for a file or edit that is no longer current is discarded.
+    /// Takes the open dialogs' finished renders and the selected file's loop finder search,
+    /// waiting for running ones when `block`. A render made for a file or edit that is no
+    /// longer current is discarded.
     fn drain_renders(&mut self, block: bool) {
+        if let Some(s) = self.selected_session_mut() {
+            loop_finder::poll_search(s, block);
+        }
         if let Some(mut d) = self.ui.tail_dialog.take() {
             self.drain_render(&mut d.analysis, block);
             self.drain_render(&mut d.render, block);
@@ -2390,8 +2419,8 @@ impl LimewaveApp {
         slot.finish(current, block);
     }
 
-    /// Test hook: blocks until the open dialogs' running renders finish and takes their
-    /// results, as the frames after they finish would. Kittest tests call it between runs.
+    /// Test hook: blocks until the open dialogs' running renders and the selected file's loop
+    /// finder search finish and takes their results, as the frames after they finish would. Kittest tests call it between runs.
     pub fn wait_for_renders(&mut self) {
         self.drain_renders(true);
     }
@@ -2710,6 +2739,9 @@ impl LimewaveApp {
             self.save_results = None;
         }
         self.flush_preview(&ctx);
+        if let Some(s) = self.selected_session_mut() {
+            loop_finder::upkeep(s);
+        }
         self.focus_last_frame = ctx.egui_wants_keyboard_input();
     }
 
@@ -3348,6 +3380,7 @@ impl eframe::App for LimewaveApp {
             VIEW_MODE_KEY,
             self.ui.view_mode.to_storage_string().to_string(),
         );
+        storage.set_string(LOOP_FINDER_KEY, self.ui.finder.to_storage_string());
     }
 }
 
@@ -3532,6 +3565,93 @@ mod tests {
         app.ui.view_mode = ViewMode::Waveform;
         eframe::App::save(&mut app, &mut storage);
         assert_eq!(storage.get_string("view_mode").as_deref(), Some("waveform"));
+    }
+
+    #[test]
+    fn finder_prefs_round_trip() {
+        use eframe::Storage as _;
+        assert_eq!(
+            UiState::default().finder,
+            FinderPrefs {
+                min_s: 0.1,
+                max_s: None,
+                preference: 0.5,
+                keep_end: false,
+            }
+        );
+        let prefs = FinderPrefs {
+            min_s: 0.25,
+            max_s: Some(1.5),
+            preference: 0.8,
+            keep_end: true,
+        };
+        let mut app = LimewaveApp::for_test();
+        app.ui.finder = prefs;
+        let mut storage = MemStorage::default();
+        eframe::App::save(&mut app, &mut storage);
+        assert_eq!(
+            storage.get_string("loop_finder").as_deref(),
+            Some("0.25,1.5,0.8,1")
+        );
+        let mut restored = LimewaveApp::for_test();
+        restored.load_settings(&storage);
+        assert_eq!(restored.ui.finder, prefs);
+
+        let mut app = LimewaveApp::for_test();
+        eframe::App::save(&mut app, &mut storage);
+        assert_eq!(
+            storage.get_string("loop_finder").as_deref(),
+            Some("0.1,,0.5,0"),
+            "no longest length is an empty field"
+        );
+        restored.load_settings(&storage);
+        assert_eq!(restored.ui.finder, FinderPrefs::default());
+
+        for bad in [
+            "",
+            "nonsense",
+            "0.1,,0.5",
+            "0.1,,0.5,0,9",
+            "x,,0.5,0",
+            "0.1,,0.5,2",
+        ] {
+            storage.set_string("loop_finder", bad.to_string());
+            let mut fresh = LimewaveApp::for_test();
+            fresh.load_settings(&storage);
+            assert_eq!(fresh.ui.finder, FinderPrefs::default(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn cancel_preview_restores_the_current_edit() {
+        let mut s = session();
+        let cursor = s.history.cursor();
+        let previewed = EditState {
+            loop_mode: LoopMode::Forward,
+            loop_start: 2000,
+            loop_end: 6000,
+            ..s.edit().clone()
+        };
+        s.set_preview(previewed.clone(), None);
+        assert_eq!(s.published, previewed);
+        s.cancel_preview(None);
+        assert_eq!(s.preview, None);
+        assert_eq!(s.published, *s.edit());
+        assert_eq!(*s.rendered, render(&s.processed, s.edit()));
+        assert_eq!(s.history.cursor(), cursor, "the history is untouched");
+
+        // A held-back preview is dropped too, so nothing publishes it later.
+        s.set_preview(previewed.clone(), None);
+        s.set_preview(
+            EditState {
+                loop_end: 5000,
+                ..previewed
+            },
+            None,
+        );
+        s.cancel_preview(None);
+        assert_eq!(s.flush_preview(None), None);
+        assert_eq!(s.published, *s.edit());
     }
 
     #[test]
