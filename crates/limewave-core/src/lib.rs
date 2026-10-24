@@ -6,6 +6,7 @@ pub mod dsp;
 pub mod edit;
 pub mod effects;
 pub mod error;
+pub mod loop_finder;
 pub mod meta;
 pub mod notes;
 pub mod render;
