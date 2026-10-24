@@ -2433,7 +2433,8 @@ impl LimewaveApp {
     }
 
     /// Test hook: blocks until the open dialogs' running renders and the selected file's loop
-    /// finder search finish and takes their results, as the frames after they finish would. Kittest tests call it between runs.
+    /// finder search finish and takes their results, as the frames after they finish would.
+    /// Kittest tests call it between runs.
     pub fn wait_for_renders(&mut self) {
         self.drain_renders(true);
     }

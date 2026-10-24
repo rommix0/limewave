@@ -118,7 +118,8 @@ pub fn tone_frame(rate: u32) -> usize {
 /// - `flux` is the median RMS-dB band difference between consecutive, non-overlapping tone
 ///   frames. With fewer than two frames in the range it is at its floor.
 ///
-/// Both are floored at a tiny positive value, so they are safe to divide by.
+/// `d2` is floored at a tiny positive value and `flux` at [`FLUX_FLOOR`] (0.5 dB), so both are
+/// safe to divide by.
 pub fn natural_change(audio: &[Vec<f32>], first: usize, last: usize, rate: u32) -> Natural {
     let len = shortest(audio);
     let last = last.min(len.saturating_sub(1));

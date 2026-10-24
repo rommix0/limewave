@@ -100,8 +100,10 @@ pub(super) fn range_is_silent(audio: &[Vec<f32>], rate: u32, first: usize, last:
 /// - The sound ends at the last step whose smoothed level is within 3 dB of the reference or
 ///   above. The steady part starts at the first step from which every smoothed level up to
 ///   that end is within 3 dB of the reference.
-/// - It counts as found when it is at least 0.25 s and 20 % of the sound long. Otherwise the
-///   result is the middle 60 % of the sound, with kind [`RangeKind::NoSteadyPart`].
+/// - It counts as found when it is at least 0.25 s or 20 % of the sound long, whichever is
+///   longer. Otherwise the result is the middle 60 % of the sound, with kind
+///   [`RangeKind::NoSteadyPart`]; when that middle is shorter than one 50 ms step, the whole
+///   audible span is used instead.
 ///
 /// `None` for empty audio or silence (every step quieter than −120 dB).
 pub fn steady_range(audio: &[Vec<f32>], rate: u32) -> Option<SearchRange> {
