@@ -80,6 +80,8 @@ pub(crate) const SELECT_ALL_SHORTCUT: KeyboardShortcut =
 
 /// Default height of the seam panel: its controls plus a plot of about 200 px.
 const SEAM_PANEL_HEIGHT: f32 = 300.0;
+/// The Loop finder panel's starting width, beside the seam view.
+const LOOP_FINDER_WIDTH: f32 = 340.0;
 /// Default height of the key map panel (spec 5.2).
 const KEYMAP_PANEL_HEIGHT: f32 = 160.0;
 
@@ -834,6 +836,12 @@ fn system_save_picker(name: &str) -> Option<PathBuf> {
     dialog.set_file_name(name).save_file()
 }
 
+/// Whether a widget holds the keyboard for itself, so the app's shortcuts and the computer
+/// keyboard keep off it. A focused loop finder row only takes the arrow keys and Enter.
+fn keyboard_taken(ctx: &egui::Context) -> bool {
+    ctx.egui_wants_keyboard_input() && loop_finder::focused_row(ctx).is_none()
+}
+
 /// Whether `path` ends in `.ext`, in any case.
 fn has_extension(path: &Path, ext: &str) -> bool {
     path.extension()
@@ -907,7 +915,8 @@ pub struct LimewaveApp {
     midi_seen: Option<u32>,
     /// Whether a widget held the keyboard focus at the end of the last frame. egui drops the
     /// focus when Escape arrives, before this app sees the key, so the field that Escape
-    /// closes would otherwise look unfocused.
+    /// closes would otherwise look unfocused. A loop finder row does not count
+    /// ([`keyboard_taken`]).
     focus_last_frame: bool,
     ctx: egui::Context,
     loader: Option<Receiver<LoadResult>>,
@@ -2117,7 +2126,7 @@ impl LimewaveApp {
     /// keyboard; releases always count, so a note never sticks.
     fn handle_keyboard(&mut self, ctx: &egui::Context) {
         let events = ctx.input(|i| i.events.clone());
-        let accepting = self.ui.audition && !self.modal_open() && !ctx.egui_wants_keyboard_input();
+        let accepting = self.ui.audition && !self.modal_open() && !keyboard_taken(ctx);
         for event in events {
             match event {
                 Event::WindowFocused(false) => self.release_all(),
@@ -2584,7 +2593,7 @@ impl LimewaveApp {
             self.undo();
         }
         // Text fields keep Ctrl+A and Escape for themselves.
-        if self.focus_last_frame || ctx.egui_wants_keyboard_input() {
+        if self.focus_last_frame || keyboard_taken(ctx) {
             return;
         }
         // An open menu or popup closes on Escape when it is drawn, so leave the key to it.
@@ -2598,9 +2607,9 @@ impl LimewaveApp {
         if select_all {
             self.select_all();
         } else if clear {
-            // Escape cancels "Set from MIDI" first, then turns Draw off, and only then clears the
-            // selection.
-            if self.ui.midi_learn.take().is_none() {
+            // Escape ends a loop finder preview first, then cancels "Set from MIDI", then turns
+            // Draw off, and only then clears the selection.
+            if !self.end_finder_preview() && self.ui.midi_learn.take().is_none() {
                 if self.ui.draw {
                     self.ui.draw = false;
                 } else {
@@ -2608,6 +2617,19 @@ impl LimewaveApp {
                 }
             }
         }
+    }
+
+    /// Ends the selected file's loop finder preview; whether there was one to end.
+    fn end_finder_preview(&mut self) -> bool {
+        let engine = self.engine.as_ref();
+        let Some(FileEntry::Loaded(s)) = self.selected.and_then(|i| self.files.get_mut(i)) else {
+            return false;
+        };
+        if !loop_finder::previewing(s) {
+            return false;
+        }
+        loop_finder::end_preview(s, engine);
+        true
     }
 
     /// Starts the cursor watch for a MIDI note-on not seen before.
@@ -2744,7 +2766,7 @@ impl LimewaveApp {
         if let Some(FileEntry::Loaded(s)) = self.selected.and_then(|i| self.files.get_mut(i)) {
             loop_finder::upkeep(s, engine);
         }
-        self.focus_last_frame = ctx.egui_wants_keyboard_input();
+        self.focus_last_frame = keyboard_taken(&ctx);
     }
 
     /// Works out, once per folder, which files an SFZ save from the open dialog would replace
@@ -3257,6 +3279,7 @@ impl LimewaveApp {
                 !RegionContext::new(st, r).follows && st.region_file(r) == self.selected
             })
         });
+        let key = self.render_key(0);
         let engine = self.engine.as_ref();
         let ui_state = &mut self.ui;
         let Some(entry) = self.selected.and_then(|i| self.files.get_mut(i)) else {
@@ -3276,7 +3299,15 @@ impl LimewaveApp {
                     .resizable(true)
                     .default_size(SEAM_PANEL_HEIGHT)
                     .size_range(120.0..=600.0)
-                    .show(ui, |ui| seam_view(ui, s, ui_state, engine, cursors));
+                    .show(ui, |ui| {
+                        egui::Panel::right("loop_finder")
+                            .resizable(true)
+                            .default_size(LOOP_FINDER_WIDTH)
+                            .show(ui, |ui| {
+                                loop_finder::finder_panel(ui, s, ui_state, engine, key);
+                            });
+                        seam_view(ui, s, ui_state, engine, cursors);
+                    });
                 view_switch(ui, ui_state);
                 let size = ui.available_size();
                 ui.allocate_ui(size, |ui| waveform_view(ui, s, ui_state, engine, cursors));

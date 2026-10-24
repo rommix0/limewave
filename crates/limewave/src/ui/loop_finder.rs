@@ -4,15 +4,20 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use eframe::egui;
+use eframe::egui::text::CCursor;
+use eframe::egui::{
+    self, Button, Checkbox, Color32, DragValue, EventFilter, Key, Modifiers, Rect, Role,
+    ScrollArea, Sense, Slider, StrokeKind, TextStyle, WidgetInfo, pos2, vec2,
+};
 use limewave_core::edit::{EditState, LoopMode};
-use limewave_core::loop_finder::steady::{SearchRange, search_range};
+use limewave_core::loop_finder::measure::{FAIR, GOOD};
+use limewave_core::loop_finder::steady::{RangeKind, SearchRange, search_range};
 use limewave_core::loop_finder::{
     DEFAULT_MIN_SECONDS, Direction, FinderError, FinderSettings, LoopCandidate, MAX_CANDIDATES,
-    find_loops,
+    MAX_SEARCH_SECONDS, Quality, SeamMeasures, find_loops,
 };
 
-use crate::app::Session;
+use crate::app::{Session, UiState};
 use crate::audio::engine::AudioEngine;
 use crate::render_worker::{RenderJob, RenderKey, spawn_render};
 
@@ -102,6 +107,8 @@ pub struct FinderState {
     pub result: Option<FinderResult>,
     /// The candidate being previewed, an index into the result's candidates.
     pub selected: Option<usize>,
+    /// The row last clicked or moved to in the list, even one that could not be previewed.
+    pub picked: Option<usize>,
     /// Why the last search could not start: no range worth searching.
     pub range_error: Option<FinderError>,
 }
@@ -143,6 +150,7 @@ pub fn start_search(
             s.loop_finder.range_error = Some(err);
             s.loop_finder.result = None;
             s.loop_finder.selected = None;
+            s.loop_finder.picked = None;
             return;
         }
     };
@@ -209,6 +217,7 @@ fn take_result(s: &mut Session, block: bool) -> bool {
     let Some(result) = got else { return false };
     st.result = Some(result);
     st.selected = None;
+    st.picked = None;
     true
 }
 
@@ -217,12 +226,12 @@ fn take_result(s: &mut Session, block: bool) -> bool {
 pub fn finish_search(s: &mut Session, block: bool, engine: Option<&AudioEngine>) {
     let live = previewing(s);
     if take_result(s, block) && live {
-        end_preview(s, engine);
+        s.cancel_preview(engine);
     }
 }
 
-/// Whether the selected candidate is what the preview shows.
-fn previewing(s: &Session) -> bool {
+/// Whether the selected candidate is what the preview shows: a candidate preview is live.
+pub fn previewing(s: &Session) -> bool {
     let frames = s.doc.frames;
     s.loop_finder
         .selected
@@ -282,9 +291,12 @@ pub fn preview_candidate(s: &mut Session, index: usize, engine: Option<&AudioEng
     s.loop_finder.selected = Some(index);
 }
 
-/// Ends a candidate preview: the views and the sound go back to the current edit.
+/// Ends a candidate preview: the views and the sound go back to the current edit. Any other
+/// preview, such as a marker drag, is left alone, so this is always safe to call.
 pub fn end_preview(s: &mut Session, engine: Option<&AudioEngine>) {
-    s.cancel_preview(engine);
+    if previewing(s) {
+        s.cancel_preview(engine);
+    }
     s.loop_finder.selected = None;
 }
 
@@ -307,5 +319,383 @@ pub fn upkeep(s: &mut Session, engine: Option<&AudioEngine>) {
     finish_search(s, false, engine);
     if s.loop_finder.selected.is_some() && !previewing(s) {
         s.loop_finder.selected = None;
+    }
+}
+
+// The panel beside the seam view.
+
+/// The shortest Longest that counts as a limit, in seconds; anything below it is "no limit".
+const MIN_LONGEST: f64 = 0.01;
+
+/// What the list says when the result was made for audio that has since changed.
+const STALE_TEXT: &str = "The sound has changed. Search again.";
+
+/// The id of the list row for candidate `index`.
+fn row_id(index: usize) -> egui::Id {
+    egui::Id::unique("loop_finder_row").with(index)
+}
+
+/// The candidate row that has keyboard focus, if any. The app lets its shortcuts and the
+/// computer keyboard through while a row has focus, as it would with nothing focused.
+pub fn focused_row(ctx: &egui::Context) -> Option<usize> {
+    let focused = ctx.memory(|m| m.focused())?;
+    (0..MAX_CANDIDATES).find(|&i| row_id(i) == focused)
+}
+
+/// The word for `q`.
+fn quality_word(q: Quality) -> &'static str {
+    match q {
+        Quality::Seamless => "Seamless",
+        Quality::Good => "Good",
+        Quality::Fair => "Fair",
+        Quality::Rough => "Rough",
+    }
+}
+
+/// A row's text, and the character range of its quality word.
+fn row_text(rank: usize, c: &LoopCandidate, rate: u32) -> (String, std::ops::Range<usize>) {
+    let secs = c.len() as f64 / f64::from(rate);
+    let mut text = format!(
+        "{rank}. {secs:.3} s \u{b7} {} frames \u{b7} {}\u{2013}{} \u{b7} ",
+        c.len(),
+        c.loop_start,
+        c.loop_end
+    );
+    let word = quality_word(c.quality);
+    let start = text.chars().count();
+    text.push_str(word);
+    let end = start + word.chars().count();
+    if let Some(cycles) = c.cycles() {
+        text.push_str(&format!(" \u{b7} {cycles:.1} cycles"));
+    }
+    (text, start..end)
+}
+
+/// The measures behind a quality word in plain words, with the Good and Fair limits as the
+/// boundaries between none, slight and clear.
+fn measures_text(m: &SeamMeasures) -> String {
+    let word = |value: f32, good: f32, fair: f32| {
+        if value <= good {
+            "none"
+        } else if value <= fair {
+            "slight"
+        } else {
+            "clear"
+        }
+    };
+    format!(
+        "Click: {} \u{b7} Tone change: {} \u{b7} Waveform match: {:.0} %",
+        word(m.click, GOOD.click, FAIR.click),
+        word(m.tone, GOOD.tone, FAIR.tone),
+        (m.matching * 100.0).max(0.0)
+    )
+}
+
+/// The panel's line for the range searched.
+fn range_text(range: &SearchRange, rate: u32) -> String {
+    let secs = |frame: usize| frame as f64 / f64::from(rate);
+    let span = format!("{:.2}\u{2013}{:.2} s", secs(range.first), secs(range.last));
+    match range.kind {
+        RangeKind::Selection => "Searched the selection".to_owned(),
+        RangeKind::Steady => format!("Searched the steady part, {span}"),
+        RangeKind::NoSteadyPart => {
+            format!("No steady part found; searched the middle of the sound, {span}")
+        }
+    }
+}
+
+/// What the panel says for `err`; nothing for a cancelled search.
+fn error_text(err: FinderError) -> Option<&'static str> {
+    match err {
+        FinderError::Silent => Some("Nothing to loop in this range"),
+        FinderError::RangeTooShort => Some("The range is shorter than the minimum loop length"),
+        FinderError::RangeTooLong => Some("Select 60 seconds or less"),
+        FinderError::BadSettings => Some("The shortest loop is longer than the longest"),
+        FinderError::Cancelled => None,
+    }
+}
+
+/// Reads Longest as typed: a length in seconds, or "no limit" (or nothing) for 0.
+fn parse_longest(text: &str) -> Option<f64> {
+    let text = text.trim();
+    if text.is_empty() || text.eq_ignore_ascii_case("no limit") {
+        return Some(0.0);
+    }
+    text.trim_end_matches('s').trim().parse().ok()
+}
+
+/// Whether candidate `index` of a current result lies outside Start...End.
+fn outside_trim(s: &Session, index: usize) -> bool {
+    let Some(Ok(candidates)) = s.loop_finder.result.as_ref().map(|r| &r.outcome) else {
+        return false;
+    };
+    let e = s.edit();
+    !is_stale(s)
+        && candidates
+            .get(index)
+            .is_some_and(|c| c.loop_start < e.start || c.loop_end > e.end)
+}
+
+/// Moves to row `index`: previews it, or ends the preview when it cannot be used.
+fn pick(s: &mut Session, index: usize, engine: Option<&AudioEngine>) {
+    s.loop_finder.picked = Some(index);
+    if indexed_edit(s, index).is_some() {
+        preview_candidate(s, index, engine);
+    } else {
+        end_preview(s, engine);
+    }
+}
+
+/// The Loop finder panel for `s`: Find loops (or Searching… and Cancel), Use loop, the
+/// settings, what was searched, and the list of candidates. `key` is what a search started
+/// now is filed under; without one Find loops is disabled.
+pub fn finder_panel(
+    ui: &mut egui::Ui,
+    s: &mut Session,
+    ui_state: &mut UiState,
+    engine: Option<&AudioEngine>,
+    key: Option<RenderKey>,
+) {
+    let loop_mode = s.edit().loop_mode;
+    let ping_pong = loop_mode == LoopMode::PingPong;
+    ui.horizontal_wrapped(|ui| {
+        ui.strong("Loop finder");
+        if is_searching(s) {
+            ui.label("Searching\u{2026}");
+            if ui.button("Cancel").clicked() {
+                end_preview(s, engine);
+                cancel_search(s);
+            }
+        } else {
+            let find = ui.add_enabled(!ping_pong && key.is_some(), Button::new("Find loops"));
+            if let (true, Some(key)) = (find.clicked(), key) {
+                end_preview(s, engine);
+                start_search(s, &ui_state.finder, ui_state.selection, key, ui.ctx());
+            }
+        }
+        let usable = s
+            .loop_finder
+            .selected
+            .filter(|&i| indexed_edit(s, i).is_some());
+        let mut use_loop = ui
+            .add_enabled(usable.is_some(), Button::new("Use loop"))
+            .on_hover_text("Apply the selected loop as one undo step");
+        if usable.is_none() && s.loop_finder.picked.is_some_and(|i| outside_trim(s, i)) {
+            use_loop = use_loop.on_disabled_hover_text("Outside Start\u{2013}End");
+        }
+        if let (true, Some(i)) = (use_loop.clicked(), usable) {
+            use_candidate(s, i, engine);
+        }
+    });
+    if ping_pong {
+        ui.weak("The finder makes forward and backward loops");
+    }
+
+    let prefs = &mut ui_state.finder;
+    ui.add_enabled(
+        loop_mode != LoopMode::Off,
+        Checkbox::new(&mut prefs.keep_end, "Keep loop end"),
+    )
+    .on_hover_text("Search for a loop start only");
+    ui.horizontal_wrapped(|ui| {
+        let name = ui.label("Shortest");
+        let most = prefs.max_s.unwrap_or(MAX_SEARCH_SECONDS).max(MIN_LONGEST);
+        ui.add(
+            DragValue::new(&mut prefs.min_s)
+                .range(MIN_LONGEST..=most)
+                .speed(0.01)
+                .fixed_decimals(2)
+                .suffix(" s"),
+        )
+        .labelled_by(name.id);
+        let name = ui.label("Longest");
+        let mut max = prefs.max_s.unwrap_or(0.0);
+        ui.add(
+            DragValue::new(&mut max)
+                .range(0.0..=MAX_SEARCH_SECONDS)
+                .speed(0.01)
+                .custom_formatter(|v, _| {
+                    if v < MIN_LONGEST {
+                        "no limit".to_owned()
+                    } else {
+                        format!("{v:.2} s")
+                    }
+                })
+                .custom_parser(parse_longest),
+        )
+        .labelled_by(name.id);
+        prefs.max_s = (max >= MIN_LONGEST).then_some(max);
+    });
+    ui.horizontal(|ui| {
+        let name = ui.label("Tight");
+        ui.add(Slider::new(&mut prefs.preference, 0.0..=1.0).show_value(false))
+            .labelled_by(name.id)
+            .on_hover_text("Tight favours short loops; Natural favours long ones");
+        ui.label("Natural");
+    });
+
+    let rate = s.rate();
+    let stale = is_stale(s);
+    let result = s.loop_finder.result.as_ref();
+    if let Some(r) = result {
+        ui.weak(range_text(&r.range, rate));
+    }
+    let message = match (s.loop_finder.range_error, result) {
+        (Some(err), _) => error_text(err),
+        (None, Some(_)) if stale => Some(STALE_TEXT),
+        (None, Some(r)) => match &r.outcome {
+            Err(err) => error_text(*err),
+            Ok(candidates) if candidates.is_empty() => Some("No loops found"),
+            Ok(_) => None,
+        },
+        (None, None) => None,
+    };
+    if let Some(message) = message {
+        ui.label(message);
+    }
+    let rows: Vec<LoopCandidate> = result
+        .and_then(|r| r.outcome.as_ref().ok())
+        .cloned()
+        .unwrap_or_default();
+    if rows.is_empty() {
+        return;
+    }
+
+    // Up and down move the preview while a row has focus, and Enter applies it.
+    if let Some(i) = focused_row(ui.ctx()).filter(|&i| !stale && i < rows.len()) {
+        let filter = EventFilter {
+            vertical_arrows: true,
+            ..Default::default()
+        };
+        ui.memory_mut(|m| m.set_focus_lock_filter(row_id(i), filter));
+        let (up, down, enter) = ui.input_mut(|input| {
+            (
+                input.consume_key(Modifiers::NONE, Key::ArrowUp),
+                input.consume_key(Modifiers::NONE, Key::ArrowDown),
+                input.consume_key(Modifiers::NONE, Key::Enter),
+            )
+        });
+        let to = if down {
+            Some(i + 1).filter(|&n| n < rows.len())
+        } else if up {
+            i.checked_sub(1)
+        } else {
+            None
+        };
+        if enter {
+            use_candidate(s, i, engine);
+        } else if let Some(to) = to {
+            pick(s, to, engine);
+            ui.memory_mut(|m| m.request_focus(row_id(to)));
+        }
+    }
+
+    let selected = s.loop_finder.selected;
+    ui.add_enabled_ui(!stale, |ui| {
+        ScrollArea::vertical()
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                for (i, c) in rows.iter().enumerate() {
+                    let row = candidate_row(ui, i, c, rate, selected == Some(i));
+                    if row.double_clicked() {
+                        use_candidate(s, i, engine);
+                    } else if row.clicked() {
+                        row.request_focus();
+                        if selected == Some(i) {
+                            end_preview(s, engine);
+                        } else {
+                            pick(s, i, engine);
+                        }
+                    }
+                }
+            });
+    });
+}
+
+/// One selectable row of the list. Its text is also its accessible label; hovering the
+/// quality word shows the measures behind it.
+fn candidate_row(
+    ui: &mut egui::Ui,
+    index: usize,
+    c: &LoopCandidate,
+    rate: u32,
+    selected: bool,
+) -> egui::Response {
+    let (text, word) = row_text(index + 1, c, rate);
+    let pad = ui.spacing().button_padding;
+    let width = ui.available_width();
+    let galley = ui.painter().layout(
+        text.clone(),
+        TextStyle::Button.resolve(ui.style()),
+        Color32::PLACEHOLDER,
+        (width - 2.0 * pad.x).max(0.0),
+    );
+    let (_, rect) = ui.allocate_space(vec2(width, galley.size().y + 2.0 * pad.y));
+    let response = ui.interact(rect, row_id(index), Sense::click());
+    let enabled = ui.is_enabled();
+    response.widget_info(|| WidgetInfo::selected(Role::Button, enabled, selected, &text));
+    let text_pos = rect.min + pad;
+    if ui.is_rect_visible(rect) {
+        let visuals = ui.style().interact_selectable(&response, selected);
+        if selected || response.hovered() || response.has_focus() {
+            ui.painter().rect(
+                rect,
+                visuals.corner_radius,
+                visuals.weak_bg_fill,
+                visuals.bg_stroke,
+                StrokeKind::Inside,
+            );
+        }
+        ui.painter()
+            .galley(text_pos, galley.clone(), visuals.text_color());
+    }
+    // The word never breaks, so its end marks its row; its start may sit at the end of the
+    // row above when the break falls just before it.
+    let from = galley.pos_from_cursor(CCursor::new(word.start));
+    let to = galley.pos_from_cursor(CCursor::new(word.end));
+    let min = if (from.min.y - to.min.y).abs() < 0.5 {
+        from.min
+    } else {
+        pos2(0.0, to.min.y)
+    };
+    let word_rect = Rect::from_min_max(min, to.max).translate(text_pos.to_vec2());
+    ui.interact(word_rect, row_id(index).with("quality"), Sense::hover())
+        .on_hover_text(measures_text(&c.measures));
+    response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn longest_reads_no_limit_and_seconds() {
+        assert_eq!(parse_longest("no limit"), Some(0.0));
+        assert_eq!(parse_longest(""), Some(0.0));
+        assert_eq!(parse_longest("1.50 s"), Some(1.5));
+        assert_eq!(parse_longest("2"), Some(2.0));
+        assert_eq!(parse_longest("long"), None);
+    }
+
+    #[test]
+    fn measures_use_the_good_and_fair_limits() {
+        let m = SeamMeasures {
+            click: GOOD.click,
+            tone: FAIR.tone,
+            matching: 0.874,
+        };
+        assert_eq!(
+            measures_text(&m),
+            "Click: none \u{b7} Tone change: slight \u{b7} Waveform match: 87 %"
+        );
+        let m = SeamMeasures {
+            click: FAIR.click + 0.1,
+            tone: 0.0,
+            matching: -0.2,
+        };
+        assert_eq!(
+            measures_text(&m),
+            "Click: clear \u{b7} Tone change: none \u{b7} Waveform match: 0 %"
+        );
     }
 }

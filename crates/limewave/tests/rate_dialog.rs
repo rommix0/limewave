@@ -18,8 +18,13 @@ fn harness() -> Harness<'static, LimewaveApp> {
 
 /// [`harness`] for a file whose `fmt` chunk says `header_rate` (the audio is the same).
 fn harness_with_header_rate(header_rate: u32) -> Harness<'static, LimewaveApp> {
+    harness_with(FRAMES, header_rate)
+}
+
+/// [`harness`] for a sine of `frames` frames whose `fmt` chunk says `header_rate`.
+fn harness_with(frames: usize, header_rate: u32) -> Harness<'static, LimewaveApp> {
     let bytes = wav_bytes(
-        &[sine(440.0, 44100, FRAMES, 0.5)],
+        &[sine(440.0, 44100, frames, 0.5)],
         header_rate,
         SampleFormat::Int { bits: 16 },
         Vec::new(),
@@ -127,7 +132,8 @@ fn a_converted_file_has_its_spectrogram_made_at_the_new_rate() {
 
 #[test]
 fn cancel_and_escape_close_the_dialog_without_converting() {
-    let mut h = harness();
+    // A long sound, so the conversion is still running when Escape arrives.
+    let mut h = harness_with(40 * FRAMES, 44100);
     open_dialog(&mut h);
     h.get_by_label("Cancel").click();
     h.run();
