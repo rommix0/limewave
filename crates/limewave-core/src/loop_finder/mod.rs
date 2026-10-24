@@ -230,8 +230,9 @@ const SAME_START_S: f64 = 0.050;
 /// - The score becomes `score − 0.15 · (preference − 0.5) · 2 · (len / range_len)`, so 0.5 is
 ///   neutral, and candidates sort ascending by it. Ties go to the earlier start, then the
 ///   shorter length.
-/// - A candidate whose length is a whole multiple (two or more) of another's moves to directly
-///   after it (whatever the preference), unless its quality word is strictly better.
+/// - A candidate whose length is a whole multiple (two or more) of a [`Quality::Seamless`] or
+///   [`Quality::Good`] candidate's moves to directly after it (whatever the preference), unless
+///   its quality word is strictly better. A Fair or Rough base pulls nothing below it.
 /// - Of two candidates that are the same loop (lengths within 1 % and either starts within
 ///   50 ms or both [`Quality::Seamless`]) only the better is kept.
 /// - Then the list is cut to `keep`.
@@ -282,16 +283,21 @@ fn is_multiple(long: usize, short: usize) -> bool {
 }
 
 /// `sorted` with each whole multiple of another candidate moved to directly after its base:
-/// the first candidate, in order, it is a multiple of and whose [`Quality`] word is no worse
-/// than its own. The words are compared, not the scores, so neither the preference nor
-/// unhearable differences between two passes of the same repeat can separate them. Several
-/// multiples of one base keep their order, each followed by its own multiples.
+/// the first candidate, in order, it is a multiple of whose [`Quality`] word is no worse than its
+/// own and is [`Quality::Seamless`] or [`Quality::Good`].
+///
+/// - The words are compared, not the scores, so neither the preference nor unhearable
+///   differences between two passes of the same repeat can separate them.
+/// - Only a genuine repeat is a base: a Fair or Rough loop is not one, so a multiple of its length
+///   is a different loop that happens to be that long, and keeps its place.
+/// - Several multiples of one base keep their order, each followed by its own multiples.
 fn after_their_bases(sorted: Vec<LoopCandidate>) -> Vec<LoopCandidate> {
     let base_of: Vec<Option<usize>> = (0..sorted.len())
         .map(|i| {
             (0..sorted.len()).find(|&j| {
                 j != i
                     && is_multiple(sorted[i].len(), sorted[j].len())
+                    && sorted[j].quality <= Quality::Good
                     && sorted[i].quality >= sorted[j].quality
             })
         })
@@ -586,6 +592,17 @@ mod tests {
         let ranked = rank(long_seam, 1.0, 100_000, 8, RATE);
         assert_eq!(lens(&ranked), [t, 2 * t, x]);
         assert!(ranked[1].score < ranked[0].score);
+        // A Fair or Rough base is not a genuine repeat, so it pulls nothing below it: the
+        // better-scored multiple keeps the place the plain sort gives it.
+        for word in [Quality::Fair, Quality::Rough] {
+            let weak_base = vec![
+                cand(0, 2 * t, 4.0, word),
+                cand(5_000, x, 5.0, Quality::Rough),
+                cand(0, t, 6.0, word),
+            ];
+            let ranked = rank(weak_base, 0.5, 100_000, 8, RATE);
+            assert_eq!(lens(&ranked), [2 * t, x, t], "{word:?}");
+        }
     }
 
     #[test]
