@@ -124,6 +124,8 @@ fn frames(seconds: f64, rate: u32) -> usize {
 /// the steady part, cut to the current Start...End. A running search is cancelled first. When
 /// there is no range to search, `range_error` says why and nothing starts. `key` is only what
 /// the worker is filed under: a result is judged by its audio version.
+///
+/// A live candidate preview is left alone: the caller ends it first with [`end_preview`].
 pub fn start_search(
     s: &mut Session,
     prefs: &FinderPrefs,
@@ -173,7 +175,8 @@ pub fn start_search(
     s.loop_finder.job = Some((job, cancel));
 }
 
-/// Stops the running search, if any; its result is never seen.
+/// Stops the running search, if any; its result is never seen. A live candidate preview is
+/// left alone: the caller ends it first with [`end_preview`].
 pub fn cancel_search(s: &mut Session) {
     if let Some((_, cancel)) = s.loop_finder.job.take() {
         cancel.store(true, Ordering::Relaxed);
@@ -181,24 +184,50 @@ pub fn cancel_search(s: &mut Session) {
 }
 
 /// Takes the running search's result once it has finished, or waits for it when `block`, and
-/// makes it the result, with no row selected. A worker that died without a result just ends
-/// the search.
+/// makes it the result, with no row selected. A worker that died without a result ends the
+/// search and leaves `result` as it was. A live candidate preview is left alone; see
+/// [`finish_search`].
 pub fn poll_search(s: &mut Session, block: bool) {
+    take_result(s, block);
+}
+
+/// [`poll_search`], returning whether a new result replaced the old one.
+fn take_result(s: &mut Session, block: bool) -> bool {
     let st = &mut s.loop_finder;
-    let Some((job, _)) = &st.job else { return };
+    let Some((job, _)) = &st.job else {
+        return false;
+    };
     let got = if block {
         job.wait()
     } else {
         match job.ended() {
             Some(got) => got,
-            None => return,
+            None => return false,
         }
     };
     st.job = None;
-    if let Some(result) = got {
-        st.result = Some(result);
-        st.selected = None;
+    let Some(result) = got else { return false };
+    st.result = Some(result);
+    st.selected = None;
+    true
+}
+
+/// [`poll_search`], and when the new result replaces one whose candidate is being previewed,
+/// the preview ends too ([`end_preview`]): a preview never outlives the result it came from.
+pub fn finish_search(s: &mut Session, block: bool, engine: Option<&AudioEngine>) {
+    let live = previewing(s);
+    if take_result(s, block) && live {
+        end_preview(s, engine);
     }
+}
+
+/// Whether the selected candidate is what the preview shows.
+fn previewing(s: &Session) -> bool {
+    let frames = s.doc.frames;
+    s.loop_finder
+        .selected
+        .and_then(|i| indexed_edit(s, i))
+        .is_some_and(|e| s.preview.as_ref() == Some(&e.clamped(frames)))
 }
 
 /// Whether a search is running.
@@ -270,21 +299,13 @@ pub fn use_candidate(s: &mut Session, index: usize, engine: Option<&AudioEngine>
     s.loop_finder.selected = None;
 }
 
-/// The finder's upkeep each frame for the selected session: picks up a finished search, and
-/// forgets the selected row once the preview no longer shows it (an undo, a marker drag or a
-/// stale result), leaving the preview itself alone.
-pub fn upkeep(s: &mut Session) {
-    poll_search(s, false);
-    if s.loop_finder.selected.is_none() {
-        return;
-    }
-    let frames = s.doc.frames;
-    let shows = s
-        .loop_finder
-        .selected
-        .and_then(|i| indexed_edit(s, i))
-        .is_some_and(|e| s.preview.as_ref() == Some(&e.clamped(frames)));
-    if !shows {
+/// The finder's upkeep each frame for the selected session: picks up a finished search,
+/// ending a preview of the result it replaces ([`finish_search`]), and forgets the selected
+/// row once the preview no longer shows it (an undo, a marker drag or a stale result), leaving
+/// that preview alone.
+pub fn upkeep(s: &mut Session, engine: Option<&AudioEngine>) {
+    finish_search(s, false, engine);
+    if s.loop_finder.selected.is_some() && !previewing(s) {
         s.loop_finder.selected = None;
     }
 }

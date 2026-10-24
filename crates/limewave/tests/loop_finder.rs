@@ -266,3 +266,20 @@ fn a_marker_drag_over_a_preview_clears_the_row_but_keeps_the_drag() {
     assert_eq!(s.loop_finder.selected, None, "the row no longer shows");
     assert_eq!(s.preview.as_ref(), Some(&dragged), "the drag is left alone");
 }
+
+#[test]
+fn a_new_result_ends_the_preview_of_the_old_one() {
+    let mut h = harness();
+    search(&mut h);
+    preview_candidate(session_mut(h.state_mut()), 0, None);
+    h.run();
+    assert!(session(h.state()).preview.is_some());
+
+    start(&mut h);
+    settle(&mut h);
+    let s = session(h.state());
+    assert_eq!(s.preview, None, "the preview went with its result");
+    assert_eq!(s.shown_edit(), s.edit());
+    assert_eq!(s.published, *s.edit());
+    assert_eq!(s.loop_finder.selected, None);
+}

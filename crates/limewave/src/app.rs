@@ -2392,8 +2392,9 @@ impl LimewaveApp {
     /// waiting for running ones when `block`. A render made for a file or edit that is no
     /// longer current is discarded.
     fn drain_renders(&mut self, block: bool) {
-        if let Some(s) = self.selected_session_mut() {
-            loop_finder::poll_search(s, block);
+        let engine = self.engine.as_ref();
+        if let Some(FileEntry::Loaded(s)) = self.selected.and_then(|i| self.files.get_mut(i)) {
+            loop_finder::finish_search(s, block, engine);
         }
         if let Some(mut d) = self.ui.tail_dialog.take() {
             self.drain_render(&mut d.analysis, block);
@@ -2739,8 +2740,9 @@ impl LimewaveApp {
             self.save_results = None;
         }
         self.flush_preview(&ctx);
-        if let Some(s) = self.selected_session_mut() {
-            loop_finder::upkeep(s);
+        let engine = self.engine.as_ref();
+        if let Some(FileEntry::Loaded(s)) = self.selected.and_then(|i| self.files.get_mut(i)) {
+            loop_finder::upkeep(s, engine);
         }
         self.focus_last_frame = ctx.egui_wants_keyboard_input();
     }
