@@ -71,6 +71,15 @@ fn middle_range(len: usize) -> SearchRange {
     }
 }
 
+/// Whether every sample of `first..=last` is quieter than −120 dB: no whole 50 ms step and no
+/// leftover tail of the range reaches that level.
+fn range_is_silent(audio: &[Vec<f32>], rate: u32, first: usize, last: usize) -> bool {
+    let hop = ((f64::from(rate) * STEP_S) as usize).max(1);
+    let levels = rms_db_frames(audio, first, last, hop);
+    let tail = first + levels.len() * hop;
+    levels.iter().all(|&d| d < SILENT_DB) && level_db(audio, tail, last) < SILENT_DB
+}
+
 /// The steady part of the sound: where the level has settled after the attack and before the
 /// fade.
 ///
@@ -92,16 +101,17 @@ pub fn steady_range(audio: &[Vec<f32>], rate: u32) -> Option<SearchRange> {
         // Shorter than one step: nothing to measure, so only silence can be ruled out.
         return (level_db(audio, 0, len - 1) >= SILENT_DB).then(|| middle_range(len));
     }
-    if levels.iter().all(|&d| d < SILENT_DB) {
-        return None;
-    }
+    // Trailing silence is not part of the sound: it would drag the reference down and read as
+    // steady itself. No audible step at all is silence.
+    let audible = levels.iter().rposition(|&d| d >= SILENT_DB)? + 1;
+    let levels = &levels[..audible];
 
     let mut second_half = levels[levels.len() / 2..].to_vec();
     second_half.sort_by(f32::total_cmp);
     let reference = second_half[second_half.len() / 2];
 
     let half = ((SMOOTH_S / STEP_S / 2.0).round() as usize).max(1);
-    let smooth = running_median(&levels, half);
+    let smooth = running_median(levels, half);
     let steady = smooth
         .iter()
         .rposition(|&d| d >= reference - BAND_DB)
@@ -114,7 +124,7 @@ pub fn steady_range(audio: &[Vec<f32>], rate: u32) -> Option<SearchRange> {
         });
     let found = steady.filter(|&(start, end)| {
         let frames = ((end + 1 - start) * hop) as f64;
-        frames >= (MIN_STEADY_S * f64::from(rate)).max(MIN_STEADY_FRACTION * len as f64)
+        frames >= (MIN_STEADY_S * f64::from(rate)).max(MIN_STEADY_FRACTION * (audible * hop) as f64)
     });
     Some(match found {
         Some((start, end)) => SearchRange {
@@ -133,6 +143,7 @@ pub fn steady_range(audio: &[Vec<f32>], rate: u32) -> Option<SearchRange> {
 /// - Without one, the [`steady_range`], keeping only its last 60 s if it is longer. Silence is
 ///   [`FinderError::Silent`].
 /// - Either is cut to the trim; nothing left is [`FinderError::RangeTooShort`].
+/// - A range that is silent after that is [`FinderError::Silent`].
 pub fn search_range(
     audio: &[Vec<f32>],
     rate: u32,
@@ -152,17 +163,17 @@ pub fn search_range(
     if first > last {
         return Err(FinderError::RangeTooShort);
     }
-    if last + 1 - first <= max_frames {
-        return Ok(SearchRange { first, last, kind });
-    }
-    if kind == RangeKind::Selection {
+    let first = if last + 1 - first <= max_frames {
+        first
+    } else if kind == RangeKind::Selection {
         return Err(FinderError::RangeTooLong);
+    } else {
+        last + 1 - max_frames
+    };
+    if range_is_silent(audio, rate, first, last) {
+        return Err(FinderError::Silent);
     }
-    Ok(SearchRange {
-        first: last + 1 - max_frames,
-        last,
-        kind,
-    })
+    Ok(SearchRange { first, last, kind })
 }
 
 #[cfg(test)]
@@ -212,6 +223,38 @@ mod tests {
         assert_eq!(steady_range(&[], RATE), None);
         assert_eq!(steady_range(&[vec![]], RATE), None);
         assert_eq!(steady_range(&[vec![0.0; 44_100]], RATE), None);
+    }
+
+    #[test]
+    fn trailing_silence_is_not_the_steady_part() {
+        let mut rng = SplitMix64::new(4);
+        let mut x = db_ramp(&mut rng, 1.0, 0.0, 0.0);
+        x.extend(vec![0.0; 2 * 44_100]);
+        let r = steady_range(&[x], RATE).expect("sound");
+        assert_eq!(r.kind, RangeKind::Steady);
+        assert!(r.last < 44_100 + 2_205, "last {}", r.last);
+    }
+
+    #[test]
+    fn a_silent_selection_is_refused() {
+        let mut rng = SplitMix64::new(5);
+        let mut x = db_ramp(&mut rng, 1.0, 0.0, 0.0);
+        x.extend(vec![0.0; 44_100]);
+        let audio = [x];
+        let trim = (0, 88_199);
+        assert_eq!(
+            search_range(&audio, RATE, Some((50_000, 80_000)), trim),
+            Err(FinderError::Silent)
+        );
+        // Shorter than one step, and silent.
+        assert_eq!(
+            search_range(&audio, RATE, Some((50_000, 50_100)), trim),
+            Err(FinderError::Silent)
+        );
+        // Part audible is fine.
+        assert!(search_range(&audio, RATE, Some((40_000, 80_000)), trim).is_ok());
+        // So is a short range with sound in it.
+        assert!(search_range(&audio, RATE, Some((100, 200)), trim).is_ok());
     }
 
     #[test]
