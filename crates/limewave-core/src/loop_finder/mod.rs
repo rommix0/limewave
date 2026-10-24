@@ -3,7 +3,12 @@
 //! This module holds the shared constants and error type. [`steady`] picks the part of the
 //! sound worth searching; later stages measure candidate loops and rank them.
 
+pub mod measure;
 pub mod steady;
+
+pub use measure::{
+    Natural, Quality, SeamMeasures, natural_change, quality, score, seam_measures, tone_frame,
+};
 
 /// The longest range the finder will search, in seconds. A longer steady part keeps its last
 /// 60 s; a longer selection is refused.
