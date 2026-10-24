@@ -16,6 +16,10 @@ const D2_FLOOR: f32 = 1e-20;
 /// nearly zero, is not ranked Rough for differences nobody could hear.
 pub const FLUX_FLOOR: f32 = 0.5;
 
+/// How far below the loudest band, in dB, a band level is allowed to count when two frames are
+/// compared. Quieter bands are raised to this, so they cannot dominate the tone measure.
+pub const TONE_RANGE_DB: f32 = 60.0;
+
 /// The lowest band level, in dB. Silent bands sit here.
 const LEVEL_FLOOR_DB: f32 = -120.0;
 
@@ -294,12 +298,20 @@ fn matching(audio: &[Vec<f32>], s: usize, e: usize, len: usize, rate: u32) -> f3
     (dot / norm).clamp(-1.0, 1.0) as f32
 }
 
-/// The RMS of the band-by-band differences of two equal-length level lists, in dB.
+/// The RMS of the band-by-band differences of two equal-length level lists, in dB. Every band
+/// is first floored at [`TONE_RANGE_DB`] below the loudest band of the two lists, so near-silent
+/// bands (leakage, rounding noise) do not dominate.
 fn rms_diff(a: &[f32], b: &[f32]) -> f32 {
     if a.is_empty() {
         return 0.0;
     }
-    let sum: f32 = a.iter().zip(b).map(|(x, y)| (x - y).powi(2)).sum();
+    let peak = a.iter().chain(b).copied().fold(f32::MIN, f32::max);
+    let floor = peak - TONE_RANGE_DB;
+    let sum: f32 = a
+        .iter()
+        .zip(b)
+        .map(|(x, y)| (x.max(floor) - y.max(floor)).powi(2))
+        .sum();
     (sum / a.len() as f32).sqrt()
 }
 
@@ -416,10 +428,9 @@ mod tests {
     #[test]
     fn a_steady_sine_looped_over_whole_periods_is_seamless() {
         // 220 Hz at 22 kHz is exactly 100 samples a period.
-        // The phase is taken within the period, so every period is bit-identical.
         let rate = 22_000;
         let sine: Vec<f32> = (0..2 * rate)
-            .map(|i| (std::f32::consts::TAU * (i % 100) as f32 / 100.0).sin())
+            .map(|i| (std::f32::consts::TAU * 220.0 * i as f32 / rate as f32).sin())
             .collect();
         let a = vec![sine];
         let (s, e) = (2_205, 2_205 + 100 * 100 - 1);
