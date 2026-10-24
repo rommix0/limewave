@@ -4,6 +4,7 @@
 //! [`steady`] picks the part of the sound worth searching, [`measure`] judges a candidate loop,
 //! and `search` finds the candidates; this module ranks them.
 
+pub mod lab;
 pub mod measure;
 mod search;
 pub mod steady;
