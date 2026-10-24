@@ -15,8 +15,9 @@ const SMOOTH_S: f64 = 0.5;
 /// It is also how far the level may fall before the sound counts as over.
 const BAND_DB: f32 = 3.0;
 
-/// A level below this is silence, in dB.
-const SILENT_DB: f32 = -120.0;
+/// A level below this counts as silence, in dB. Not the same as `SILENCE_DB`, the level
+/// reported for exact digital zero.
+const AUDIBLE_FLOOR_DB: f32 = -120.0;
 
 /// The shortest steady part, in seconds...
 const MIN_STEADY_S: f64 = 0.25;
@@ -63,11 +64,18 @@ fn running_median(levels: &[f32], half: usize) -> Vec<f32> {
 }
 
 /// The middle 60 % of the first `len` (non-zero) frames, the fallback when nothing is steady.
-/// It never reaches past `audible_end`, so a quiet tail cannot push it into silence.
-fn middle_range(len: usize, audible_end: usize) -> SearchRange {
+/// It never reaches past `audible_end`, so a quiet tail cannot push it into silence. If that
+/// leaves less than one `hop`, the whole audible span is used instead.
+fn middle_range(len: usize, audible_end: usize, hop: usize) -> SearchRange {
     let last = (len * 4 / 5).min(len - 1).min(audible_end - 1);
+    let first = (len / 5).min(last);
+    let (first, last) = if last - first + 1 < hop {
+        (0, audible_end - 1)
+    } else {
+        (first, last)
+    };
     SearchRange {
-        first: (len / 5).min(last),
+        first,
         last,
         kind: RangeKind::NoSteadyPart,
     }
@@ -79,8 +87,8 @@ fn range_is_silent(audio: &[Vec<f32>], rate: u32, first: usize, last: usize) -> 
     let hop = ((f64::from(rate) * STEP_S) as usize).max(1);
     let levels = rms_db_frames(audio, first, last, hop);
     let tail = first + levels.len() * hop;
-    levels.iter().all(|&d| d < SILENT_DB)
-        && (tail > last || level_db(audio, tail, last) < SILENT_DB)
+    levels.iter().all(|&d| d < AUDIBLE_FLOOR_DB)
+        && (tail > last || level_db(audio, tail, last) < AUDIBLE_FLOOR_DB)
 }
 
 /// The steady part of the sound: where the level has settled after the attack and before the
@@ -102,11 +110,12 @@ pub fn steady_range(audio: &[Vec<f32>], rate: u32) -> Option<SearchRange> {
     let levels = rms_db_frames(audio, 0, len - 1, hop);
     if levels.is_empty() {
         // Shorter than one step: nothing to measure, so only silence can be ruled out.
-        return (level_db(audio, 0, len - 1) >= SILENT_DB).then(|| middle_range(len, len));
+        return (level_db(audio, 0, len - 1) >= AUDIBLE_FLOOR_DB)
+            .then(|| middle_range(len, len, hop));
     }
     // Trailing silence is not part of the sound: it would drag the reference down and read as
     // steady itself. No audible step at all is silence.
-    let audible = levels.iter().rposition(|&d| d >= SILENT_DB)? + 1;
+    let audible = levels.iter().rposition(|&d| d >= AUDIBLE_FLOOR_DB)? + 1;
     // The fallback is based on the sound up to its last non-zero step, so a long decay below
     // -120 dB still counts as sound, but exact silence after it does not.
     let sounding = levels
@@ -146,7 +155,7 @@ pub fn steady_range(audio: &[Vec<f32>], rate: u32) -> Option<SearchRange> {
             last: (end + 1) * hop - 1,
             kind: RangeKind::Steady,
         },
-        None => middle_range(sounding_len, audible * hop),
+        None => middle_range(sounding_len, audible * hop, hop),
     })
 }
 
@@ -261,6 +270,20 @@ mod tests {
         assert!(r.first <= r.last && r.last < 88_200, "{r:?}");
         let r = search_range(&audio, RATE, None, (0, len - 1)).expect("audible");
         assert_eq!(r.kind, RangeKind::NoSteadyPart);
+    }
+
+    #[test]
+    fn a_short_audible_span_is_used_whole() {
+        let mut rng = SplitMix64::new(7);
+        // 0.1 s at 0 dB, then 1 s at -150 dB (below the audible floor), then exact zeros.
+        let mut x = db_ramp(&mut rng, 0.1, 0.0, 0.0);
+        x.extend(db_ramp(&mut rng, 1.0, -150.0, -150.0));
+        x.extend(vec![0.0; 44_100]);
+        let r = steady_range(&[x], RATE).expect("sound");
+        assert_eq!(r.kind, RangeKind::NoSteadyPart);
+        assert_eq!(r.first, 0);
+        assert!(r.last.abs_diff(4_409) <= 2_205, "{r:?}");
+        assert!(r.last + 1 - r.first >= 2_205, "{r:?}");
     }
 
     #[test]
