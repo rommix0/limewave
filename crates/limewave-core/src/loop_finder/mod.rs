@@ -208,8 +208,8 @@ pub fn find_loops(
 /// the range.
 const LENGTH_CREDIT: f32 = 0.15;
 
-/// Scores closer than this count as tied when deciding whether a multiple of a loop is better
-/// than the loop. It is far below anything audible, and stops rounding noise in two equally
+/// Seam scores closer than this count as tied when deciding whether a multiple of a loop is
+/// better than the loop. It is far below anything audible, and stops rounding noise in two equally
 /// exact repeats from putting the longer one first.
 const SCORE_TIE: f32 = 1e-3;
 
@@ -229,10 +229,10 @@ const SAME_START_S: f64 = 0.050;
 /// - The score becomes `score − 0.15 · (preference − 0.5) · 2 · (len / range_len)`, so 0.5 is
 ///   neutral, and candidates sort ascending by it. Ties go to the earlier start, then the
 ///   shorter length.
-/// - A candidate whose length is a whole multiple (two or more) of another's, with a score no
-///   better than that one's, moves to directly after it.
-/// - Of two candidates that are the same loop (lengths within 1 %, starts within 50 ms, or both
-///   [`Quality::Seamless`]) only the better is kept.
+/// - A candidate whose length is a whole multiple (two or more) of another's, with a seam
+///   score no better than that one's (whatever the preference), moves to directly after it.
+/// - Of two candidates that are the same loop (lengths within 1 % and either starts within
+///   50 ms or both [`Quality::Seamless`]) only the better is kept.
 /// - Then the list is cut to `keep`.
 fn rank(
     mut found: Vec<LoopCandidate>,
@@ -242,7 +242,8 @@ fn rank(
     rate: u32,
 ) -> Vec<LoopCandidate> {
     for c in &mut found {
-        c.score -= LENGTH_CREDIT * (preference - 0.5) * 2.0 * (c.len() as f32 / range_len as f32);
+        let share = (c.len() as f32 / range_len as f32).min(1.0);
+        c.score -= LENGTH_CREDIT * (preference - 0.5) * 2.0 * share;
     }
     found.sort_by(|a, b| {
         a.score
@@ -267,9 +268,10 @@ fn rank(
 /// Whether `a` and `b` are the same loop for ranking, with starts within `near` frames.
 fn same_loop(a: &LoopCandidate, b: &LoopCandidate, near: usize) -> bool {
     let (la, lb) = (a.len() as f64, b.len() as f64);
-    let close =
-        (la - lb).abs() < SAME_LENGTH * la.max(lb) && a.loop_start.abs_diff(b.loop_start) < near;
-    close || (a.quality == Quality::Seamless && b.quality == Quality::Seamless)
+    let length_close = (la - lb).abs() < SAME_LENGTH * la.max(lb);
+    let start_close = a.loop_start.abs_diff(b.loop_start) < near;
+    let both_seamless = a.quality == Quality::Seamless && b.quality == Quality::Seamless;
+    length_close && (start_close || both_seamless)
 }
 
 /// Whether `long` is `k ≥ 2` times as long as `short`, give or take 0.1 %.
@@ -279,7 +281,8 @@ fn is_multiple(long: usize, short: usize) -> bool {
 }
 
 /// `sorted` with each whole multiple of another candidate moved to directly after its base:
-/// the first candidate, in order, it is a multiple of and is no better than. Several multiples
+/// the first candidate, in order, it is a multiple of and whose seam it is no better than.
+/// The seam is compared, not the ranking score, so the preference cannot separate them. Several multiples
 /// of one base keep their order, each followed by its own multiples.
 fn after_their_bases(sorted: Vec<LoopCandidate>) -> Vec<LoopCandidate> {
     let base_of: Vec<Option<usize>> = (0..sorted.len())
@@ -287,7 +290,7 @@ fn after_their_bases(sorted: Vec<LoopCandidate>) -> Vec<LoopCandidate> {
             (0..sorted.len()).find(|&j| {
                 j != i
                     && is_multiple(sorted[i].len(), sorted[j].len())
-                    && sorted[i].score >= sorted[j].score - SCORE_TIE
+                    && score(&sorted[i].measures) >= score(&sorted[j].measures) - SCORE_TIE
             })
         })
         .collect();
@@ -385,9 +388,10 @@ mod tests {
     /// Two loops the finder would call the same.
     fn same_loop(a: &LoopCandidate, b: &LoopCandidate) -> bool {
         let (la, lb) = (a.len() as f64, b.len() as f64);
-        let near = (la - lb).abs() < 0.01 * la.max(lb)
-            && a.loop_start.abs_diff(b.loop_start) < (0.05 * f64::from(RATE)) as usize;
-        near || (a.quality == Quality::Seamless && b.quality == Quality::Seamless)
+        let length_close = (la - lb).abs() < 0.01 * la.max(lb);
+        let start_close = a.loop_start.abs_diff(b.loop_start) < (0.05 * f64::from(RATE)) as usize;
+        length_close
+            && (start_close || (a.quality == Quality::Seamless && b.quality == Quality::Seamless))
     }
 
     #[test]
@@ -409,9 +413,8 @@ mod tests {
         let one = found.iter().position(|c| c.len() == TILE);
         let two = found.iter().position(|c| c.len() == 2 * TILE);
         let one = one.expect("a one-tile candidate");
-        if let Some(two) = two {
-            assert!(one < two, "{found:?}");
-        }
+        let two = two.expect("a two-tile candidate");
+        assert!(one < two, "{found:?}");
     }
 
     #[test]
@@ -515,9 +518,10 @@ mod tests {
             loop_end: start + len - 1,
             score,
             quality,
+            // Only the tone is off, so the seam score is the score given.
             measures: SeamMeasures {
                 click: 0.0,
-                tone: 0.0,
+                tone: score,
                 matching: 1.0,
             },
             period: None,
@@ -547,6 +551,29 @@ mod tests {
         ];
         let ranked = rank(better, 0.5, 100_000, 8, RATE);
         assert_eq!(lens(&ranked), [2 * t, t, x]);
+        // The preference credits the longer loop, putting its ranking score ahead of the
+        // single's, but its seam is still no better, so it ranks directly below the single.
+        let long_seam = vec![
+            cand(0, 2 * t, 0.11, Quality::Good),
+            cand(0, t, 0.10, Quality::Good),
+            cand(5_000, x, 0.3, Quality::Fair),
+        ];
+        let ranked = rank(long_seam, 1.0, 100_000, 8, RATE);
+        assert_eq!(lens(&ranked), [t, 2 * t, x]);
+        assert!(ranked[1].score < ranked[0].score);
+    }
+
+    #[test]
+    fn the_length_credit_never_exceeds_its_cap() {
+        // A kept end past the range can give a loop longer than the range.
+        let ranked = rank(
+            vec![cand(0, 30_000, 0.5, Quality::Good)],
+            1.0,
+            10_000,
+            8,
+            RATE,
+        );
+        assert!((ranked[0].score - (0.5 - LENGTH_CREDIT)).abs() < 1e-6);
     }
 
     #[test]
@@ -554,14 +581,14 @@ mod tests {
         let make = || {
             vec![
                 cand(0, 10_000, 0.20, Quality::Good),
-                cand(20_000, 50_000, 0.25, Quality::Good),
+                cand(20_000, 45_000, 0.25, Quality::Good),
             ]
         };
-        assert_eq!(lens(&rank(make(), 0.5, 100_000, 8, RATE)), [10_000, 50_000]);
-        assert_eq!(lens(&rank(make(), 1.0, 100_000, 8, RATE)), [50_000, 10_000]);
-        assert_eq!(lens(&rank(make(), 0.0, 100_000, 8, RATE)), [10_000, 50_000]);
+        assert_eq!(lens(&rank(make(), 0.5, 100_000, 8, RATE)), [10_000, 45_000]);
+        assert_eq!(lens(&rank(make(), 1.0, 100_000, 8, RATE)), [45_000, 10_000]);
+        assert_eq!(lens(&rank(make(), 0.0, 100_000, 8, RATE)), [10_000, 45_000]);
         let ranked = rank(make(), 1.0, 100_000, 8, RATE);
-        assert!((ranked[0].score - (0.25 - 0.15 * 0.5)).abs() < 1e-6);
+        assert!((ranked[0].score - (0.25 - 0.15 * 0.45)).abs() < 1e-6);
     }
 
     #[test]
@@ -573,12 +600,14 @@ mod tests {
             // Far enough away.
             cand(40_000, 20_000, 0.4, Quality::Good),
             cand(60_000, 9_000, 0.0, Quality::Seamless),
-            // A second seamless loop is a duplicate of the first.
+            // Seamless but 5 % longer: not the same loop.
             cand(70_000, 9_500, 0.001, Quality::Seamless),
+            // Seamless, far away, within 1 % of the first: the same loop.
+            cand(80_000, 9_050, 0.002, Quality::Seamless),
         ];
         let ranked = rank(found.clone(), 0.5, 100_000, 8, RATE);
         let starts: Vec<usize> = ranked.iter().map(|c| c.loop_start).collect();
-        assert_eq!(starts, [60_000, 1_000, 40_000]);
+        assert_eq!(starts, [60_000, 70_000, 1_000, 40_000]);
         assert_eq!(rank(found, 0.5, 100_000, 2, RATE).len(), 2);
     }
 
@@ -591,6 +620,24 @@ mod tests {
         ];
         let ranked = rank(found, 0.5, 100_000, 8, RATE);
         assert_eq!(lens(&ranked), [8_000, 25_000, 6_000]);
+    }
+
+    #[test]
+    fn a_far_kept_end_searches_only_the_last_minute() {
+        let rate = 8_000;
+        let n = 100 * rate as usize;
+        let audio = vec![super::fixtures::noise(7, n)];
+        let end = n - 11;
+        let mut s = settings((0, 50 * rate as usize), Some(end));
+        s.min_len = 800;
+        let found = find_loops(&audio, rate, &s, &AtomicBool::new(false)).unwrap();
+        assert!(!found.is_empty());
+        let reach = 60 * rate as usize;
+        for c in &found {
+            assert_eq!(c.loop_end, end);
+            assert!(c.loop_start + reach > end, "{c:?}");
+            assert!(c.len() <= reach, "{c:?}");
+        }
     }
 
     #[test]

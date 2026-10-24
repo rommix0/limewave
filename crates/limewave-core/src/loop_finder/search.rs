@@ -11,7 +11,7 @@ use realfft::RealFftPlanner;
 use realfft::num_complex::Complex64;
 
 use super::measure::{natural_change, quality, score, seam_measures, shortest};
-use super::{FinderError, LoopCandidate};
+use super::{FinderError, LoopCandidate, MAX_SEARCH_SECONDS};
 
 /// How many frames either side of the kept point the reference spans, at most.
 const CONTEXT: usize = 1_024;
@@ -21,6 +21,11 @@ const MAX_PICKS: usize = 48;
 
 /// The closest two returned positions may be, in seconds.
 const MIN_GAP_S: f64 = 0.050;
+
+/// The longest loop a search proposes, in frames: [`MAX_SEARCH_SECONDS`] at `rate`.
+fn max_span(rate: u32) -> usize {
+    (MAX_SEARCH_SECONDS * f64::from(rate)) as usize
+}
 
 /// What a search needs besides the audio.
 pub(super) struct Job<'a> {
@@ -39,16 +44,19 @@ pub(super) struct Job<'a> {
 }
 
 /// Candidate loops of `audio` that end at `end`, measured as forward loops and unsorted. Their
-/// scores are the plain seam scores.
+/// scores are the plain seam scores. The loops are at most 60 s long, so a kept end far past
+/// the range searches only the last 60 s before it.
 pub(super) fn kept_end(
     audio: &[Vec<f32>],
     job: &Job,
     end: usize,
 ) -> Result<Vec<LoopCandidate>, FinderError> {
     let latest = (end + 1).saturating_sub(job.min_len);
-    let earliest = job.max_len.map_or(job.range.0, |m| {
-        job.range.0.max((end + 1).saturating_sub(m))
-    });
+    // No more than the last 60 s before the end, whatever the range holds.
+    let reach = job
+        .max_len
+        .map_or(max_span(job.rate), |m| m.min(max_span(job.rate)));
+    let earliest = job.range.0.max((end + 1).saturating_sub(reach));
     let starts = if earliest <= latest {
         starts_for_end(audio, job.rate, end, (earliest, latest))
     } else {
@@ -58,16 +66,21 @@ pub(super) fn kept_end(
 }
 
 /// Candidate loops of `audio` that start at `start`, measured as forward loops and unsorted.
-/// Their scores are the plain seam scores.
+/// Their scores are the plain seam scores. The loops are at most 60 s long.
 pub(super) fn kept_start(
     audio: &[Vec<f32>],
     job: &Job,
     start: usize,
 ) -> Result<Vec<LoopCandidate>, FinderError> {
-    let earliest = start + job.min_len - 1;
-    let latest = job
+    let earliest = start.saturating_add(job.min_len).saturating_sub(1);
+    // No more than the first 60 s after the start, whatever the range holds.
+    let reach = job
         .max_len
-        .map_or(job.range.1, |m| job.range.1.min(start + m - 1));
+        .map_or(max_span(job.rate), |m| m.min(max_span(job.rate)));
+    let latest = job
+        .range
+        .1
+        .min(start.saturating_add(reach).saturating_sub(1));
     let ends = if earliest <= latest {
         ends_for_start(audio, job.rate, start, (earliest, latest))
     } else {
