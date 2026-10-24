@@ -158,8 +158,9 @@ pub fn natural_change(audio: &[Vec<f32>], first: usize, last: usize, rate: u32) 
 /// - `matching` is the normalised correlation of the 5 ms either side of `e + 1` and of `s`,
 ///   both clipped to the same lengths at the edges of the audio.
 ///
-/// Loop points that do not make a loop (`e <= s`, or past the audio) measure as unrelated:
-/// `matching` is 0, so the quality is [`Quality::Rough`].
+/// Loop points that do not make a loop (`e <= s`, or past the audio) measure as the worst
+/// possible seam: infinite `click` and `tone` and `matching` 0, so the quality is
+/// [`Quality::Rough`] and the [`score`] is infinite, never better than a real candidate's.
 pub fn seam_measures(
     audio: &[Vec<f32>],
     loop_start: usize,
@@ -171,8 +172,8 @@ pub fn seam_measures(
     let (s, e) = (loop_start, loop_end);
     if e <= s || e >= len {
         return SeamMeasures {
-            click: 0.0,
-            tone: 0.0,
+            click: f32::INFINITY,
+            tone: f32::INFINITY,
             matching: 0.0,
         };
     }
@@ -204,7 +205,7 @@ pub fn score(m: &SeamMeasures) -> f32 {
 }
 
 /// The length of the shortest channel, 0 for no channels.
-fn shortest(audio: &[Vec<f32>]) -> usize {
+pub(super) fn shortest(audio: &[Vec<f32>]) -> usize {
     audio.iter().map(Vec::len).min().unwrap_or(0)
 }
 
@@ -388,27 +389,7 @@ impl Bands {
 mod tests {
     use super::*;
     use crate::dsp::rng::SplitMix64;
-
-    const RATE: u32 = 44_100;
-    /// 0.7 s of frames.
-    const TILE: usize = 30_870;
-
-    fn noise(seed: u64, n: usize) -> Vec<f32> {
-        let mut r = SplitMix64::new(seed);
-        (0..n).map(|_| r.next_f32() * 2.0 - 1.0).collect()
-    }
-
-    /// Four repeats of one tile per channel: every loop of whole tiles is an exact repeat.
-    fn repeated(channels: &[Vec<f32>]) -> Vec<Vec<f32>> {
-        channels
-            .iter()
-            .map(|t| t.iter().cycle().take(t.len() * 4).copied().collect())
-            .collect()
-    }
-
-    fn stereo_repeat() -> Vec<Vec<f32>> {
-        repeated(&[noise(1, TILE), noise(2, TILE)])
-    }
+    use crate::loop_finder::fixtures::{RATE, TILE, noise, repeated, stereo_repeat};
 
     fn measure(audio: &[Vec<f32>], s: usize, e: usize) -> SeamMeasures {
         let natural = natural_change(audio, s, e, RATE);
@@ -556,6 +537,19 @@ mod tests {
     fn thresholds_get_looser_down_the_table() {
         for (a, b) in [(SEAMLESS, GOOD), (GOOD, FAIR)] {
             assert!(a.click < b.click && a.tone < b.tone && a.matching > b.matching);
+        }
+    }
+
+    #[test]
+    fn an_invalid_pair_is_the_worst_seam() {
+        let a = stereo_repeat();
+        let natural = natural_change(&a, 0, a[0].len() - 1, RATE);
+        let real = measure(&a, TILE, 2 * TILE + 5);
+        for (s, e) in [(100, 100), (200, 100), (100, a[0].len())] {
+            let m = seam_measures(&a, s, e, RATE, &natural);
+            assert_eq!(quality(&m), Quality::Rough, "({s}, {e})");
+            assert_eq!(score(&m), f32::INFINITY, "({s}, {e})");
+            assert!(score(&m).total_cmp(&score(&real)).is_gt());
         }
     }
 

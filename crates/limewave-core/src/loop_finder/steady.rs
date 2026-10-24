@@ -83,7 +83,7 @@ fn middle_range(len: usize, audible_end: usize, hop: usize) -> SearchRange {
 
 /// Whether every sample of `first..=last` is quieter than −120 dB: no whole 50 ms step and no
 /// leftover tail of the range reaches that level.
-fn range_is_silent(audio: &[Vec<f32>], rate: u32, first: usize, last: usize) -> bool {
+pub(super) fn range_is_silent(audio: &[Vec<f32>], rate: u32, first: usize, last: usize) -> bool {
     let hop = ((f64::from(rate) * STEP_S) as usize).max(1);
     let levels = rms_db_frames(audio, first, last, hop);
     let tail = first + levels.len() * hop;
